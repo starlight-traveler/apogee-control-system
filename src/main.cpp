@@ -1,11 +1,14 @@
 #include <Arduino.h>
 
+#include "bno085_sensor.h"
+#include "bmp581_sensor.h"
+#include "data_logger.h"
 #include "flight_computer.h"
 
-// Placeholder sensor acquisition hook. Replace with real sensor reads.
 static bool AcquireSensorData(SensorData &data) {
-    (void)data;
-    return false;
+    bool hasImu = Bno085SensorAcquire(data);
+    bool hasAltimeter = Bmp581SensorAcquire(data);
+    return hasImu || hasAltimeter;
 }
 
 static FlightComputer flightComputer;
@@ -13,6 +16,28 @@ static FlightComputer flightComputer;
 void setup() {
     Serial.begin(115200);
     while (!Serial && millis() < 2000) {
+    }
+
+    if (!Bno085SensorBegin()) {
+        Serial.println("Failed to initialize BNO085 sensor.");
+        while (true) {
+            delay(100);
+        }
+    }
+
+    if (!Bmp581SensorBegin()) {
+        Serial.println("Failed to initialize BMP581 sensor.");
+        while (true) {
+            delay(100);
+        }
+    }
+
+    if (!DataLoggerBegin()) {
+        Serial.println("Sensor logging is disabled.");
+        while (true)
+        {
+            delay(100);
+        }
     }
 
     const EnvironmentModel::Config environmentConfig;
@@ -38,11 +63,15 @@ void setup() {
 }
 
 void loop() {
+    DataLoggerService();
+
     SensorData data;
     if (!AcquireSensorData(data)) {
         delay(1);
         return;
     }
+
+    DataLoggerLog(data);
 
     FilteredState state;
     if (flightComputer.Update(data, state) && Serial) {
@@ -59,4 +88,6 @@ void loop() {
         Serial.print(" status=");
         Serial.println(FlightStatusToString(flightComputer.Status()));
     }
+
+    DataLoggerService();
 }
