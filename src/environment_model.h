@@ -7,10 +7,10 @@
 class EnvironmentModel {
   public:
     struct Config {
-        float groundTemperatureF = 50.0f;
-        float windSpeedMph = 10.0f;
-        float windDirectionDeg = 270.0f;
-        float launchDirectionDeg = 260.0f;
+        float groundTemperatureF = 45.0f;
+        float windSpeedMph = 25.0f;
+        float windDirectionDeg = 310.0f;
+        float launchDirectionDeg = 130.0f;
         float roughnessLengthMeters = 0.075f;
         float gradientHeightMeters = 300.0f;
         float measurementHeightMeters = 10.0f;

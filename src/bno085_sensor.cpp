@@ -2,7 +2,9 @@
 
 #include <Arduino.h>
 #include <SPI.h>
+
 #include "SparkFun_BNO080_Arduino_Library.h"
+#include "bno085_orientation.h"
 
 namespace {
 
@@ -69,19 +71,44 @@ bool Bno085SensorAcquire(SensorData &out) {
         hasSample = true;
 
         out.timestamp = static_cast<float>(micros()) * 1.0e-6f;
-        out.accelBNO[0] = g_bno.getAccelX();
-        out.accelBNO[1] = g_bno.getAccelY();
-        out.accelBNO[2] = g_bno.getAccelZ();
-        out.accelICM[0] = g_bno.getAccelX();
-        out.accelICM[1] = g_bno.getAccelY();
-        out.accelICM[2] = g_bno.getAccelZ();
-        out.gyro[0] = g_bno.getGyroX();
-        out.gyro[1] = g_bno.getGyroY();
-        out.gyro[2] = g_bno.getGyroZ();
-        out.quaternion[0] = g_bno.getQuatReal();
-        out.quaternion[1] = g_bno.getQuatI();
-        out.quaternion[2] = g_bno.getQuatJ();
-        out.quaternion[3] = g_bno.getQuatK();
+
+        const float rawAccelX = g_bno.getAccelX();
+        const float rawAccelY = g_bno.getAccelY();
+        const float rawAccelZ = g_bno.getAccelZ();
+        float accelX;
+        float accelY;
+        float accelZ;
+        bno085_orientation::TransformVector(rawAccelX, rawAccelY, rawAccelZ, accelX, accelY, accelZ);
+        out.accelBNO[0] = accelX;
+        out.accelBNO[1] = accelY;
+        out.accelBNO[2] = accelZ;
+        out.accelICM[0] = accelX;
+        out.accelICM[1] = accelY;
+        out.accelICM[2] = accelZ;
+
+        const float rawGyroX = g_bno.getGyroX();
+        const float rawGyroY = g_bno.getGyroY();
+        const float rawGyroZ = g_bno.getGyroZ();
+        float gyroX;
+        float gyroY;
+        float gyroZ;
+        bno085_orientation::TransformVector(rawGyroX, rawGyroY, rawGyroZ, gyroX, gyroY, gyroZ);
+        out.gyro[0] = gyroX;
+        out.gyro[1] = gyroY;
+        out.gyro[2] = gyroZ;
+
+        const float rawQuat[4] = {
+            g_bno.getQuatReal(),
+            g_bno.getQuatI(),
+            g_bno.getQuatJ(),
+            g_bno.getQuatK(),
+        };
+        float adjustedQuat[4];
+        bno085_orientation::AdjustQuaternion(rawQuat[0], rawQuat[1], rawQuat[2], rawQuat[3], adjustedQuat);
+        out.quaternion[0] = adjustedQuat[0];
+        out.quaternion[1] = adjustedQuat[1];
+        out.quaternion[2] = adjustedQuat[2];
+        out.quaternion[3] = adjustedQuat[3];
         out.hasQuaternion = true;
     }
 
