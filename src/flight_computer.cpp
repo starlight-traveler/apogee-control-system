@@ -9,6 +9,22 @@ namespace {
 
 constexpr float kDefaultDt = 0.03f;
 
+constexpr float kLiftoffAccelerationThreshold = 7.0f;   // m/s^2 (~0.7 g)
+constexpr float kLiftoffVelocityThreshold = 5.0f;        // m/s
+constexpr float kLiftoffAltitudeThreshold = 3.0f;        // m above pad
+constexpr float kLiftoffConfirmationSeconds = 0.08f;     // require sustained signal
+
+constexpr float kBurnoutAccelerationThreshold = -1.5f;   // m/s^2 (net downward accel)
+constexpr float kBurnoutVelocityThreshold = 1.0f;        // still ascending
+constexpr float kBurnoutConfirmationSeconds = 0.1f;
+
+constexpr float kDescentVelocityThreshold = -1.0f;       // m/s downward
+constexpr float kDescentAccelerationThreshold = -2.0f;   // ensure net downward accel
+constexpr float kDescentConfirmationSeconds = 0.12f;
+
+constexpr float kOvershootAltitudeMarginMeters = 5.0f;
+constexpr float kGroundResetAltitudeMeters = 1.5f;
+
 math_utils::Vec3 RotateBodyToInertial(const math_utils::Vec3 &bodyAccel, float zenith) {
     const float angle = zenith - 1.5707963267948966f;
     float sinA;
@@ -140,23 +156,64 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
         apogeeUpdateAccumulator_ = 0.0f;
     }
 
-    if (status_ == FlightStatus::Ground && accZ > 5.0f && fabsf(posZ) > 1.0f) {
-        status_ = FlightStatus::Burn;
-        burnTimestamp_ = data.timestamp;
-        ReportEvent(false, data.timestamp, "Engine burn");
-    } else if (status_ == FlightStatus::Burn && accZ < 0.0f && posZ < apogeeTargetMeters_ && velZ > 0.0f) {
-        status_ = FlightStatus::Coast;
-        burnoutTimestamp_ = data.timestamp;
-        ReportEvent(false, data.timestamp, "Engine burnout");
-    } else if (status_ == FlightStatus::Coast && accZ < 0.0f && posZ >= apogeeTargetMeters_) {
-        status_ = FlightStatus::Overshoot;
-        ReportEvent(false, data.timestamp, "Overshoot");
-    } else if ((status_ == FlightStatus::Overshoot || status_ == FlightStatus::Coast) && accZ < 0.0f && velZ <= 0.0f) {
-        status_ = FlightStatus::Descent;
-        apogeeAltitude_ = posZ;
-        apogeeTimestamp_ = data.timestamp;
-        apogeeRecorded_ = true;
-        ReportEvent(true, data.timestamp, "Apogee reached");
+    if (status_ == FlightStatus::Ground) {
+        if (accZ > kLiftoffAccelerationThreshold && velZ > kLiftoffVelocityThreshold && posZ > kLiftoffAltitudeThreshold) {
+            liftoffTimer_ += dt;
+            if (liftoffTimer_ >= kLiftoffConfirmationSeconds) {
+                status_ = FlightStatus::Burn;
+                burnTimestamp_ = data.timestamp;
+                liftoffTimer_ = 0.0f;
+                ReportEvent(false, data.timestamp, "Engine burn");
+            }
+        } else {
+            liftoffTimer_ = 0.0f;
+        }
+        if (status_ == FlightStatus::Ground && fabsf(posZ) < kGroundResetAltitudeMeters && fabsf(velZ) < 0.5f) {
+            burnTimestamp_ = 0.0f;
+        }
+    } else {
+        liftoffTimer_ = 0.0f;
+    }
+
+    if (status_ == FlightStatus::Burn) {
+        if (accZ < kBurnoutAccelerationThreshold && velZ > kBurnoutVelocityThreshold && posZ < apogeeTargetMeters_) {
+            burnoutTimer_ += dt;
+            if (burnoutTimer_ >= kBurnoutConfirmationSeconds) {
+                status_ = FlightStatus::Coast;
+                burnoutTimestamp_ = data.timestamp;
+                burnoutTimer_ = 0.0f;
+                ReportEvent(false, data.timestamp, "Engine burnout");
+            }
+        } else {
+            burnoutTimer_ = 0.0f;
+        }
+    } else {
+        burnoutTimer_ = 0.0f;
+    }
+
+    if (status_ == FlightStatus::Coast) {
+        if (posZ >= apogeeTargetMeters_ + kOvershootAltitudeMarginMeters && velZ > 0.0f) {
+            status_ = FlightStatus::Overshoot;
+            ReportEvent(false, data.timestamp, "Overshoot");
+        }
+    }
+
+    if (status_ == FlightStatus::Overshoot || status_ == FlightStatus::Coast) {
+        if (accZ <= kDescentAccelerationThreshold && velZ <= kDescentVelocityThreshold) {
+            descentTimer_ += dt;
+            if (descentTimer_ >= kDescentConfirmationSeconds) {
+                status_ = FlightStatus::Descent;
+                apogeeAltitude_ = posZ;
+                apogeeTimestamp_ = data.timestamp;
+                apogeeRecorded_ = true;
+                descentTimer_ = 0.0f;
+                ReportEvent(true, data.timestamp, "Apogee reached");
+            }
+        } else {
+            descentTimer_ = 0.0f;
+        }
+    } else {
+        descentTimer_ = 0.0f;
     }
 
     output.time = data.timestamp;
@@ -197,10 +254,13 @@ void FlightComputer::ResetInternalState() {
     burnoutTimestamp_ = 0.0f;
     apogeeTimestamp_ = 0.0f;
     apogeeUpdateAccumulator_ = 0.0f;
+    liftoffTimer_ = 0.0f;
+    burnoutTimer_ = 0.0f;
+    descentTimer_ = 0.0f;
 }
 
 void FlightComputer::ReportEvent(bool includeAltitude, float timeSeconds, const char *label) {
-    if (!Serial) {
+    if (!serialReportingEnabled_ || !Serial) {
         return;
     }
     Serial.print(label);

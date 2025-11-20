@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cmath>
+
 #include "constants.h"
 #include "environment_model.h"
 #include "math_utils.h"
@@ -34,6 +36,12 @@ class ApogeePredictor {
     void SetTimeStep(float dt) { timeStep_ = dt; }
 
     float PredictApogee(const ApogeeState &initialState) {
+        if (!std::isfinite(initialState.verticalVelocity) || !std::isfinite(initialState.altitudeMeters)) {
+            return initialState.altitudeMeters;
+        }
+        if (initialState.verticalVelocity <= minVerticalVelocityForPrediction_) {
+            return initialState.altitudeMeters;
+        }
         ApogeeState state = initialState;
         float apogee = state.altitudeMeters;
         const int maxIterations = 2000;
@@ -138,4 +146,5 @@ class ApogeePredictor {
     const EnvironmentModel *environment_ = nullptr;
     ApogeeVehicleParameters vehicle_;
     float timeStep_ = 0.1f;
+    float minVerticalVelocityForPrediction_ = 1.0f;
 };
