@@ -9,10 +9,12 @@ namespace {
 
 constexpr float kDefaultDt = 0.03f;
 
-constexpr float kLiftoffAccelerationThreshold = 7.0f;   // m/s^2 (~0.7 g)
-constexpr float kLiftoffVelocityThreshold = 5.0f;        // m/s
-constexpr float kLiftoffAltitudeThreshold = 3.0f;        // m above pad
-constexpr float kLiftoffConfirmationSeconds = 0.08f;     // require sustained signal
+constexpr float kLiftoffAccelerationThreshold = 4.0f;   // m/s^2 (~0.4 g)
+constexpr float kLiftoffVelocityThreshold = 2.0f;        // m/s
+constexpr float kLiftoffAltitudeThreshold = 1.0f;        // m above pad
+constexpr float kLiftoffConfirmationSeconds = 0.01f;     // require sustained signal
+constexpr float kLiftoffAltitudeFallback = 3.0f;         // m above pad
+constexpr float kLiftoffVelocityFallback = 0.5f;         // m/s
 
 constexpr float kBurnoutAccelerationThreshold = -1.5f;   // m/s^2 (net downward accel)
 constexpr float kBurnoutVelocityThreshold = 1.0f;        // still ascending
@@ -144,6 +146,30 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
     const float accY = kalmanY_.Acceleration();
     const float accZ = kalmanZ_.Acceleration();
 
+    if (!groundReferenceValid_ && isfinite(altitudeMeters)) {
+        groundReferenceAltitude_ = posZ;
+        groundReferenceValid_ = true;
+        lastRelativeAltitude_ = 0.0f;
+        relativeAltitudeInitialized_ = true;
+    }
+
+    float relativeAltitude = posZ - (groundReferenceValid_ ? groundReferenceAltitude_ : 0.0f);
+    float relativeClimbRate = 0.0f;
+    if (relativeAltitudeInitialized_) {
+        relativeClimbRate = (relativeAltitude - lastRelativeAltitude_) / dt;
+    } else {
+        relativeAltitudeInitialized_ = true;
+    }
+    lastRelativeAltitude_ = relativeAltitude;
+
+    const float climbAlpha = 0.2f;
+    relativeClimbRateFiltered_ = climbAlpha * relativeClimbRate + (1.0f - climbAlpha) * relativeClimbRateFiltered_;
+
+    if (status_ == FlightStatus::Ground && groundReferenceValid_ && fabsf(velZ) < 0.5f) {
+        groundReferenceAltitude_ = 0.995f * groundReferenceAltitude_ + 0.005f * posZ;
+        relativeAltitude = posZ - groundReferenceAltitude_;
+    }
+
     if (status_ == FlightStatus::Coast && apogeeUpdateAccumulator_ >= apogeeUpdateInterval_) {
         ApogeeState predictorState;
         predictorState.altitudeMeters = posZ;
@@ -157,7 +183,15 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
     }
 
     if (status_ == FlightStatus::Ground) {
-        if (accZ > kLiftoffAccelerationThreshold && velZ > kLiftoffVelocityThreshold && posZ > kLiftoffAltitudeThreshold) {
+        const bool accelLiftoff = accZ > kLiftoffAccelerationThreshold;
+        const bool velocityLiftoff = velZ > kLiftoffVelocityThreshold;
+        const bool altitudeLiftoff = relativeAltitude > kLiftoffAltitudeThreshold;
+        const bool primaryLiftoff = accelLiftoff && velocityLiftoff && altitudeLiftoff;
+
+        const bool altitudeDrivenLiftoff =
+            relativeAltitude > kLiftoffAltitudeFallback && relativeClimbRateFiltered_ > kLiftoffVelocityFallback;
+
+        if (primaryLiftoff || altitudeDrivenLiftoff) {
             liftoffTimer_ += dt;
             if (liftoffTimer_ >= kLiftoffConfirmationSeconds) {
                 status_ = FlightStatus::Burn;
@@ -168,7 +202,7 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
         } else {
             liftoffTimer_ = 0.0f;
         }
-        if (status_ == FlightStatus::Ground && fabsf(posZ) < kGroundResetAltitudeMeters && fabsf(velZ) < 0.5f) {
+        if (status_ == FlightStatus::Ground && fabsf(relativeAltitude) < kGroundResetAltitudeMeters && fabsf(velZ) < 0.5f) {
             burnTimestamp_ = 0.0f;
         }
     } else {
@@ -257,6 +291,11 @@ void FlightComputer::ResetInternalState() {
     liftoffTimer_ = 0.0f;
     burnoutTimer_ = 0.0f;
     descentTimer_ = 0.0f;
+    groundReferenceAltitude_ = 0.0f;
+    groundReferenceValid_ = false;
+    lastRelativeAltitude_ = 0.0f;
+    relativeAltitudeInitialized_ = false;
+    relativeClimbRateFiltered_ = 0.0f;
 }
 
 void FlightComputer::ReportEvent(bool includeAltitude, float timeSeconds, const char *label) {

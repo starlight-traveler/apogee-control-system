@@ -199,19 +199,19 @@ bool DataLoggerIsInitialized() {
 }
 
 
-void DataLoggerService() {
-    if (!g_loggerInitialized) {
-        return;
-    }
+// void DataLoggerService() {
+//     if (!g_loggerInitialized) {
+//         return;
+//     }
 
-    const uint32_t now = micros();
-    if (g_bufferPosition == 0) {
-        return;
-    }
+//     const uint32_t now = micros();
+//     if (g_bufferPosition == 0) {
+//         return;
+//     }
 
-    if ((now - g_lastFlushMicros >= kFlushIntervalMicros) || g_bufferPosition >= kBufferSize) {
-        if (!FlushBuffer()) {
-            Serial.println("Failed to flush sensor log buffer.");
-        }
-    }
-}
+//     if ((now - g_lastFlushMicros >= kFlushIntervalMicros) || g_bufferPosition >= kBufferSize) {
+//         if (!FlushBuffer()) {
+//             Serial.println("Failed to flush sensor log buffer.");
+//         }
+//     }
+// }

@@ -90,6 +90,12 @@ class FlightComputer {
     float apogeeUpdateAccumulator_ = 0.0f;
     float apogeeUpdateInterval_ = 0.05f;  // Predict apogee at ~20 Hz to save time.
 
+    float groundReferenceAltitude_ = 0.0f;
+    bool groundReferenceValid_ = false;
+    float lastRelativeAltitude_ = 0.0f;
+    bool relativeAltitudeInitialized_ = false;
+    float relativeClimbRateFiltered_ = 0.0f;
+
     bool serialReportingEnabled_ = true;
 
     float liftoffTimer_ = 0.0f;
