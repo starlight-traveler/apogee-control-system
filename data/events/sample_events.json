@@ -1,6 +1,0 @@
-[
-{"event_type": "stage_change", "event_type_raw": 0, "flight_status": "ground", "flight_status_raw": 0, "timestamp": 1.3306330442428589, "altitude_meters": 185.90353393554688, "vertical_velocity": 0.9126577377319336, "apogee_estimate": 0.0},
-{"event_type": "stage_change", "event_type_raw": 0, "flight_status": "burn", "flight_status_raw": 1, "timestamp": 164.0343780517578, "altitude_meters": 192.93356323242188, "vertical_velocity": 7.925435543060303, "apogee_estimate": 0.0},
-{"event_type": "stage_change", "event_type_raw": 0, "flight_status": "coast", "flight_status_raw": 2, "timestamp": 165.8223876953125, "altitude_meters": 192.80674743652344, "vertical_velocity": 5.3464837074279785, "apogee_estimate": 0.0},
-{"event_type": "stage_change", "event_type_raw": 0, "flight_status": "descent", "flight_status_raw": 4, "timestamp": 169.59422302246094, "altitude_meters": 191.56985473632812, "vertical_velocity": -2.550126552581787, "apogee_estimate": 191.56985473632812}
-]
