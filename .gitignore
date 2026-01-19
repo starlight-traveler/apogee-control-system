@@ -70,3 +70,4 @@ venv/
 # Local data/logs
 data/
 *.log
+standalone-c/sensor_data/
