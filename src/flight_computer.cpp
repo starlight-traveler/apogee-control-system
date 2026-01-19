@@ -9,23 +9,14 @@ namespace {
 
 constexpr float kDefaultDt = 0.03f;
 
-constexpr float kLiftoffAccelerationThreshold = 4.0f;   // m/s^2 (~0.4 g)
-constexpr float kLiftoffVelocityThreshold = 2.0f;        // m/s
-constexpr float kLiftoffAltitudeThreshold = 1.0f;        // m above pad
-constexpr float kLiftoffConfirmationSeconds = 0.01f;     // require sustained signal
-constexpr float kLiftoffAltitudeFallback = 3.0f;         // m above pad
-constexpr float kLiftoffVelocityFallback = 0.5f;         // m/s
+constexpr float kLiftoffAccelerationThreshold = 5.0f;   // m/s^2
+constexpr float kLiftoffAltitudeThreshold = 1.0f;       // m above pad
 
-constexpr float kBurnoutAccelerationThreshold = -1.5f;   // m/s^2 (net downward accel)
-constexpr float kBurnoutVelocityThreshold = 1.0f;        // still ascending
-constexpr float kBurnoutConfirmationSeconds = 0.1f;
+constexpr float kBurnoutAccelerationThreshold = 0.0f;   // m/s^2
+constexpr float kBurnoutVelocityThreshold = 0.0f;       // still ascending
 
-constexpr float kDescentVelocityThreshold = -1.0f;       // m/s downward
-constexpr float kDescentAccelerationThreshold = -2.0f;   // ensure net downward accel
-constexpr float kDescentConfirmationSeconds = 0.12f;
-
-constexpr float kOvershootAltitudeMarginMeters = 5.0f;
-constexpr float kGroundResetAltitudeMeters = 1.5f;
+constexpr float kDescentVelocityThreshold = 0.0f;       // m/s downward or zero
+constexpr float kDescentAccelerationThreshold = 0.0f;   // ensure net downward accel
 
 math_utils::Vec3 RotateBodyToInertial(const math_utils::Vec3 &bodyAccel, float zenith) {
     const float angle = zenith - 1.5707963267948966f;
@@ -79,8 +70,6 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
         dt = kDefaultDt;
     }
     lastTimestamp_ = data.timestamp;
-    apogeeUpdateAccumulator_ += dt;
-
     const float altitudeMeters = data.altitudeFeet * constants::kFeetToMeters;
 
     float accelBody[3];
@@ -146,31 +135,7 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
     const float accY = kalmanY_.Acceleration();
     const float accZ = kalmanZ_.Acceleration();
 
-    if (!groundReferenceValid_ && isfinite(altitudeMeters)) {
-        groundReferenceAltitude_ = posZ;
-        groundReferenceValid_ = true;
-        lastRelativeAltitude_ = 0.0f;
-        relativeAltitudeInitialized_ = true;
-    }
-
-    float relativeAltitude = posZ - (groundReferenceValid_ ? groundReferenceAltitude_ : 0.0f);
-    float relativeClimbRate = 0.0f;
-    if (relativeAltitudeInitialized_) {
-        relativeClimbRate = (relativeAltitude - lastRelativeAltitude_) / dt;
-    } else {
-        relativeAltitudeInitialized_ = true;
-    }
-    lastRelativeAltitude_ = relativeAltitude;
-
-    const float climbAlpha = 0.2f;
-    relativeClimbRateFiltered_ = climbAlpha * relativeClimbRate + (1.0f - climbAlpha) * relativeClimbRateFiltered_;
-
-    if (status_ == FlightStatus::Ground && groundReferenceValid_ && fabsf(velZ) < 0.5f) {
-        groundReferenceAltitude_ = 0.995f * groundReferenceAltitude_ + 0.005f * posZ;
-        relativeAltitude = posZ - groundReferenceAltitude_;
-    }
-
-    if (status_ == FlightStatus::Coast && apogeeUpdateAccumulator_ >= apogeeUpdateInterval_) {
+    if (status_ == FlightStatus::Coast) {
         ApogeeState predictorState;
         predictorState.altitudeMeters = posZ;
         predictorState.horizontalDistanceMeters = math_utils::Magnitude2(posX, posY);
@@ -179,75 +144,39 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
         predictorState.zenith = zenithRadians_;
         predictorState.angularVelocity = (zenithRadians_ - lastZenith_) / dt;
         lastApogeePrediction_ = apogeePredictor_.PredictApogee(predictorState);
-        apogeeUpdateAccumulator_ = 0.0f;
     }
 
     if (status_ == FlightStatus::Ground) {
-        const bool accelLiftoff = accZ > kLiftoffAccelerationThreshold;
-        const bool velocityLiftoff = velZ > kLiftoffVelocityThreshold;
-        const bool altitudeLiftoff = relativeAltitude > kLiftoffAltitudeThreshold;
-        const bool primaryLiftoff = accelLiftoff && velocityLiftoff && altitudeLiftoff;
-
-        const bool altitudeDrivenLiftoff =
-            relativeAltitude > kLiftoffAltitudeFallback && relativeClimbRateFiltered_ > kLiftoffVelocityFallback;
-
-        if (primaryLiftoff || altitudeDrivenLiftoff) {
-            liftoffTimer_ += dt;
-            if (liftoffTimer_ >= kLiftoffConfirmationSeconds) {
-                status_ = FlightStatus::Burn;
-                burnTimestamp_ = data.timestamp;
-                liftoffTimer_ = 0.0f;
-                ReportEvent(false, data.timestamp, "Engine burn");
-            }
-        } else {
-            liftoffTimer_ = 0.0f;
+        if (accZ > kLiftoffAccelerationThreshold && fabsf(posZ) > kLiftoffAltitudeThreshold) {
+            status_ = FlightStatus::Burn;
+            burnTimestamp_ = data.timestamp;
+            ReportEvent(false, data.timestamp, "Engine burn");
         }
-        if (status_ == FlightStatus::Ground && fabsf(relativeAltitude) < kGroundResetAltitudeMeters && fabsf(velZ) < 0.5f) {
-            burnTimestamp_ = 0.0f;
-        }
-    } else {
-        liftoffTimer_ = 0.0f;
     }
 
     if (status_ == FlightStatus::Burn) {
-        if (accZ < kBurnoutAccelerationThreshold && velZ > kBurnoutVelocityThreshold && posZ < apogeeTargetMeters_) {
-            burnoutTimer_ += dt;
-            if (burnoutTimer_ >= kBurnoutConfirmationSeconds) {
-                status_ = FlightStatus::Coast;
-                burnoutTimestamp_ = data.timestamp;
-                burnoutTimer_ = 0.0f;
-                ReportEvent(false, data.timestamp, "Engine burnout");
-            }
-        } else {
-            burnoutTimer_ = 0.0f;
+        if (accZ < kBurnoutAccelerationThreshold && posZ < apogeeTargetMeters_ && velZ > kBurnoutVelocityThreshold) {
+            status_ = FlightStatus::Coast;
+            burnoutTimestamp_ = data.timestamp;
+            ReportEvent(false, data.timestamp, "Engine burnout");
         }
-    } else {
-        burnoutTimer_ = 0.0f;
     }
 
     if (status_ == FlightStatus::Coast) {
-        if (posZ >= apogeeTargetMeters_ + kOvershootAltitudeMarginMeters && velZ > 0.0f) {
+        if (accZ < kBurnoutAccelerationThreshold && posZ >= apogeeTargetMeters_) {
             status_ = FlightStatus::Overshoot;
             ReportEvent(false, data.timestamp, "Overshoot");
         }
     }
 
     if (status_ == FlightStatus::Overshoot || status_ == FlightStatus::Coast) {
-        if (accZ <= kDescentAccelerationThreshold && velZ <= kDescentVelocityThreshold) {
-            descentTimer_ += dt;
-            if (descentTimer_ >= kDescentConfirmationSeconds) {
-                status_ = FlightStatus::Descent;
-                apogeeAltitude_ = posZ;
-                apogeeTimestamp_ = data.timestamp;
-                apogeeRecorded_ = true;
-                descentTimer_ = 0.0f;
-                ReportEvent(true, data.timestamp, "Apogee reached");
-            }
-        } else {
-            descentTimer_ = 0.0f;
+        if (accZ < kDescentAccelerationThreshold && velZ <= kDescentVelocityThreshold) {
+            status_ = FlightStatus::Descent;
+            apogeeAltitude_ = posZ;
+            apogeeTimestamp_ = data.timestamp;
+            apogeeRecorded_ = true;
+            ReportEvent(true, data.timestamp, "Apogee reached");
         }
-    } else {
-        descentTimer_ = 0.0f;
     }
 
     output.time = data.timestamp;
@@ -287,15 +216,6 @@ void FlightComputer::ResetInternalState() {
     burnTimestamp_ = 0.0f;
     burnoutTimestamp_ = 0.0f;
     apogeeTimestamp_ = 0.0f;
-    apogeeUpdateAccumulator_ = 0.0f;
-    liftoffTimer_ = 0.0f;
-    burnoutTimer_ = 0.0f;
-    descentTimer_ = 0.0f;
-    groundReferenceAltitude_ = 0.0f;
-    groundReferenceValid_ = false;
-    lastRelativeAltitude_ = 0.0f;
-    relativeAltitudeInitialized_ = false;
-    relativeClimbRateFiltered_ = 0.0f;
 }
 
 void FlightComputer::ReportEvent(bool includeAltitude, float timeSeconds, const char *label) {

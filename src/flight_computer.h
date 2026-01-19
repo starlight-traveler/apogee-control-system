@@ -87,20 +87,9 @@ class FlightComputer {
 
     float processNoiseXY_ = 0.5f;
     float processNoiseZ_ = 1.0f;
-    float apogeeUpdateAccumulator_ = 0.0f;
-    float apogeeUpdateInterval_ = 0.05f;  // Predict apogee at ~20 Hz to save time.
-
-    float groundReferenceAltitude_ = 0.0f;
-    bool groundReferenceValid_ = false;
-    float lastRelativeAltitude_ = 0.0f;
-    bool relativeAltitudeInitialized_ = false;
-    float relativeClimbRateFiltered_ = 0.0f;
 
     bool serialReportingEnabled_ = true;
 
-    float liftoffTimer_ = 0.0f;
-    float burnoutTimer_ = 0.0f;
-    float descentTimer_ = 0.0f;
 };
 
 const char *FlightStatusToString(FlightStatus status);

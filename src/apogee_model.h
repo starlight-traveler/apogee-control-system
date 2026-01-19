@@ -146,5 +146,5 @@ class ApogeePredictor {
     const EnvironmentModel *environment_ = nullptr;
     ApogeeVehicleParameters vehicle_;
     float timeStep_ = 0.1f;
-    float minVerticalVelocityForPrediction_ = 1.0f;
+    float minVerticalVelocityForPrediction_ = 0.0f;
 };

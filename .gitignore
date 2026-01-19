@@ -53,3 +53,20 @@ dkms.conf
 
 # debug information files
 *.dwo
+
+# PlatformIO build output
+.pio/
+
+# Python cache/venv
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# IDE/editor
+.vscode/
+.idea/
+
+# Local data/logs
+data/
+*.log

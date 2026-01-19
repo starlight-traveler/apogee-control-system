@@ -182,6 +182,89 @@ def _build_event_object(data: dict) -> dict:
     }
 
 
+class _ProgressStream:
+    def __init__(self, raw: BinaryIO) -> None:
+        self.raw = raw
+        self.bytes_read = 0
+
+    def read(self, size: int = -1) -> bytes:
+        data = self.raw.read(size)
+        self.bytes_read += len(data)
+        return data
+
+    def __getattr__(self, name: str):
+        return getattr(self.raw, name)
+
+
+def _decode_stream(
+    source: BinaryIO,
+    telemetry_destination: BinaryIO,
+    events_destination: BinaryIO | None,
+    progress_callback=None,
+    total_bytes: int | None = None,
+) -> None:
+    writer = csv.DictWriter(telemetry_destination, fieldnames=_TELEMETRY_FIELD_NAMES)
+    writer.writeheader()
+
+    first_event = True
+
+    if progress_callback is not None:
+        progress_callback(0, total_bytes)
+
+    for kind, data in _iter_records(source):
+        if kind == "telemetry":
+            writer.writerow(_build_telemetry_row(data))
+        elif kind == "event" and events_destination is not None:
+            event_object = _build_event_object(data)
+            if first_event:
+                events_destination.write("[\n")
+            else:
+                events_destination.write(",\n")
+            json.dump(event_object, events_destination)
+            first_event = False
+
+        if progress_callback is not None:
+            bytes_read = getattr(source, "bytes_read", None)
+            progress_callback(bytes_read, total_bytes)
+
+    if events_destination is not None:
+        if first_event:
+            events_destination.write("[]")
+        else:
+            events_destination.write("\n]\n")
+
+    if progress_callback is not None:
+        progress_callback(total_bytes, total_bytes)
+
+
+def decode_with_progress(
+    input_path: pathlib.Path,
+    telemetry_output: pathlib.Path,
+    events_output: pathlib.Path | None = None,
+    progress_callback=None,
+) -> None:
+    if events_output is None:
+        events_output = input_path.with_name(input_path.stem + "_events.json")
+
+    total_bytes = input_path.stat().st_size if input_path.exists() else None
+    with ExitStack() as stack:
+        raw = stack.enter_context(input_path.open("rb"))
+        source = _ProgressStream(raw)
+        telemetry_dest = stack.enter_context(
+            telemetry_output.open("w", newline="", encoding="utf-8")
+        )
+        events_dest = None
+        if events_output is not None:
+            events_dest = stack.enter_context(events_output.open("w", encoding="utf-8"))
+        _decode_stream(
+            source,
+            telemetry_dest,
+            events_dest,
+            progress_callback=progress_callback,
+            total_bytes=total_bytes,
+        )
+
+
 def _run(argv: Iterable[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("input", type=pathlib.Path, help="Binary log file to decode")
@@ -228,28 +311,7 @@ def _run(argv: Iterable[str] | None = None) -> int:
         if events_path is not None:
             events_destination = stack.enter_context(events_path.open("w", encoding="utf-8"))
 
-        writer = csv.DictWriter(telemetry_destination, fieldnames=_TELEMETRY_FIELD_NAMES)
-        writer.writeheader()
-
-        first_event = True
-
-        for kind, data in _iter_records(source):
-            if kind == "telemetry":
-                writer.writerow(_build_telemetry_row(data))
-            elif kind == "event" and events_destination is not None:
-                event_object = _build_event_object(data)
-                if first_event:
-                    events_destination.write("[\n")
-                else:
-                    events_destination.write(",\n")
-                json.dump(event_object, events_destination)
-                first_event = False
-
-        if events_destination is not None:
-            if first_event:
-                events_destination.write("[]")
-            else:
-                events_destination.write("\n]\n")
+        _decode_stream(source, telemetry_destination, events_destination)
 
     return 0
 
