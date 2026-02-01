@@ -1,3 +1,6 @@
+/// \file flight_computer.cpp
+/// \brief FlightComputer implementation and state transitions.
+
 #include "flight_computer.h"
 
 #include <math.h>
@@ -7,17 +10,28 @@
 
 namespace {
 
+/// \brief Default integration time step in seconds.
 constexpr float kDefaultDt = 0.03f;
 
+/// \brief Acceleration threshold for liftoff detection.
 constexpr float kLiftoffAccelerationThreshold = 5.0f;   // m/s^2
+/// \brief Altitude threshold for liftoff detection.
 constexpr float kLiftoffAltitudeThreshold = 1.0f;       // m above pad
 
+/// \brief Acceleration threshold for burnout detection.
 constexpr float kBurnoutAccelerationThreshold = 0.0f;   // m/s^2
+/// \brief Velocity threshold for burnout detection.
 constexpr float kBurnoutVelocityThreshold = 0.0f;       // still ascending
 
+/// \brief Velocity threshold for descent detection.
 constexpr float kDescentVelocityThreshold = 0.0f;       // m/s downward or zero
+/// \brief Acceleration threshold for descent detection.
 constexpr float kDescentAccelerationThreshold = 0.0f;   // ensure net downward accel
 
+/// \brief Rotate body-frame acceleration into the inertial frame.
+/// \param bodyAccel Body-frame acceleration.
+/// \param zenith Zenith angle in radians.
+/// \return Acceleration in the inertial frame.
 math_utils::Vec3 RotateBodyToInertial(const math_utils::Vec3 &bodyAccel, float zenith) {
     const float angle = zenith - 1.5707963267948966f;
     float sinA;
@@ -31,14 +45,46 @@ math_utils::Vec3 RotateBodyToInertial(const math_utils::Vec3 &bodyAccel, float z
     return result;
 }
 
+/// \brief Convert quaternion to Euler angles using the Python convert.py convention.
+/// \param q Input quaternion in wxyz order.
+/// \param yaw Output yaw in radians.
+/// \param pitch Output pitch in radians.
+/// \param roll Output roll in radians.
+void QuaternionToEulerPython(const math_utils::Quaternion &q, float &yaw, float &pitch, float &roll) {
+    const float w = q.w;
+    const float x = q.x;
+    const float y = q.y;
+    const float z = q.z;
+
+    const float r11 = 2.0f * w * w - 1.0f + 2.0f * x * x;
+    const float r21 = 2.0f * (x * y - w * z);
+    const float r31 = 2.0f * (x * z + w * y);
+    const float r32 = 2.0f * (y * z - w * x);
+    const float r33 = 2.0f * w * w - 1.0f + 2.0f * z * z;
+
+    roll = atan2f(r32, r33);
+    const float denom = sqrtf(fmaxf(0.0f, 1.0f - r31 * r31));
+    if (denom == 0.0f) {
+        pitch = -copysignf(1.5707963267948966f, r31);
+    } else {
+        pitch = -atanf(r31 / denom);
+    }
+    yaw = atan2f(r21, r11);
+}
+
 }  // namespace
 
+/// \brief Construct the flight computer.
 FlightComputer::FlightComputer() = default;
 
+/// \brief Load a CFD lookup table into the predictor.
+/// \param path Path to CFD CSV file.
+/// \return True if the table loaded successfully.
 bool FlightComputer::LoadCfdTable(const char *path) {
     return apogeePredictor_.LoadCfdTable(path);
 }
 
+/// \brief Configure filters, environment, and prediction parameters.
 void FlightComputer::Begin(float sigmaAccelXY,
                            float sigmaAccelZ,
                            float sigmaAltimeter,
@@ -62,16 +108,13 @@ void FlightComputer::Begin(float sigmaAccelXY,
     ResetInternalState();
 }
 
+/// \brief Update the filter state with new sensor data.
 bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
+    float dt = kDefaultDt;
     if (!initialized_) {
-        lastTimestamp_ = data.timestamp;
         initialized_ = true;
-        return false;
-    }
-
-    float dt = data.timestamp - lastTimestamp_;
-    if (dt <= 0.0f || dt > 1.0f) {
-        dt = kDefaultDt;
+    } else {
+        dt = data.timestamp - lastTimestamp_;
     }
     lastTimestamp_ = data.timestamp;
     const float altitudeMeters = data.altitudeFeet * constants::kFeetToMeters;
@@ -98,24 +141,21 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
     accelBody[1] = bodyY;
     accelBody[2] = bodyX;
 
-    math_utils::Quaternion orientation = previousQuaternion_;
-    if (!quaternionValid_ && data.hasQuaternion) {
+    if (data.hasQuaternion) {
         previousQuaternion_ = ArrayToQuaternion(data.quaternion);
         quaternionValid_ = true;
-        orientation = previousQuaternion_;
-    } else if ((status_ == FlightStatus::Burn || status_ == FlightStatus::Coast) && quaternionValid_) {
+    }
+
+    math_utils::Quaternion orientation = previousQuaternion_;
+    if ((status_ == FlightStatus::Burn || status_ == FlightStatus::Coast) && quaternionValid_) {
         orientation = TeasleyFilter(previousQuaternion_, data.gyro, dt);
         previousQuaternion_ = orientation;
-    } else if (data.hasQuaternion) {
-        orientation = ArrayToQuaternion(data.quaternion);
-        previousQuaternion_ = orientation;
-        quaternionValid_ = true;
     }
 
     float yaw = 0.0f;
     float pitch = 0.0f;
     float roll = 0.0f;
-    math_utils::QuaternionToEuler(orientation, yaw, pitch, roll);
+    QuaternionToEulerPython(orientation, yaw, pitch, roll);
     zenithRadians_ = math_utils::EulerToZenith(pitch, roll);
 
     const math_utils::Vec3 bodyAccel = math_utils::MakeVec3(accelBody[0], accelBody[1], accelBody[2]);
@@ -204,6 +244,7 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
     return true;
 }
 
+/// \brief Reset state and filter history for a new flight.
 void FlightComputer::ResetInternalState() {
     kalmanX_.Reset();
     kalmanY_.Reset();
@@ -222,6 +263,7 @@ void FlightComputer::ResetInternalState() {
     apogeeTimestamp_ = 0.0f;
 }
 
+/// \brief Report an event via serial (ARDUINO builds only).
 void FlightComputer::ReportEvent(bool includeAltitude, float timeSeconds, const char *label) {
 #if defined(ARDUINO)
     if (!serialReportingEnabled_ || !Serial) {
@@ -244,6 +286,7 @@ void FlightComputer::ReportEvent(bool includeAltitude, float timeSeconds, const 
 #endif
 }
 
+/// \brief Update orientation using the Teasley filter.
 math_utils::Quaternion FlightComputer::TeasleyFilter(const math_utils::Quaternion &quat, const float gyro[3], float dt) {
     const float half_dt = 0.5f * dt;
     const float qw = quat.w;
@@ -263,10 +306,12 @@ math_utils::Quaternion FlightComputer::TeasleyFilter(const math_utils::Quaternio
     return math_utils::Normalize(updated);
 }
 
+/// \brief Normalize a quaternion from a float array.
 math_utils::Quaternion FlightComputer::ArrayToQuaternion(const float values[4]) const {
     return math_utils::Normalize(math_utils::MakeQuaternion(values[0], values[1], values[2], values[3]));
 }
 
+/// \brief Convert a FlightStatus to a string label.
 const char *FlightStatusToString(FlightStatus status) {
     switch (status) {
         case FlightStatus::Ground:

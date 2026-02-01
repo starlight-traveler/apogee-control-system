@@ -1,3 +1,6 @@
+/// \file main.cpp
+/// \brief Host-side telemetry reader and logger for the cm5 flight computer.
+
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
@@ -23,19 +26,30 @@
 
 namespace {
 
+/// \brief Maximum payload size supported by the frame parser.
 constexpr uint16_t kMaxPayload = 256;
+/// \brief Telemetry stream rate in Hz.
 constexpr float kStreamRateHz = 200.0f;
+/// \brief Default serial baud rate.
 constexpr int kDefaultBaud = 921600;
+/// \brief Enable verbose console output when true.
 constexpr bool kVerbose = false;
+/// \brief Realtime scheduling priority on Linux.
 constexpr int kRealtimePriority = 20;
+/// \brief CPU affinity core index, or -1 for no pinning.
 constexpr int kAffinityCore = -1;
 
+/// \brief Global run flag controlled by signal handlers.
 bool g_running = true;
 
+/// \brief Signal handler to request shutdown.
 void HandleSignal(int) {
     g_running = false;
 }
 
+/// \brief Convert an integer baud rate to termios speed_t.
+/// \param baud Baud rate integer.
+/// \return termios speed constant.
 speed_t BaudToSpeed(int baud) {
     switch (baud) {
         case 115200:
@@ -59,8 +73,13 @@ speed_t BaudToSpeed(int baud) {
     }
 }
 
+/// \brief Minimal serial port wrapper for blocking IO.
 class SerialPort {
   public:
+    /// \brief Open the serial device.
+    /// \param device Path to the serial device.
+    /// \param baud Baud rate.
+    /// \return True on success.
     bool Open(const std::string &device, int baud) {
         fd_ = open(device.c_str(), O_RDWR | O_NOCTTY);
         if (fd_ < 0) {
@@ -93,6 +112,10 @@ class SerialPort {
         return true;
     }
 
+    /// \brief Read from the serial device.
+    /// \param buffer Destination buffer.
+    /// \param length Maximum bytes to read.
+    /// \return Bytes read or negative on error.
     ssize_t Read(uint8_t *buffer, size_t length) {
         if (fd_ < 0) {
             return -1;
@@ -100,6 +123,10 @@ class SerialPort {
         return read(fd_, buffer, length);
     }
 
+    /// \brief Write to the serial device.
+    /// \param buffer Data to send.
+    /// \param length Bytes to write.
+    /// \return Bytes written or negative on error.
     ssize_t Write(const uint8_t *buffer, size_t length) {
         if (fd_ < 0) {
             return -1;
@@ -107,6 +134,7 @@ class SerialPort {
         return write(fd_, buffer, length);
     }
 
+    /// \brief Close the serial device.
     void Close() {
         if (fd_ >= 0) {
             close(fd_);
@@ -114,22 +142,34 @@ class SerialPort {
         }
     }
 
+    /// \brief Close the device on destruction.
     ~SerialPort() { Close(); }
 
   private:
+    /// \brief File descriptor for the serial port.
     int fd_ = -1;
 };
 
+/// \brief Buffer holding one decoded frame.
 struct FrameBuffer {
+    /// \brief Parsed frame header.
     serial_protocol::FrameHeader header{};
+    /// \brief Payload buffer.
     std::array<uint8_t, kMaxPayload> payload{};
+    /// \brief Payload length in bytes.
     uint16_t payloadLength = 0;
 };
 
+/// \brief Parser state machine states.
 enum class ParseState { Sync1, Sync2, Header, Payload, Crc };
 
+/// \brief Incremental parser for the serial frame format.
 class FrameParser {
   public:
+    /// \brief Feed one byte into the parser.
+    /// \param byte Next byte from the stream.
+    /// \param frame Output frame when a full message is decoded.
+    /// \return True when a full frame is available.
     bool Feed(uint8_t byte, FrameBuffer &frame) {
         switch (state_) {
             case ParseState::Sync1:
@@ -191,6 +231,8 @@ class FrameParser {
     }
 
   private:
+    /// \brief Compute the CRC over the current header and payload.
+    /// \return CRC value.
     uint16_t ComputeCrc() const {
         const uint8_t *headerBytes = reinterpret_cast<const uint8_t *>(&header_);
         const size_t headerLen = sizeof(serial_protocol::FrameHeader) - 2;
@@ -198,6 +240,7 @@ class FrameParser {
         return serial_protocol::Crc16Ccitt(payload_.data(), payloadLength_, crc);
     }
 
+    /// \brief Reset parser state to look for sync bytes.
     void Reset() {
         state_ = ParseState::Sync1;
         offset_ = 0;
@@ -205,15 +248,27 @@ class FrameParser {
         crcBytes_ = 0;
     }
 
+    /// \brief Current parser state.
     ParseState state_ = ParseState::Sync1;
+    /// \brief Working header being filled.
     serial_protocol::FrameHeader header_{};
+    /// \brief Working payload buffer.
     std::array<uint8_t, kMaxPayload> payload_{};
+    /// \brief Length of the payload for the current frame.
     uint16_t payloadLength_ = 0;
+    /// \brief Offset within the header or payload.
     uint16_t offset_ = 0;
+    /// \brief CRC byte buffer.
     uint8_t crcBuffer_[2] = {};
+    /// \brief CRC byte count.
     uint16_t crcBytes_ = 0;
 };
 
+/// \brief Compute the CRC for a full frame.
+/// \param header Frame header.
+/// \param payload Payload bytes.
+/// \param length Payload length.
+/// \return CRC value.
 uint16_t ComputeCrc(const serial_protocol::FrameHeader &header,
                     const uint8_t *payload,
                     uint16_t length) {
@@ -223,6 +278,13 @@ uint16_t ComputeCrc(const serial_protocol::FrameHeader &header,
     return serial_protocol::Crc16Ccitt(payload, length, crc);
 }
 
+/// \brief Send a full frame to the serial port.
+/// \param port Serial port to write to.
+/// \param type Message type.
+/// \param sequence Sequence number.
+/// \param payload Payload bytes.
+/// \param length Payload length.
+/// \return True on success.
 bool SendFrame(SerialPort &port,
                serial_protocol::MessageType type,
                uint32_t sequence,
@@ -252,6 +314,13 @@ bool SendFrame(SerialPort &port,
     return true;
 }
 
+/// \brief Send a command packet over the serial port.
+/// \param port Serial port to write to.
+/// \param commandId Command identifier.
+/// \param payload Optional payload pointer.
+/// \param payloadLength Payload length.
+/// \param sequence Sequence number.
+/// \return True on success.
 bool SendCommand(SerialPort &port,
                  uint8_t commandId,
                  const void *payload,
@@ -277,6 +346,14 @@ bool SendCommand(SerialPort &port,
                      static_cast<uint16_t>(sizeof(cmd) + payloadLength));
 }
 
+/// \brief Send a PWM command packet.
+/// \param port Serial port to write to.
+/// \param channel PWM channel.
+/// \param duty PWM duty cycle.
+/// \param hasFrequency True if frequency is set.
+/// \param frequencyHz Frequency in Hz.
+/// \param sequence Sequence number.
+/// \return True on success.
 bool SendPwmCommand(SerialPort &port,
                     uint8_t channel,
                     uint16_t duty,
@@ -298,6 +375,7 @@ bool SendPwmCommand(SerialPort &port,
 
 }  // namespace
 
+/// \brief Configure low-latency scheduling and affinity on Linux.
 void ConfigureLowLatency() {
 #if defined(__linux__)
     if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0 && kVerbose) {
@@ -321,14 +399,23 @@ void ConfigureLowLatency() {
 #endif
 }
 
+/// \brief Log record written to the binary telemetry file.
 struct LogRecord {
+    /// \brief Raw sensor data.
     SensorData sensor;
+    /// \brief Filtered state data.
     FilteredState state;
+    /// \brief Flag indicating state validity.
     uint8_t hasState;
+    /// \brief Encoded flight status.
     uint8_t status;
+    /// \brief Reserved padding.
     uint16_t reserved;
 };
 
+/// \brief Open a binary log file with buffered IO.
+/// \param path Path to the log file.
+/// \return File pointer or nullptr on failure.
 FILE *OpenLogFile(const std::string &path) {
     FILE *file = std::fopen(path.c_str(), "wb");
     if (!file) {
@@ -340,6 +427,12 @@ FILE *OpenLogFile(const std::string &path) {
     return file;
 }
 
+/// \brief Write one telemetry record to the log file.
+/// \param file Log file handle.
+/// \param sensor Raw sensor data.
+/// \param state Filtered state data.
+/// \param hasState True if state data is valid.
+/// \param status Current flight status.
 void WriteLogRecord(FILE *file, const SensorData &sensor, const FilteredState &state, bool hasState, FlightStatus status) {
     if (!file) {
         return;
@@ -352,6 +445,7 @@ void WriteLogRecord(FILE *file, const SensorData &sensor, const FilteredState &s
     std::fwrite(&record, sizeof(record), 1, file);
 }
 
+/// \brief Application entry point.
 int main(int argc, char **argv) {
     const std::string device = argc > 1 ? argv[1] : "/dev/ttyACM0";
     const int baud = argc > 2 ? std::atoi(argv[2]) : kDefaultBaud;

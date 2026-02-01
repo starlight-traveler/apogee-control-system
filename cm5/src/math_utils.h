@@ -20,16 +20,23 @@ namespace math_utils {
 
 /// \brief Simple 3D vector.
 struct Vec3 {
+    /// \brief X component.
     float x;
+    /// \brief Y component.
     float y;
+    /// \brief Z component.
     float z;
 };
 
 /// \brief Quaternion in wxyz order.
 struct Quaternion {
+    /// \brief Scalar component.
     float w;
+    /// \brief X component.
     float x;
+    /// \brief Y component.
     float y;
+    /// \brief Z component.
     float z;
 };
 
