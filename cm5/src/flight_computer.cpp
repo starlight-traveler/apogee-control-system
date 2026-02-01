@@ -35,6 +35,10 @@ math_utils::Vec3 RotateBodyToInertial(const math_utils::Vec3 &bodyAccel, float z
 
 FlightComputer::FlightComputer() = default;
 
+bool FlightComputer::LoadCfdTable(const char *path) {
+    return apogeePredictor_.LoadCfdTable(path);
+}
+
 void FlightComputer::Begin(float sigmaAccelXY,
                            float sigmaAccelZ,
                            float sigmaAltimeter,
@@ -219,6 +223,7 @@ void FlightComputer::ResetInternalState() {
 }
 
 void FlightComputer::ReportEvent(bool includeAltitude, float timeSeconds, const char *label) {
+#if defined(ARDUINO)
     if (!serialReportingEnabled_ || !Serial) {
         return;
     }
@@ -232,6 +237,11 @@ void FlightComputer::ReportEvent(bool includeAltitude, float timeSeconds, const 
         Serial.print(" m");
     }
     Serial.println();
+#else
+    (void)includeAltitude;
+    (void)timeSeconds;
+    (void)label;
+#endif
 }
 
 math_utils::Quaternion FlightComputer::TeasleyFilter(const math_utils::Quaternion &quat, const float gyro[3], float dt) {

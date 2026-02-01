@@ -1,0 +1,3 @@
+/Users/ryanpaillet/apogee-control-system/cm5/build/CMakeFiles/cm5_flight_computer.dir
+/Users/ryanpaillet/apogee-control-system/cm5/build/CMakeFiles/edit_cache.dir
+/Users/ryanpaillet/apogee-control-system/cm5/build/CMakeFiles/rebuild_cache.dir

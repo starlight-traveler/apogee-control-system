@@ -1,6 +1,6 @@
 #pragma once
 
-#include "flight_computer.h"
+#include "telemetry_types.h"
 
 bool Bmp581SensorBegin();
 bool Bmp581SensorAcquire(SensorData &out);

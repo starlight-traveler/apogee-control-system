@@ -5,17 +5,23 @@
 
 #include "constants.h"
 
-// Implements the lightweight Kalman filters from filter.py without dynamic allocations.
+/// \file kalman_filters.h
+/// \brief Lightweight Kalman filters from filter.py without dynamic allocations.
 
+/// \brief 1D acceleration-only Kalman filter.
 class KalmanFilterAccel {
   public:
+    /// \brief Construct and reset the filter.
     KalmanFilterAccel() { Reset(); }
 
+    /// \brief Configure measurement noise.
+    /// \param measurementSigma Standard deviation of measurement noise.
     void Configure(float measurementSigma) {
         measurementVariance_ = measurementSigma * measurementSigma;
         Reset();
     }
 
+    /// \brief Reset state and covariance to defaults.
     void Reset() {
         memset(state_, 0, sizeof(state_));
         memset(covariance_, 0, sizeof(covariance_));
@@ -24,6 +30,9 @@ class KalmanFilterAccel {
         covariance_[2][2] = 10.0f;
     }
 
+    /// \brief Predict state forward using process noise.
+    /// \param dt Time step in seconds.
+    /// \param processSigma Standard deviation of process noise.
     void Predict(float dt, float processSigma) {
         if (dt <= 0.0f) {
             dt = 0.03f;
@@ -87,7 +96,8 @@ class KalmanFilterAccel {
         covariance_[2][2] = newP22;
     }
 
-    // Measurement update using Joseph form to mirror the FilterPy implementation.
+    /// \brief Measurement update using Joseph form to mirror the FilterPy implementation.
+    /// \param accelMeasurement Measured acceleration.
     void Update(float accelMeasurement) {
         const float residual = accelMeasurement - state_[2];
         float innovation = covariance_[2][2] + measurementVariance_;
@@ -164,26 +174,41 @@ class KalmanFilterAccel {
         covariance_[2][2] = newP22;
     }
 
+    /// \brief Get estimated position.
+    /// \return Position state.
     float Position() const { return state_[0]; }
+    /// \brief Get estimated velocity.
+    /// \return Velocity state.
     float Velocity() const { return state_[1]; }
+    /// \brief Get estimated acceleration.
+    /// \return Acceleration state.
     float Acceleration() const { return state_[2]; }
 
   private:
+    /// \brief [position, velocity, acceleration] state.
     float state_[3] = {0.0f, 0.0f, 0.0f};
+    /// \brief State covariance.
     float covariance_[3][3] = {{0.0f}};
+    /// \brief Measurement noise variance.
     float measurementVariance_ = 0.25f;
 };
 
+/// \brief 1D Kalman filter fusing acceleration and altitude measurements.
 class KalmanFilterAccelAlt {
   public:
+    /// \brief Construct and reset the filter.
     KalmanFilterAccelAlt() { Reset(); }
 
+    /// \brief Configure measurement noise for acceleration and altitude.
+    /// \param accelSigma Standard deviation of acceleration measurement noise.
+    /// \param altSigma Standard deviation of altitude measurement noise.
     void Configure(float accelSigma, float altSigma) {
         accelVariance_ = accelSigma * accelSigma;
         altitudeVariance_ = altSigma * altSigma;
         Reset();
     }
 
+    /// \brief Reset state and covariance to defaults.
     void Reset() {
         memset(state_, 0, sizeof(state_));
         memset(covariance_, 0, sizeof(covariance_));
@@ -192,6 +217,9 @@ class KalmanFilterAccelAlt {
         covariance_[2][2] = 10.0f;
     }
 
+    /// \brief Predict state forward using process noise.
+    /// \param dt Time step in seconds.
+    /// \param processSigma Standard deviation of process noise.
     void Predict(float dt, float processSigma) {
         if (dt <= 0.0f) {
             dt = 0.03f;
@@ -240,7 +268,9 @@ class KalmanFilterAccelAlt {
         }
     }
 
-    // Joint acceleration/altimeter update using Joseph form for numerical stability.
+    /// \brief Joint acceleration/altimeter update using Joseph form for numerical stability.
+    /// \param accelMeasurement Measured acceleration.
+    /// \param altitudeMeasurement Measured altitude.
     void Update(float accelMeasurement, float altitudeMeasurement) {
         const float residualAccel = accelMeasurement - state_[2];
         const float residualAlt = altitudeMeasurement - state_[0];
@@ -337,13 +367,23 @@ class KalmanFilterAccelAlt {
         covariance_[2][2] = newP22;
     }
 
+    /// \brief Get estimated position.
+    /// \return Position state.
     float Position() const { return state_[0]; }
+    /// \brief Get estimated velocity.
+    /// \return Velocity state.
     float Velocity() const { return state_[1]; }
+    /// \brief Get estimated acceleration.
+    /// \return Acceleration state.
     float Acceleration() const { return state_[2]; }
 
   private:
+    /// \brief [position, velocity, acceleration] state.
     float state_[3] = {0.0f, 0.0f, 0.0f};
+    /// \brief State covariance.
     float covariance_[3][3] = {{0.0f}};
+    /// \brief Acceleration measurement variance.
     float accelVariance_ = 0.25f;
+    /// \brief Altitude measurement variance.
     float altitudeVariance_ = 0.25f;
 };

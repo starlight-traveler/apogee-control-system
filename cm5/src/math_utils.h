@@ -12,15 +12,20 @@
 #define MATHUTILS_HAVE_ARM_MATH 0
 #endif
 
-// Minimal vector and quaternion helpers mirroring math_lib.py functionality.
+/// \file math_utils.h
+/// \brief Minimal vector and quaternion helpers mirroring math_lib.py functionality.
+
+/// \brief Collection of math helpers used across cm5.
 namespace math_utils {
 
+/// \brief Simple 3D vector.
 struct Vec3 {
     float x;
     float y;
     float z;
 };
 
+/// \brief Quaternion in wxyz order.
 struct Quaternion {
     float w;
     float x;
@@ -28,8 +33,17 @@ struct Quaternion {
     float z;
 };
 
+/// \brief Construct a Vec3.
+/// \param x X component.
+/// \param y Y component.
+/// \param z Z component.
+/// \return A new vector.
 inline Vec3 MakeVec3(float x, float y, float z) { return Vec3{x, y, z}; }
 
+/// \brief Compute sine and cosine for an angle.
+/// \param angle Angle in radians.
+/// \param sineOut Output sine.
+/// \param cosineOut Output cosine.
 inline void FastSinCos(float angle, float &sineOut, float &cosineOut) {
 #if MATHUTILS_HAVE_ARM_MATH
     arm_sin_cos_f32(angle, &sineOut, &cosineOut);
@@ -39,8 +53,15 @@ inline void FastSinCos(float angle, float &sineOut, float &cosineOut) {
 #endif
 }
 
+/// \brief Fast atan2 wrapper with hardware optimization where available.
+/// \param y Y component.
+/// \param x X component.
+/// \return atan2(y, x) in radians.
 inline float FastAtan2(float y, float x) { return atan2f(y, x); }
 
+/// \brief Fast square root wrapper with hardware optimization where available.
+/// \param value Input value.
+/// \return Square root of value.
 inline float FastSqrt(float value) {
 #if MATHUTILS_HAVE_ARM_MATH
     float result;
@@ -51,34 +72,63 @@ inline float FastSqrt(float value) {
 #endif
 }
 
+/// \brief Add two vectors.
+/// \param a Left operand.
+/// \param b Right operand.
+/// \return a + b.
 inline Vec3 Add(const Vec3 &a, const Vec3 &b) {
     return Vec3{a.x + b.x, a.y + b.y, a.z + b.z};
 }
 
+/// \brief Subtract two vectors.
+/// \param a Left operand.
+/// \param b Right operand.
+/// \return a - b.
 inline Vec3 Subtract(const Vec3 &a, const Vec3 &b) {
     return Vec3{a.x - b.x, a.y - b.y, a.z - b.z};
 }
 
+/// \brief Scale a vector.
+/// \param v Vector to scale.
+/// \param s Scale factor.
+/// \return v * s.
 inline Vec3 Scale(const Vec3 &v, float s) {
     return Vec3{v.x * s, v.y * s, v.z * s};
 }
 
+/// \brief Dot product of two vectors.
+/// \param a Left operand.
+/// \param b Right operand.
+/// \return a dot b.
 inline float Dot(const Vec3 &a, const Vec3 &b) {
     return a.x * b.x + a.y * b.y + a.z * b.z;
 }
 
+/// \brief Squared magnitude of a vector.
+/// \param v Input vector.
+/// \return |v|^2.
 inline float MagnitudeSquared(const Vec3 &v) {
     return Dot(v, v);
 }
 
+/// \brief Magnitude of a vector.
+/// \param v Input vector.
+/// \return |v|.
 inline float Magnitude(const Vec3 &v) {
     return FastSqrt(MagnitudeSquared(v));
 }
 
+/// \brief Magnitude of a 2D vector.
+/// \param x X component.
+/// \param y Y component.
+/// \return sqrt(x^2 + y^2).
 inline float Magnitude2(float x, float y) {
     return FastSqrt(x * x + y * y);
 }
 
+/// \brief Normalize a vector.
+/// \param v Input vector.
+/// \return Unit-length vector (or zero vector if magnitude is zero).
 inline Vec3 Normalize(const Vec3 &v) {
     const float mag = Magnitude(v);
     if (mag <= 0.0f) {
@@ -88,10 +138,20 @@ inline Vec3 Normalize(const Vec3 &v) {
     return Scale(v, inv);
 }
 
+/// \brief Construct a quaternion.
+/// \param w Scalar component.
+/// \param x X component.
+/// \param y Y component.
+/// \param z Z component.
+/// \return A new quaternion.
 inline Quaternion MakeQuaternion(float w, float x, float y, float z) {
     return Quaternion{w, x, y, z};
 }
 
+/// \brief Multiply two quaternions.
+/// \param a Left operand.
+/// \param b Right operand.
+/// \return a * b.
 inline Quaternion Multiply(const Quaternion &a, const Quaternion &b) {
     return Quaternion{
         a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z,
@@ -101,6 +161,9 @@ inline Quaternion Multiply(const Quaternion &a, const Quaternion &b) {
     };
 }
 
+/// \brief Normalize a quaternion.
+/// \param q Input quaternion.
+/// \return Unit quaternion (or identity if norm is zero).
 inline Quaternion Normalize(const Quaternion &q) {
     const float norm = FastSqrt(q.w * q.w + q.x * q.x + q.y * q.y + q.z * q.z);
     if (norm <= 0.0f) {
@@ -110,6 +173,11 @@ inline Quaternion Normalize(const Quaternion &q) {
     return Quaternion{q.w * inv, q.x * inv, q.y * inv, q.z * inv};
 }
 
+/// \brief Clamp a value to [minValue, maxValue].
+/// \param value Input value.
+/// \param minValue Minimum allowed.
+/// \param maxValue Maximum allowed.
+/// \return Clamped value.
 inline float Clamp(float value, float minValue, float maxValue) {
     if (value < minValue) {
         return minValue;
@@ -120,6 +188,11 @@ inline float Clamp(float value, float minValue, float maxValue) {
     return value;
 }
 
+/// \brief Convert a quaternion to yaw/pitch/roll Euler angles.
+/// \param q Input quaternion.
+/// \param yaw Output yaw in radians.
+/// \param pitch Output pitch in radians.
+/// \param roll Output roll in radians.
 inline void QuaternionToEuler(const Quaternion &q, float &yaw, float &pitch, float &roll) {
     const float sinr_cosp = 2.0f * (q.w * q.x + q.y * q.z);
     const float cosr_cosp = 1.0f - 2.0f * (q.x * q.x + q.y * q.y);
@@ -137,6 +210,10 @@ inline void QuaternionToEuler(const Quaternion &q, float &yaw, float &pitch, flo
     yaw = FastAtan2(siny_cosp, cosy_cosp);
 }
 
+/// \brief Convert pitch/roll into a zenith angle.
+/// \param pitch Pitch in radians.
+/// \param roll Roll in radians.
+/// \return Zenith angle in radians.
 inline float EulerToZenith(float pitch, float roll) {
     const float value = Clamp(cosf(pitch) * cosf(roll), -1.0f, 1.0f);
     return acosf(value);

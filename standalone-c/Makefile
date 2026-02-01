@@ -1,5 +1,5 @@
 CXX ?= g++
-CXXFLAGS ?= -std=c++17 -Wall -Wextra -Wpedantic -Dcimg_display=0 -I../src -I./include -I./matplotplusplus/source \
+CXXFLAGS ?= -std=c++17 -Wall -Wextra -Wpedantic -Dcimg_display=0 -I../src -I../include -I./include -I./matplotplusplus/source \
     -I./matplotplusplus/source/3rd_party/nodesoup/include \
     -I./matplotplusplus/source/3rd_party/nodesoup/src \
     -I./matplotplusplus/source/3rd_party/cimg
@@ -65,7 +65,7 @@ main.o: main.cpp
 arduino_stubs.o: arduino_stubs.cpp include/Arduino.h
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
-flight_computer.o: ../src/flight_computer.cpp ../src/flight_computer.h
+flight_computer.o: ../cm5/src/flight_computer.cpp ../cm5/src/flight_computer.h
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 %.o: %.cpp
