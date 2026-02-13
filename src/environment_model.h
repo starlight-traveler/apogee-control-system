@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cmath>
+
 #include "constants.h"
 #include "math_utils.h"
 
@@ -26,10 +28,10 @@ class EnvironmentModel {
     }
 
     // Temperature as a function of altitude (meters).
-    float TemperatureKelvin(float altitudeMeters) const {
-        const float altitudeFeet = altitudeMeters * constants::kMetersToFeet;
-        const float temperatureF = config_.groundTemperatureF - 0.00356f * altitudeFeet;
-        return constants::FahrenheitToKelvin(temperatureF);
+    double TemperatureKelvin(double altitudeMeters) const {
+        const double altitudeFeet = altitudeMeters * constants::kMetersToFeet;
+        const double temperatureF = static_cast<double>(config_.groundTemperatureF) - 0.00356 * altitudeFeet;
+        return (temperatureF - 32.0) / 1.8 + 273.15;
     }
 
     // Gradient wind experienced above the boundary layer (m/s).
@@ -37,28 +39,34 @@ class EnvironmentModel {
 
   private:
     void initialiseWind() {
-        const float windSpeedMs = config_.windSpeedMph * constants::kMphToMs;
-        const float windDirectionRad = ToRadians(config_.windDirectionDeg);
-        const float launchDirectionRad = ToRadians(config_.launchDirectionDeg);
+        const double windSpeedMs = static_cast<double>(config_.windSpeedMph) * constants::kMphToMs;
+        const double windDirectionRad = ToRadians(config_.windDirectionDeg);
+        const double launchDirectionRad = ToRadians(config_.launchDirectionDeg);
+        const double windSin = std::sin(windDirectionRad);
+        const double windCos = std::cos(windDirectionRad);
+        const double launchSin = std::sin(launchDirectionRad);
+        const double launchCos = std::cos(launchDirectionRad);
 
-        const float windVectorX = windSpeedMs * cosf(windDirectionRad);
-        const float windVectorY = windSpeedMs * sinf(windDirectionRad);
-        const float launchUnitX = cosf(launchDirectionRad);
-        const float launchUnitY = sinf(launchDirectionRad);
-        const float windDownrange = windVectorX * launchUnitX + windVectorY * launchUnitY;
+        const double windVectorX = windSpeedMs * windCos;
+        const double windVectorY = windSpeedMs * windSin;
+        const double launchUnitX = launchCos;
+        const double launchUnitY = launchSin;
+        const double windDownrange = windVectorX * launchUnitX + windVectorY * launchUnitY;
 
-        const float numerator = logf(config_.gradientHeightMeters / config_.roughnessLengthMeters);
-        const float denominator = logf(config_.measurementHeightMeters / config_.roughnessLengthMeters);
-        float gradientSpeed = 0.0f;
-        if (denominator != 0.0f) {
+        const double numerator = std::log(static_cast<double>(config_.gradientHeightMeters) /
+                                          static_cast<double>(config_.roughnessLengthMeters));
+        const double denominator = std::log(static_cast<double>(config_.measurementHeightMeters) /
+                                            static_cast<double>(config_.roughnessLengthMeters));
+        double gradientSpeed = 0.0;
+        if (denominator != 0.0) {
             gradientSpeed = windDownrange * numerator / denominator;
         }
 
-        gradientWind_ = math_utils::MakeVec3(0.0f, gradientSpeed, 0.0f);
+        gradientWind_ = math_utils::MakeVec3(0.0f, static_cast<float>(gradientSpeed), 0.0f);
     }
 
-    static float ToRadians(float degrees) {
-        return degrees * 0.017453292519943295f;
+    static double ToRadians(double degrees) {
+        return degrees * 0.017453292519943295;
     }
 
     Config config_;

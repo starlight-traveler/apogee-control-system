@@ -3,17 +3,17 @@
 // Lightweight equivalents to constants.py for use on the Teensy flight computer.
 namespace constants {
 
-constexpr float kGravity = 9.8067f;            // [m/s^2]
-constexpr float kGamma = 1.4f;                 // Ratio of specific heats for air
-constexpr float kGasConstant = 287.05f;        // [J/(kg·K)] specific gas constant
-constexpr float kMetersToFeet = 3.28083989501f;
-constexpr float kFeetToMeters = 1.0f / kMetersToFeet;
-constexpr float kFahrenheitToKelvinScale = 5.0f / 9.0f;
-constexpr float kFahrenheitToKelvinOffset = 273.15f - 32.0f * kFahrenheitToKelvinScale;
-constexpr float kMphToMs = 0.44704f;
+constexpr double kGravity = 9.8067;            // [m/s^2]
+constexpr double kGamma = 1.4;                 // Ratio of specific heats for air
+constexpr double kGasConstant = 287.05;        // [J/(kg·K)] specific gas constant
+constexpr double kMetersToFeet = 3.28083989501;
+constexpr double kFeetToMeters = 1.0 / kMetersToFeet;
+constexpr double kFahrenheitToKelvinScale = 5.0 / 9.0;
+constexpr double kFahrenheitToKelvinOffset = 273.15 - 32.0 * kFahrenheitToKelvinScale;
+constexpr double kMphToMs = 0.44704;
 
 // Convert Fahrenheit to Kelvin.
-inline float FahrenheitToKelvin(float temperatureF) {
+inline double FahrenheitToKelvin(double temperatureF) {
     return temperatureF * kFahrenheitToKelvinScale + kFahrenheitToKelvinOffset;
 }
 

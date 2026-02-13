@@ -198,6 +198,93 @@ bool DataLoggerIsInitialized() {
     return g_loggerInitialized;
 }
 
+bool DataLoggerReadTextFile(const char *path, bool (*lineCallback)(const char *line, void *context), void *context) {
+    if (!g_loggerInitialized || path == nullptr || lineCallback == nullptr) {
+        return false;
+    }
+
+    FsFile file = g_sd.open(path, O_RDONLY);
+    if (!file) {
+        return false;
+    }
+
+    char line[128];
+    size_t length = 0;
+    while (true) {
+        const int value = file.read();
+        if (value < 0) {
+            break;
+        }
+        const char ch = static_cast<char>(value);
+        if (ch == '\r') {
+            continue;
+        }
+        if (ch == '\n') {
+            if (length > 0) {
+                line[length] = '\0';
+                lineCallback(line, context);
+                length = 0;
+            }
+            continue;
+        }
+        if (length + 1 < sizeof(line)) {
+            line[length++] = ch;
+        }
+    }
+
+    if (length > 0) {
+        line[length] = '\0';
+        lineCallback(line, context);
+    }
+
+    file.close();
+    return true;
+}
+
+bool DataLoggerOpenReadFile(const char *path, FsFile &file) {
+    if (!g_loggerInitialized || path == nullptr) {
+        return false;
+    }
+    file = g_sd.open(path, O_RDONLY);
+    return static_cast<bool>(file);
+}
+
+bool DataLoggerReadLine(FsFile &file, char *line, size_t lineSize) {
+    if (!file || line == nullptr || lineSize == 0) {
+        return false;
+    }
+
+    size_t length = 0;
+    bool sawData = false;
+    while (true) {
+        const int value = file.read();
+        if (value < 0) {
+            break;
+        }
+        const char ch = static_cast<char>(value);
+        if (ch == '\r') {
+            continue;
+        }
+        if (ch == '\n') {
+            if (sawData) {
+                break;
+            }
+            continue;
+        }
+        sawData = true;
+        if (length + 1 < lineSize) {
+            line[length++] = ch;
+        }
+    }
+
+    if (!sawData) {
+        return false;
+    }
+
+    line[length] = '\0';
+    return true;
+}
+
 
 // void DataLoggerService() {
 //     if (!g_loggerInitialized) {

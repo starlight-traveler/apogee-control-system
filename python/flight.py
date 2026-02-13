@@ -77,18 +77,12 @@ for idx in range(num_points):
     else:
         acc_meas = acc_bno_meas
 
-        # Consistent sensor frame
-        x, y, z = acc_meas[0], acc_meas[1], acc_meas[2]
-        acc_meas[0] = -y
-        acc_meas[1] = x
-        acc_meas[2] = z
-
     # Prepare sensor fusion
     if status == "ground":
         quaternion_old = flight_log[idx - 1, 13:17]  # last quaternion
 
     if status == "burn" or status == "coast":
-        # At high accelerations, the BNO085's orientation determination is unreliable.
+        # At high accelerations, the BNO055's orientation determination is unreliable.
         # For this reason, manual sensor fusion is used.
         # NOTE: Gyro drift starts to kick in pretty heavily after around 15-20 seconds.
         # Calculate quaternions manually using gyro (fusion)
@@ -97,11 +91,7 @@ for idx in range(num_points):
         quaternion = kal.teasley_filter(quaternion_old, gyro, dt)
         quaternion_old = quaternion
 
-    # Sensor frame to body frame
-    x, y, z = acc_meas[0], acc_meas[1], acc_meas[2]
-    acc_meas[0] = z
-    acc_meas[1] = y
-    acc_meas[2] = x
+    # Sensor frame already matches the body frame (+Z up).
 
     # Calculate euler angles and zenith angle [rad]
     zenith_old = zenith

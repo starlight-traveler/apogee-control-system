@@ -16,8 +16,8 @@ namespace {
 
 BMP581 g_pressureSensor;
 
-constexpr uint8_t kChipSelectPin = 10;
-constexpr uint8_t kInterruptPin = 9;
+constexpr uint8_t kChipSelectPin = 9;
+constexpr uint8_t kInterruptPin = 6;
 constexpr uint32_t kSpiClockHz = 1000000UL;
 
 constexpr float kSeaLevelPressureHpa = 1012.19f;
@@ -97,9 +97,16 @@ bool Bmp581SensorBegin() {
 
     SPI.begin();
 
-    if (g_pressureSensor.beginSPI(kChipSelectPin, kSpiClockHz) != BMP5_OK) {
-        return false;
+    while(g_pressureSensor.beginSPI(kChipSelectPin, kSpiClockHz) != BMP5_OK)
+    {
+        // Not connected, inform user
+        Serial.println("Error: BMP581 not connected, check wiring and CS pin!");
+
+        // Wait a bit to see if connection is established
+        delay(1000);
     }
+    
+    Serial.println("BMP581 connected!");
 
     if (!ConfigureSensor()) {
         return false;
@@ -153,6 +160,9 @@ bool Bmp581SensorAcquire(SensorData &out) {
     }
 
     const float pressureHpa = sample.pressure * 0.01f;
+    if (!(pressureHpa > 0.0f) || !isfinite(pressureHpa)) {
+        return false;
+    }
     UpdateCachedSample(pressureHpa, sample.temperature);
 
     out.altitudeFeet = g_lastAltitudeFeet;

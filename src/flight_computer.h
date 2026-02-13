@@ -35,26 +35,27 @@ class FlightComputer {
   public:
     FlightComputer();
 
-    void Begin(float sigmaAccelXY,
-               float sigmaAccelZ,
-               float sigmaAltimeter,
-               float processXY,
-               float processZ,
-               float apogeeTargetMeters,
+    void Begin(double sigmaAccelXY,
+               double sigmaAccelZ,
+               double sigmaAltimeter,
+               double processXY,
+               double processZ,
+               double apogeeTargetMeters,
                const EnvironmentModel::Config &environmentConfig,
-               const ApogeeVehicleParameters &vehicleParameters);
+               const ApogeeVehicleParameters &vehicleParameters,
+               const ApogeeForceTable *forceTable = nullptr);
 
     bool Update(const SensorData &data, FilteredState &output);
 
     void SetSerialReportingEnabled(bool enabled) { serialReportingEnabled_ = enabled; }
 
     FlightStatus Status() const { return status_; }
-    float ApogeePrediction() const { return lastApogeePrediction_; }
+    double ApogeePrediction() const { return lastApogeePrediction_; }
     bool ApogeeReached() const { return apogeeRecorded_; }
-    float ApogeeAltitude() const { return apogeeAltitude_; }
-    float BurnTime() const { return burnTimestamp_; }
-    float BurnoutTime() const { return burnoutTimestamp_; }
-    float ApogeeTime() const { return apogeeTimestamp_; }
+    double ApogeeAltitude() const { return apogeeAltitude_; }
+    double BurnTime() const { return burnTimestamp_; }
+    double BurnoutTime() const { return burnoutTimestamp_; }
+    double ApogeeTime() const { return apogeeTimestamp_; }
 
   private:
     void ResetInternalState();
@@ -68,25 +69,25 @@ class FlightComputer {
 
     EnvironmentModel environment_;
     ApogeePredictor apogeePredictor_;
-    float apogeeTargetMeters_ = 1550.0f;
+    double apogeeTargetMeters_ = 1550.0;
 
     FlightStatus status_ = FlightStatus::Ground;
     bool initialized_ = false;
-    float lastTimestamp_ = 0.0f;
-    float zenithRadians_ = 0.0f;
-    float lastZenith_ = 0.0f;
+    double lastTimestamp_ = 0.0;
+    double zenithRadians_ = 0.0;
+    double lastZenith_ = 0.0;
     bool quaternionValid_ = false;
     math_utils::Quaternion previousQuaternion_ = math_utils::MakeQuaternion(1.0f, 0.0f, 0.0f, 0.0f);
 
-    float lastApogeePrediction_ = 0.0f;
-    float apogeeAltitude_ = 0.0f;
+    double lastApogeePrediction_ = 0.0;
+    double apogeeAltitude_ = 0.0;
     bool apogeeRecorded_ = false;
-    float burnTimestamp_ = 0.0f;
-    float burnoutTimestamp_ = 0.0f;
-    float apogeeTimestamp_ = 0.0f;
+    double burnTimestamp_ = 0.0;
+    double burnoutTimestamp_ = 0.0;
+    double apogeeTimestamp_ = 0.0;
 
-    float processNoiseXY_ = 0.5f;
-    float processNoiseZ_ = 1.0f;
+    double processNoiseXY_ = 0.5;
+    double processNoiseZ_ = 1.0;
 
     bool serialReportingEnabled_ = true;
 

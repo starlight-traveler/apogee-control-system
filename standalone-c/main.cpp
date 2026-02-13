@@ -1058,7 +1058,8 @@ int main(int argc, char **argv) {
                          options.processZ,
                          options.apogeeTargetMeters,
                          environmentConfig,
-                         vehicleParameters);
+                         vehicleParameters,
+                         nullptr);
     flightComputer.SetSerialReportingEnabled(false);
 
     if (!options.quiet) {

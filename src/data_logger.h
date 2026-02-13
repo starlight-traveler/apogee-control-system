@@ -2,6 +2,8 @@
 
 #include <stdint.h>
 
+#include <SdFat.h>
+
 #include "flight_computer.h"
 
 enum class LogRecordType : uint8_t { Telemetry = 0, Event = 1 };
@@ -42,3 +44,10 @@ void DataLoggerLogEvent(FlightEventType type,
                         float apogeeEstimate);
 void DataLoggerService();
 bool DataLoggerIsInitialized();
+// Reads a text file from the SD card line-by-line and invokes the callback for each line.
+// Returns false if the SD card or file is unavailable.
+bool DataLoggerReadTextFile(const char *path, bool (*lineCallback)(const char *line, void *context), void *context);
+// Opens a text file for streaming reads (CSV replay).
+bool DataLoggerOpenReadFile(const char *path, FsFile &file);
+// Reads the next line into the buffer. Returns true when a line is read.
+bool DataLoggerReadLine(FsFile &file, char *line, size_t lineSize);

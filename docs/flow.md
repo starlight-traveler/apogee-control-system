@@ -5,7 +5,7 @@ together, and where to look when you need to change behavior.
 
 ## Firmware pipeline (PlatformIO)
 
-1. Sensor drivers (`src/bmp581_sensor.*`, `src/bno085_sensor.*`)
+1. Sensor drivers (`src/bmp581_sensor.*`, `src/bno055_sensor.*`)
    provide raw measurements to the flight computer.
 2. `src/flight_computer.*` owns the main control loop:
    - pulls raw sensor samples
