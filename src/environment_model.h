@@ -4,18 +4,19 @@
 
 #include "constants.h"
 #include "math_utils.h"
+#include "settings.h"
 
 // Encapsulates the logic in environment.py for use at runtime.
 class EnvironmentModel {
   public:
     struct Config {
-        float groundTemperatureF = 50.0f;
-        float windSpeedMph = 10.0f;
-        float windDirectionDeg = 270.0f;
-        float launchDirectionDeg = 260.0f;
-        float roughnessLengthMeters = 0.075f;
-        float gradientHeightMeters = 300.0f;
-        float measurementHeightMeters = 10.0f;
+        float groundTemperatureF = settings::environment::kGroundTemperatureF;
+        float windSpeedMph = settings::environment::kWindSpeedMph;
+        float windDirectionDeg = settings::environment::kWindDirectionDeg;
+        float launchDirectionDeg = settings::environment::kLaunchDirectionDeg;
+        float roughnessLengthMeters = settings::environment::kRoughnessLengthMeters;
+        float gradientHeightMeters = settings::environment::kGradientHeightMeters;
+        float measurementHeightMeters = settings::environment::kMeasurementHeightMeters;
     };
 
     EnvironmentModel() { Configure(Config{}); }

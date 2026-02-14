@@ -4,29 +4,21 @@
 
 #include "constants.h"
 #include "math_utils.h"
+#include "settings.h"
 
 namespace {
 
-constexpr float kDefaultDt = 0.03f;
+math_utils::Vec3 RotateBodyToInertial(const math_utils::Vec3 &bodyAccel, float zenith) {
+    constexpr float kHalfPi = 1.5707963267948966f;
+    const float angle = zenith - kHalfPi;
+    float sinA = 0.0f;
+    float cosA = 1.0f;
+    math_utils::FastSinCos(angle, sinA, cosA);
 
-constexpr float kLiftoffAccelerationThreshold = 20.0;   // m/s^2
-constexpr float kLiftoffAltitudeThreshold = 40.0f;       // m above pad
-
-constexpr float kBurnoutAccelerationThreshold = 0.0f;   // m/s^2
-constexpr float kBurnoutVelocityThreshold = 0.0f;       // still ascending
-
-constexpr float kDescentVelocityThreshold = 0.0f;       // m/s downward or zero
-constexpr float kDescentAccelerationThreshold = 0.0f;   // ensure net downward accel
-
-math_utils::Vec3d RotateBodyToInertial(const math_utils::Vec3d &bodyAccel, double zenith) {
-    const double angle = zenith - 1.5707963267948966;
-    const double sinA = std::sin(angle);
-    const double cosA = std::cos(angle);
-
-    math_utils::Vec3d result;
+    math_utils::Vec3 result;
     result.x = bodyAccel.x * cosA + bodyAccel.z * sinA;
     result.y = bodyAccel.y;
-    result.z = -bodyAccel.x * sinA + bodyAccel.z * cosA - static_cast<double>(constants::kGravity);
+    result.z = -bodyAccel.x * sinA + bodyAccel.z * cosA - constants::kGravity;
     return result;
 }
 
@@ -66,14 +58,14 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
         return false; // No valid accelerometer data; skip this update
     }
     
-    double dt = static_cast<double>(kDefaultDt);
+    double dt = static_cast<double>(settings::flight::kDefaultDtSeconds);
     if (!initialized_) {
         initialized_ = true;
     } else {
         dt = static_cast<double>(data.timestamp) - lastTimestamp_;
     }
     if (dt <= 0.0 || dt > 1.0) {
-        dt = static_cast<double>(kDefaultDt);
+        dt = static_cast<double>(settings::flight::kDefaultDtSeconds);
     }
     lastTimestamp_ = static_cast<double>(data.timestamp);
     const double altitudeMeters = static_cast<double>(data.altitudeFeet) * constants::kFeetToMeters;
@@ -103,22 +95,17 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
         quaternionValid_ = true;
     }
 
-    const math_utils::Quaterniond orientationD = math_utils::MakeQuaternion(
-        static_cast<double>(orientation.w),
-        static_cast<double>(orientation.x),
-        static_cast<double>(orientation.y),
-        static_cast<double>(orientation.z));
-    double yaw = 0.0;
-    double pitch = 0.0;
-    double roll = 0.0;
-    math_utils::QuaternionToEuler(orientationD, yaw, pitch, roll);
-    zenithRadians_ = math_utils::EulerToZenith(pitch, roll);
+    float yaw = 0.0f;
+    float pitch = 0.0f;
+    float roll = 0.0f;
+    math_utils::QuaternionToEuler(orientation, yaw, pitch, roll);
+    zenithRadians_ = static_cast<double>(math_utils::EulerToZenith(pitch, roll));
 
-    const math_utils::Vec3d bodyAccel = math_utils::MakeVec3d(
-        static_cast<double>(accelBody[0]),
-        static_cast<double>(accelBody[1]),
-        static_cast<double>(accelBody[2]));
-    const math_utils::Vec3d inertialAcceleration = RotateBodyToInertial(bodyAccel, zenithRadians_);
+    const math_utils::Vec3 bodyAccel = math_utils::MakeVec3(
+        accelBody[0],
+        accelBody[1],
+        accelBody[2]);
+    const math_utils::Vec3 inertialAcceleration = RotateBodyToInertial(bodyAccel, static_cast<float>(zenithRadians_));
 
     kalmanX_.Predict(dt, processNoiseXY_);
     kalmanY_.Predict(dt, processNoiseXY_);
@@ -150,7 +137,8 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
     }
 
     if (status_ == FlightStatus::Ground) {
-        if (accZ > kLiftoffAccelerationThreshold && std::fabs(posZ) > kLiftoffAltitudeThreshold) {
+        if (accZ > settings::flight::kLiftoffAccelerationThresholdMps2 &&
+            std::fabs(posZ) > settings::flight::kLiftoffAltitudeThresholdM) {
             status_ = FlightStatus::Burn;
             burnTimestamp_ = static_cast<double>(data.timestamp);
             ReportEvent(false, data.timestamp, "Engine burn");
@@ -158,7 +146,9 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
     }
 
     if (status_ == FlightStatus::Burn) {
-        if (accZ < kBurnoutAccelerationThreshold && posZ < apogeeTargetMeters_ && velZ > kBurnoutVelocityThreshold) {
+        if (accZ < settings::flight::kBurnoutAccelerationThresholdMps2 &&
+            posZ < apogeeTargetMeters_ &&
+            velZ > settings::flight::kBurnoutVelocityThresholdMps) {
             status_ = FlightStatus::Coast;
             burnoutTimestamp_ = static_cast<double>(data.timestamp);
             ReportEvent(false, data.timestamp, "Engine burnout");
@@ -166,14 +156,15 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
     }
 
     if (status_ == FlightStatus::Coast) {
-        if (accZ < kBurnoutAccelerationThreshold && posZ >= apogeeTargetMeters_) {
+        if (accZ < settings::flight::kBurnoutAccelerationThresholdMps2 && posZ >= apogeeTargetMeters_) {
             status_ = FlightStatus::Overshoot;
             ReportEvent(false, data.timestamp, "Overshoot");
         }
     }
 
     if (status_ == FlightStatus::Overshoot || status_ == FlightStatus::Coast) {
-        if (accZ < kDescentAccelerationThreshold && velZ <= kDescentVelocityThreshold) {
+        if (accZ < settings::flight::kDescentAccelerationThresholdMps2 &&
+            velZ <= settings::flight::kDescentVelocityThresholdMps) {
             status_ = FlightStatus::Descent;
             apogeeAltitude_ = posZ;
             apogeeTimestamp_ = static_cast<double>(data.timestamp);
@@ -238,25 +229,25 @@ void FlightComputer::ReportEvent(bool includeAltitude, float timeSeconds, const 
 }
 
 math_utils::Quaternion FlightComputer::TeasleyFilter(const math_utils::Quaternion &quat, const float gyro[3], float dt) {
-    const double half_dt = 0.5 * static_cast<double>(dt);
-    const double qw = quat.w;
-    const double qx = quat.x;
-    const double qy = quat.y;
-    const double qz = quat.z;
-    const double gx = gyro[0];
-    const double gy = gyro[1];
-    const double gz = gyro[2];
+    const float half_dt = 0.5f * dt;
+    const float qw = quat.w;
+    const float qx = quat.x;
+    const float qy = quat.y;
+    const float qz = quat.z;
+    const float gx = gyro[0];
+    const float gy = gyro[1];
+    const float gz = gyro[2];
 
-    const double dq_w = (-qx * gx - qy * gy - qz * gz) * half_dt;
-    const double dq_x = (qw * gx + qy * gz - qz * gy) * half_dt;
-    const double dq_y = (qw * gy - qx * gz + qz * gx) * half_dt;
-    const double dq_z = (qw * gz + qx * gy - qy * gx) * half_dt;
+    const float dq_w = (-qx * gx - qy * gy - qz * gz) * half_dt;
+    const float dq_x = (qw * gx + qy * gz - qz * gy) * half_dt;
+    const float dq_y = (qw * gy - qx * gz + qz * gx) * half_dt;
+    const float dq_z = (qw * gz + qx * gy - qy * gx) * half_dt;
 
     math_utils::Quaternion updated = math_utils::MakeQuaternion(
-        static_cast<float>(qw + dq_w),
-        static_cast<float>(qx + dq_x),
-        static_cast<float>(qy + dq_y),
-        static_cast<float>(qz + dq_z));
+        qw + dq_w,
+        qx + dq_x,
+        qy + dq_y,
+        qz + dq_z);
     return math_utils::Normalize(updated);
 }
 

@@ -9,20 +9,20 @@
 #include "cfd_table.h"
 #include "data_logger.h"
 #include "flight_computer.h"
-
-constexpr bool kEnableSerialTelemetry = true;
+#include "settings.h"
+constexpr bool kEnableSerialTelemetry = settings::build::kEnableSerialTelemetry;
 
 namespace {
 
-constexpr uint8_t kStatusLedPin = LED_BUILTIN;
-constexpr uint32_t kErrorBlinkIntervalMs = 120;
-constexpr uint32_t kRecoveryBlinkIntervalMs = 60;
-constexpr uint8_t kServoPin = 18;
-constexpr int kServoExtendAngle = 180;
-constexpr int kServoRetractAngle = 0;
-constexpr bool kEnableCsvReplay = true;
-constexpr const char *kCsvReplayPath = "shortened.csv";
-constexpr size_t kCsvLineBufferSize = 768;
+constexpr uint8_t kStatusLedPin = settings::hardware::kStatusLedPin;
+constexpr uint32_t kErrorBlinkIntervalMs = settings::flight::kErrorBlinkIntervalMs;
+constexpr uint32_t kRecoveryBlinkIntervalMs = settings::flight::kRecoveryBlinkIntervalMs;
+constexpr uint8_t kServoPin = settings::hardware::kServoPin;
+constexpr int kServoExtendAngle = settings::hardware::kServoExtendAngle;
+constexpr int kServoRetractAngle = settings::hardware::kServoRetractAngle;
+constexpr bool kEnableCsvReplay = settings::replay::kEnableCsvReplay;
+constexpr const char *kCsvReplayPath = settings::replay::kCsvReplayPath;
+constexpr size_t kCsvLineBufferSize = settings::replay::kCsvLineBufferSize;
 
 enum class SystemError : uint8_t {
     BnoInitialization = 0,
@@ -334,8 +334,25 @@ static bool g_hasPadAltitude = false;
 static float g_padAltitudeFeet = 0.0f;
 static Servo g_servo;
 static bool g_servoExtended = false;
+static bool g_servoCycleTestMode = false;
+
+static void RunServoCycleTest() {
+    g_servo.attach(kServoPin);
+
+    const uint32_t startMs = millis();
+    bool extend = false;
+    while ((millis() - startMs) < settings::test::kServoCycleDurationMs) {
+        extend = !extend;
+        g_servo.write(extend ? kServoExtendAngle : kServoRetractAngle);
+        delay(settings::test::kServoCycleToggleIntervalMs);
+    }
+
+    g_servo.write(kServoRetractAngle);
+}
 
 void setup() {
+    g_servoCycleTestMode = settings::test::kEnableServoCycleTest;
+
     pinMode(kStatusLedPin, OUTPUT);
     digitalWrite(kStatusLedPin, LOW);
 
@@ -343,6 +360,17 @@ void setup() {
     if (kEnableSerialTelemetry) {
         while (!Serial && millis() < 2000) {
         }
+    }
+
+    if (g_servoCycleTestMode) {
+        if (kEnableSerialTelemetry && Serial) {
+            Serial.println("Servo cycle test mode active.");
+        }
+        RunServoCycleTest();
+        if (kEnableSerialTelemetry && Serial) {
+            Serial.println("Servo cycle test complete.");
+        }
+        return;
     }
 
     DataLoggerSetSerialLoggingEnabled(kEnableSerialTelemetry);
@@ -373,12 +401,12 @@ void setup() {
     const EnvironmentModel::Config environmentConfig;
     ApogeeVehicleParameters vehicleParameters;
 
-    const double sigmaAccelXY = 0.5;
-    const double sigmaAccelZ = 0.5;
-    const double sigmaAltimeter = 0.5;
-    const double processXY = 0.5;
-    const double processZ = 1.0;
-    const double apogeeTargetMeters = 1550.0;
+    const double sigmaAccelXY = settings::flight::kSigmaAccelXY;
+    const double sigmaAccelZ = settings::flight::kSigmaAccelZ;
+    const double sigmaAltimeter = settings::flight::kSigmaAltimeter;
+    const double processXY = settings::flight::kProcessNoiseXY;
+    const double processZ = settings::flight::kProcessNoiseZ;
+    const double apogeeTargetMeters = settings::flight::kApogeeTargetMeters;
 
     flightComputer.Begin(sigmaAccelXY,
                          sigmaAccelZ,
@@ -401,7 +429,10 @@ void setup() {
 }
 
 void loop() {
-    DataLoggerService();
+    if (g_servoCycleTestMode) {
+        delay(1000);
+        return;
+    }
 
     if (!DataLoggerIsInitialized()) {
         InitializeWithRecovery(SystemError::DataLoggerInitialization,

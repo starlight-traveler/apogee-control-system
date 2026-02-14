@@ -6,19 +6,21 @@
 #include <string.h>
 #include <type_traits>
 
+#include "settings.h"
+
 namespace {
 
 SdFs g_sd;
 FsFile g_logFile;
 
-constexpr size_t kBufferSize = 4096;
+constexpr size_t kBufferSize = settings::build::kDataLoggerBufferSize;
 alignas(uint32_t) uint8_t g_buffer[kBufferSize];
 size_t g_bufferPosition = 0;
 uint32_t g_lastFlushMicros = 0;
 bool g_loggerInitialized = false;
 bool g_serialLoggingEnabled = true;
 
-constexpr uint32_t kFlushIntervalMicros = 50000;  // Flush at least every 50 ms.
+constexpr uint32_t kFlushIntervalMicros = settings::build::kDataLoggerFlushIntervalUs;
 
 constexpr const char *kLogPrefix = "SENS";
 constexpr const char *kLogExtension = "BIN";
@@ -185,7 +187,12 @@ void DataLoggerService() {
         return;
     }
 
+    const uint32_t now = micros();
     if (g_bufferPosition == 0) {
+        return;
+    }
+
+    if ((now - g_lastFlushMicros < kFlushIntervalMicros) && g_bufferPosition < kBufferSize) {
         return;
     }
 
@@ -284,21 +291,3 @@ bool DataLoggerReadLine(FsFile &file, char *line, size_t lineSize) {
     line[length] = '\0';
     return true;
 }
-
-
-// void DataLoggerService() {
-//     if (!g_loggerInitialized) {
-//         return;
-//     }
-
-//     const uint32_t now = micros();
-//     if (g_bufferPosition == 0) {
-//         return;
-//     }
-
-//     if ((now - g_lastFlushMicros >= kFlushIntervalMicros) || g_bufferPosition >= kBufferSize) {
-//         if (!FlushBuffer()) {
-//             Serial.println("Failed to flush sensor log buffer.");
-//         }
-//     }
-// }

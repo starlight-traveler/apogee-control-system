@@ -5,6 +5,7 @@
 #include "constants.h"
 #include "environment_model.h"
 #include "math_utils.h"
+#include "settings.h"
 
 // C++ equivalent to apogee.py and apogee_lib.py focused on ballistic prediction.
 
@@ -51,14 +52,17 @@ class ApogeePredictor {
     void SetForceTable(const ApogeeForceTable *table) { forceTable_ = table; }
 
     void SetTimeStep(double dt) { timeStep_ = dt; }
+    void SetMaxIntegrationSteps(int steps) { maxIntegrationSteps_ = (steps > 0) ? steps : 1; }
 
     double PredictApogee(const ApogeeState &initialState) {
         if (initialState.verticalVelocity <= minVerticalVelocityForPrediction_) {
             return initialState.altitudeMeters;
         }
         ApogeeState state = initialState;
-        while (state.verticalVelocity > 0.0) {
+        int steps = 0;
+        while (state.verticalVelocity > 0.0 && steps < maxIntegrationSteps_) {
             state = IntegrateStep(state, timeStep_);
+            ++steps;
         }
         return state.altitudeMeters;
     }
@@ -279,5 +283,6 @@ class ApogeePredictor {
     ApogeeVehicleParameters vehicle_;
     const ApogeeForceTable *forceTable_ = nullptr;
     double timeStep_ = 0.1;
+    int maxIntegrationSteps_ = settings::flight::kApogeePredictorMaxSteps;
     double minVerticalVelocityForPrediction_ = 0.0;
 };
