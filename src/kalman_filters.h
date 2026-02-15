@@ -50,6 +50,8 @@ class KalmanFilterAccel {
         const double p20 = covariance_[2][0];
         const double p21 = covariance_[2][1];
         const double p22 = covariance_[2][2];
+        (void)p11;
+        (void)p21;
 
         const double fp00 = p00 + dt * p10 + half_dt2 * p20;
         const double fp01 = p01 + dt * p11 + half_dt2 * p21;

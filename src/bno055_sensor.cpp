@@ -55,7 +55,7 @@ bool Bno055SensorAcquire(SensorData &out) {
     float accelX;
     float accelY;
     float accelZ;
-    bno055_orientation::TransformVector(rawAccel.x(), rawAccel.y(), rawAccel.z(), accelX, accelY, accelZ);
+    bno055_orientation::TransformVector(rawAccel.z(), rawAccel.y(), rawAccel.x(), accelX, accelY, accelZ);
     out.accelBNO[0] = accelX;
     out.accelBNO[1] = accelY;
     out.accelBNO[2] = accelZ;

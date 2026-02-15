@@ -42,7 +42,7 @@ constexpr uint32_t kDataLoggerFlushIntervalUs = DATA_LOGGER_FLUSH_INTERVAL_US;
 namespace hardware {
 constexpr uint8_t kStatusLedPin = LED_BUILTIN;
 constexpr uint8_t kServoPin = 18;
-constexpr int kServoExtendAngle = 180;
+constexpr int kServoExtendAngle = 60;
 constexpr int kServoRetractAngle = 0;
 }
 
@@ -57,31 +57,18 @@ constexpr size_t kCsvLineBufferSize = 768;
 }
 
 // ---------------------------------------------------------------------------
-// Test Settings
-// Optional bench-test behaviors that bypass normal flight logic.
-// ---------------------------------------------------------------------------
-namespace test {
-// When true, firmware runs only a servo extend/retract bench test.
-constexpr bool kEnableServoCycleTest = true;
-// Total test runtime for servo cycling (milliseconds).
-constexpr uint32_t kServoCycleDurationMs = 5000;
-// Delay between each servo state toggle (milliseconds).
-constexpr uint32_t kServoCycleToggleIntervalMs = 250;
-}
-
-// ---------------------------------------------------------------------------
 // Environment Model Settings
 // Default atmospheric and wind parameters used by EnvironmentModel::Config.
 // ---------------------------------------------------------------------------
 namespace environment {
 // Ground temperature used as altitude=0 reference in Fahrenheit.
-constexpr float kGroundTemperatureF = 50.0f;
+constexpr float kGroundTemperatureF = 44.0f;
 // Measured surface wind speed in miles per hour.
-constexpr float kWindSpeedMph = 10.0f;
+constexpr float kWindSpeedMph = 6.0f;
 // Meteorological wind direction in degrees.
-constexpr float kWindDirectionDeg = 270.0f;
+constexpr float kWindDirectionDeg = 200.0f;
 // Launch rail azimuth direction in degrees.
-constexpr float kLaunchDirectionDeg = 260.0f;
+constexpr float kLaunchDirectionDeg = 200.0f;
 // Terrain roughness length (meters) for log wind profile.
 constexpr float kRoughnessLengthMeters = 0.075f;
 // Height where gradient wind is modeled (meters).
@@ -111,7 +98,7 @@ constexpr double kSigmaAccelZ = 0.5;
 constexpr double kSigmaAltimeter = 0.5;
 constexpr double kProcessNoiseXY = 0.5;
 constexpr double kProcessNoiseZ = 1.0;
-constexpr double kApogeeTargetMeters = 1569.72;
+constexpr double kApogeeTargetMeters = 1711.;
 
 constexpr int kApogeePredictorMaxSteps = APOGEE_PREDICTOR_MAX_STEPS;
 }

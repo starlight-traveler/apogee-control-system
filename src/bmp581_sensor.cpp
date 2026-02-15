@@ -20,7 +20,7 @@ constexpr uint8_t kChipSelectPin = 9;
 constexpr uint8_t kInterruptPin = 6;
 constexpr uint32_t kSpiClockHz = 1000000UL;
 
-constexpr float kSeaLevelPressureHpa = 1012.19f;
+constexpr float kSeaLevelPressureHpa = 1018.8f;
 constexpr float kSeaLevelPressureInv = 1.0f / kSeaLevelPressureHpa;
 
 volatile bool g_interruptFlag = false;

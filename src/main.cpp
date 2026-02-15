@@ -20,6 +20,9 @@ constexpr uint32_t kRecoveryBlinkIntervalMs = settings::flight::kRecoveryBlinkIn
 constexpr uint8_t kServoPin = settings::hardware::kServoPin;
 constexpr int kServoExtendAngle = settings::hardware::kServoExtendAngle;
 constexpr int kServoRetractAngle = settings::hardware::kServoRetractAngle;
+constexpr float kServoMinExtendAltitudeFeet = 1000.0f;
+constexpr float kServoForceExtendAltitudeFeet = 2000.0f;
+constexpr uint32_t kServoForceExtendHoldMs = 4000.0f;
 constexpr bool kEnableCsvReplay = settings::replay::kEnableCsvReplay;
 constexpr const char *kCsvReplayPath = settings::replay::kCsvReplayPath;
 constexpr size_t kCsvLineBufferSize = settings::replay::kCsvLineBufferSize;
@@ -332,45 +335,24 @@ static FlightStatus g_lastLoggedStatus = FlightStatus::Ground;
 static bool g_hasLoggedStatus = false;
 static bool g_hasPadAltitude = false;
 static float g_padAltitudeFeet = 0.0f;
-static Servo g_servo;
+Servo g_servo;
 static bool g_servoExtended = false;
 static bool g_servoCycleTestMode = false;
-
-static void RunServoCycleTest() {
-    g_servo.attach(kServoPin);
-
-    const uint32_t startMs = millis();
-    bool extend = false;
-    while ((millis() - startMs) < settings::test::kServoCycleDurationMs) {
-        extend = !extend;
-        g_servo.write(extend ? kServoExtendAngle : kServoRetractAngle);
-        delay(settings::test::kServoCycleToggleIntervalMs);
-    }
-
-    g_servo.write(kServoRetractAngle);
-}
+static bool g_servoForcedExtendActive = false;
+static uint32_t g_servoExtendStartMs = 0;
+static bool g_servoExtensionLocked = false;
 
 void setup() {
-    g_servoCycleTestMode = settings::test::kEnableServoCycleTest;
-
     pinMode(kStatusLedPin, OUTPUT);
     digitalWrite(kStatusLedPin, LOW);
+
+    g_servo.attach(18);
+    g_servo.write(0);
 
     Serial.begin(115200);
     if (kEnableSerialTelemetry) {
         while (!Serial && millis() < 2000) {
         }
-    }
-
-    if (g_servoCycleTestMode) {
-        if (kEnableSerialTelemetry && Serial) {
-            Serial.println("Servo cycle test mode active.");
-        }
-        RunServoCycleTest();
-        if (kEnableSerialTelemetry && Serial) {
-            Serial.println("Servo cycle test complete.");
-        }
-        return;
     }
 
     DataLoggerSetSerialLoggingEnabled(kEnableSerialTelemetry);
@@ -381,8 +363,6 @@ void setup() {
 
     CsvReplayInit();
 
-    g_servo.attach(kServoPin);
-    g_servo.write(kServoRetractAngle);
 
     if (!g_csvReplay.enabled) {
         InitializeWithRecovery(SystemError::BnoInitialization,
@@ -465,18 +445,64 @@ void loop() {
 
     if (hasFilteredState) {
         const FlightStatus status = flightComputer.Status();
-        if (!g_servoExtended && status == FlightStatus::Coast) {
-            g_servo.write(kServoExtendAngle);
+        float altitudeAglFeet = 0.0f;
+        if (g_hasPadAltitude) {
+            altitudeAglFeet = data.altitudeFeet - g_padAltitudeFeet;
+            if (altitudeAglFeet < 0.0f) {
+                altitudeAglFeet = 0.0f;
+            }
+        }
+
+        const bool aboveMinExtendAltitude = altitudeAglFeet >= kServoMinExtendAltitudeFeet;
+        const bool aboveForceExtendAltitude = altitudeAglFeet >= kServoForceExtendAltitudeFeet;
+
+        if (!g_servoExtensionLocked && aboveForceExtendAltitude) {
+            g_servoForcedExtendActive = true;
+            if (!g_servoExtended) {
+                g_servoExtendStartMs = millis();
+                g_servo.write(60);
+                g_servoExtended = true;
+                if (kEnableSerialTelemetry && Serial) {
+                    Serial.println("Servo extended (failsafe altitude).");
+                }
+            }
+        }
+
+        if (!g_servoExtensionLocked && !g_servoForcedExtendActive &&
+            !g_servoExtended && status == FlightStatus::Coast && aboveMinExtendAltitude) {
+            g_servoExtendStartMs = millis();
+            g_servo.write(60);
             g_servoExtended = true;
             if (kEnableSerialTelemetry && Serial) {
                 Serial.println("Servo extended (coast).");
             }
         }
-        if (g_servoExtended && status == FlightStatus::Descent) {
-            g_servo.write(kServoRetractAngle);
+
+        if (g_servoExtended && g_servoExtendStartMs == 0) {
+            g_servoExtendStartMs = millis();
+        }
+
+        if (g_servoExtended && g_servoExtendStartMs != 0) {
+            const uint32_t elapsedMs = millis() - g_servoExtendStartMs;
+            if (elapsedMs >= kServoForceExtendHoldMs) {
+                g_servo.write(0);
+                g_servoExtended = false;
+                g_servoForcedExtendActive = false;
+                g_servoExtensionLocked = true;
+                g_servoExtendStartMs = 0;
+                
+                if (kEnableSerialTelemetry && Serial) {
+                    Serial.println("Servo retracted (max hold).");
+                }
+            }
+        }
+
+        if (g_servoExtended && status == FlightStatus::Descent && !g_servoForcedExtendActive) {
+            g_servo.write(0);
             g_servoExtended = false;
+            g_servoExtendStartMs = 0;
             if (kEnableSerialTelemetry && Serial) {
-                Serial.println("Servo retracted (apogee).");
+                Serial.println("Servo retracted (descent).");
             }
         }
         if (!g_hasLoggedStatus || status != g_lastLoggedStatus) {
