@@ -203,7 +203,17 @@ std::string SanitizeFilename(const std::string &value) {
 
 enum class SampleValueId {
     AltitudeMeters,
+    AltitudeAglMeters,
     VelocityMetersPerSecond,
+    HorizontalVelocityMetersPerSecond,
+    SpeedTotalMetersPerSecond,
+    RelativeAirspeedMetersPerSecond,
+    MachNumber,
+    ZenithDegrees,
+    ZenithRateDegreesPerSecond,
+    AngleOfAttackDegrees,
+    AngleOfAttackAbsDegrees,
+    ApogeeErrorMeters,
     ApogeePredictionMeters,
     AltimeterRawMeters,
     AccelIcmX,
@@ -234,11 +244,71 @@ const std::vector<SampleValueInfo> &AllSampleValues() {
          "Filtered altitude in meters.",
          false,
          true},
+        {SampleValueId::AltitudeAglMeters,
+         "altitude_agl_m",
+         {"altitude_agl_m", "agl_m", "alt_agl"},
+         "Filtered altitude above launch reference in meters.",
+         true,
+         true},
         {SampleValueId::VelocityMetersPerSecond,
          "velocity_mps",
          {"velocity_mps", "velocity", "vel"},
          "Filtered vertical velocity in m/s.",
          false,
+         true},
+        {SampleValueId::HorizontalVelocityMetersPerSecond,
+         "horizontal_velocity_mps",
+         {"horizontal_velocity_mps", "hvel", "velocity_xy_mps"},
+         "Horizontal speed magnitude in m/s.",
+         true,
+         true},
+        {SampleValueId::SpeedTotalMetersPerSecond,
+         "speed_total_mps",
+         {"speed_total_mps", "speed_mps", "speed"},
+         "Total speed magnitude in m/s.",
+         true,
+         true},
+        {SampleValueId::RelativeAirspeedMetersPerSecond,
+         "airspeed_rel_mps",
+         {"airspeed_rel_mps", "airspeed", "relative_airspeed_mps"},
+         "Relative airspeed magnitude after wind subtraction in m/s.",
+         true,
+         true},
+        {SampleValueId::MachNumber,
+         "mach",
+         {"mach", "mach_number"},
+         "Estimated Mach number from relative airspeed.",
+         true,
+         true},
+        {SampleValueId::ZenithDegrees,
+         "zenith_deg",
+         {"zenith_deg", "zenith", "attitude_zenith_deg"},
+         "Zenith angle in degrees.",
+         true,
+         true},
+        {SampleValueId::ZenithRateDegreesPerSecond,
+         "zenith_rate_dps",
+         {"zenith_rate_dps", "zenith_rate", "attitude_rate_dps"},
+         "Zenith angular rate in degrees/s.",
+         true,
+         true},
+        {SampleValueId::AngleOfAttackDegrees,
+         "aoa_deg",
+         {"aoa_deg", "aoa", "angle_of_attack_deg"},
+         "Signed angle of attack estimate in degrees.",
+         true,
+         true},
+        {SampleValueId::AngleOfAttackAbsDegrees,
+         "aoa_abs_deg",
+         {"aoa_abs_deg", "aoa_abs", "angle_of_attack_abs_deg"},
+         "Absolute angle of attack estimate in degrees.",
+         true,
+         true},
+        {SampleValueId::ApogeeErrorMeters,
+         "apogee_error_m",
+         {"apogee_error_m", "apogee_error", "target_error_m"},
+         "Predicted apogee minus configured target (meters).",
+         true,
          true},
         {SampleValueId::ApogeePredictionMeters,
          "apogee_prediction_m",
@@ -352,6 +422,18 @@ std::vector<SampleValueId> ExpandSampleValueToken(const std::string &token) {
     }
     if (lowered == "gyro" || lowered == "gyros") {
         return {SampleValueId::GyroX, SampleValueId::GyroY, SampleValueId::GyroZ};
+    }
+    if (lowered == "derived") {
+        return {SampleValueId::AltitudeAglMeters,
+                SampleValueId::HorizontalVelocityMetersPerSecond,
+                SampleValueId::SpeedTotalMetersPerSecond,
+                SampleValueId::RelativeAirspeedMetersPerSecond,
+                SampleValueId::MachNumber,
+                SampleValueId::ZenithDegrees,
+                SampleValueId::ZenithRateDegreesPerSecond,
+                SampleValueId::AngleOfAttackDegrees,
+                SampleValueId::AngleOfAttackAbsDegrees,
+                SampleValueId::ApogeeErrorMeters};
     }
     if (const SampleValueInfo *info = FindSampleValueByName(lowered)) {
         return {info->id};
@@ -616,20 +698,108 @@ struct SampleValueContext {
     const FilteredState &state;
     const SensorData &sensor;
     std::optional<float> altimeterMeters;
+    struct DerivedMetrics {
+        float altitudeAglMeters = 0.0f;
+        float horizontalVelocityMps = 0.0f;
+        float speedTotalMps = 0.0f;
+        float relativeAirspeedMps = 0.0f;
+        float mach = 0.0f;
+        float zenithDeg = 0.0f;
+        float zenithRateDps = 0.0f;
+        float aoaDeg = 0.0f;
+        float aoaAbsDeg = 0.0f;
+        float apogeeErrorMeters = 0.0f;
+    } derived;
 };
 
 struct SampleSnapshot {
     FilteredState state;
     SensorData sensor;
     std::optional<float> altimeterMeters;
+    SampleValueContext::DerivedMetrics derived;
 };
+
+SampleValueContext::DerivedMetrics ComputeDerivedMetrics(const FilteredState &state,
+                                                         const EnvironmentModel &environment,
+                                                         float apogeeTargetMeters,
+                                                         float altitudeReferenceMeters,
+                                                         bool hasAltitudeReference,
+                                                         float previousTimeSeconds,
+                                                         float previousZenithRadians,
+                                                         bool hasPreviousZenith) {
+    SampleValueContext::DerivedMetrics metrics;
+
+    const float velZ = state.velocity[2];
+    const float velHorizontal = math_utils::Magnitude2(state.velocity[0], state.velocity[1]);
+    metrics.horizontalVelocityMps = velHorizontal;
+    metrics.speedTotalMps = math_utils::Magnitude2(velHorizontal, velZ);
+
+    const math_utils::Vec3 wind = environment.GradientWind();
+    const float relX = velZ - wind.x;
+    const float relY = velHorizontal - wind.y;
+    metrics.relativeAirspeedMps = math_utils::Magnitude2(relX, relY);
+
+    const float temperatureK = static_cast<float>(environment.TemperatureKelvin(state.position[2]));
+    if (temperatureK > 0.0f) {
+        const float speedOfSound =
+            math_utils::FastSqrt(static_cast<float>(constants::kGamma * constants::kGasConstant) * temperatureK);
+        if (speedOfSound > 0.0f) {
+            metrics.mach = metrics.relativeAirspeedMps / speedOfSound;
+        }
+    }
+
+    constexpr float kRadToDeg = 57.29577951308232f;
+    metrics.zenithDeg = state.zenith * kRadToDeg;
+    const float flowAngle = std::fabs(math_utils::FastAtan2(relY, relX));
+    const float aoaRad = state.zenith - flowAngle;
+    metrics.aoaDeg = aoaRad * kRadToDeg;
+    metrics.aoaAbsDeg = std::fabs(metrics.aoaDeg);
+
+    if (hasPreviousZenith) {
+        const float dt = state.time - previousTimeSeconds;
+        if (dt > 1.0e-5f) {
+            metrics.zenithRateDps = (state.zenith - previousZenithRadians) * kRadToDeg / dt;
+        }
+    }
+
+    metrics.apogeeErrorMeters = state.apogeeEstimate - apogeeTargetMeters;
+
+    if (hasAltitudeReference) {
+        metrics.altitudeAglMeters = state.position[2] - altitudeReferenceMeters;
+        if (metrics.altitudeAglMeters < 0.0f) {
+            metrics.altitudeAglMeters = 0.0f;
+        }
+    }
+
+    return metrics;
+}
 
 std::optional<float> ResolveSampleValue(SampleValueId id, const SampleValueContext &ctx) {
     switch (id) {
         case SampleValueId::AltitudeMeters:
             return ctx.state.position[2];
+        case SampleValueId::AltitudeAglMeters:
+            return ctx.derived.altitudeAglMeters;
         case SampleValueId::VelocityMetersPerSecond:
             return ctx.state.velocity[2];
+        case SampleValueId::HorizontalVelocityMetersPerSecond:
+            return ctx.derived.horizontalVelocityMps;
+        case SampleValueId::SpeedTotalMetersPerSecond:
+            return ctx.derived.speedTotalMps;
+        case SampleValueId::RelativeAirspeedMetersPerSecond:
+            return ctx.derived.relativeAirspeedMps;
+        case SampleValueId::MachNumber:
+            return ctx.derived.mach;
+        case SampleValueId::ZenithDegrees:
+            return ctx.derived.zenithDeg;
+        case SampleValueId::ZenithRateDegreesPerSecond:
+            return ctx.derived.zenithRateDps;
+        case SampleValueId::AngleOfAttackDegrees:
+            return ctx.derived.aoaDeg;
+        case SampleValueId::AngleOfAttackAbsDegrees:
+            return ctx.derived.aoaAbsDeg;
+        case SampleValueId::ApogeeErrorMeters:
+            return ctx.derived.apogeeErrorMeters;
         case SampleValueId::ApogeePredictionMeters:
             return ctx.state.apogeeEstimate;
         case SampleValueId::AltimeterRawMeters:
@@ -773,7 +943,12 @@ void RenderRequestedGraphs(const std::vector<SampleSnapshot> &snapshots,
         std::vector<std::pair<float, float>> series;
         series.reserve(snapshots.size());
         for (const auto &snapshot : snapshots) {
-            SampleValueContext ctx{snapshot.state, snapshot.sensor, snapshot.altimeterMeters};
+            SampleValueContext ctx{
+                snapshot.state,
+                snapshot.sensor,
+                snapshot.altimeterMeters,
+                snapshot.derived,
+            };
             auto value = ResolveSampleValue(field, ctx);
             if (!value.has_value()) {
                 continue;
@@ -1055,6 +1230,7 @@ int main(int argc, char **argv) {
 
     EnvironmentModel::Config environmentConfig;
     ApogeeVehicleParameters vehicleParameters;
+    EnvironmentModel environment(environmentConfig);
     FlightComputer flightComputer;
     flightComputer.Begin(options.sigmaAccelXY,
                          options.sigmaAccelZ,
@@ -1089,6 +1265,11 @@ int main(int argc, char **argv) {
     std::size_t skippedRows = 0;
     std::size_t outlierAltimeterRows = 0;
     std::size_t emittedStates = 0;
+    bool hasAltitudeReference = false;
+    float altitudeReferenceMeters = 0.0f;
+    bool hasPreviousZenith = false;
+    float previousZenithRadians = 0.0f;
+    float previousTimeSeconds = 0.0f;
     while (std::getline(input, line)) {
         ++lineNumber;
         if (Trim(line).empty()) {
@@ -1115,11 +1296,28 @@ int main(int argc, char **argv) {
         const bool hasState = flightComputer.Update(sample, state);
         if (hasState) {
             ++emittedStates;
+            if (!hasAltitudeReference) {
+                altitudeReferenceMeters = state.position[2];
+                hasAltitudeReference = true;
+            }
+            const SampleValueContext::DerivedMetrics derived = ComputeDerivedMetrics(state,
+                                                                                     environment,
+                                                                                     options.apogeeTargetMeters,
+                                                                                     altitudeReferenceMeters,
+                                                                                     hasAltitudeReference,
+                                                                                     previousTimeSeconds,
+                                                                                     previousZenithRadians,
+                                                                                     hasPreviousZenith);
             if (!options.quiet) {
                 std::cout << state.time << ',' << state.position[2] << ',' << state.velocity[2] << ','
                           << state.apogeeEstimate << ',' << FlightStatusToString(flightComputer.Status());
                 if (!options.extraOutputFields.empty()) {
-                    SampleValueContext context{state, sample, altimeterMeasurementMeters};
+                    SampleValueContext context{
+                        state,
+                        sample,
+                        altimeterMeasurementMeters,
+                        derived,
+                    };
                     for (SampleValueId field : options.extraOutputFields) {
                         std::cout << ',';
                         const auto value = ResolveSampleValue(field, context);
@@ -1131,8 +1329,11 @@ int main(int argc, char **argv) {
                 std::cout << std::endl;
             }
             if (graphingEnabled) {
-                snapshots.push_back(SampleSnapshot{state, sample, altimeterMeasurementMeters});
+                snapshots.push_back(SampleSnapshot{state, sample, altimeterMeasurementMeters, derived});
             }
+            hasPreviousZenith = true;
+            previousZenithRadians = state.zenith;
+            previousTimeSeconds = state.time;
         }
     }
 
