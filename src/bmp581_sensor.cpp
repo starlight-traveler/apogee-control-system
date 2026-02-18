@@ -11,6 +11,7 @@
 #include <arm_math.h>
 
 #include "SparkFun_BMP581_Arduino_Library.h"
+#include "settings.h"
 
 namespace {
 
@@ -20,8 +21,11 @@ constexpr uint8_t kChipSelectPin = 9;
 constexpr uint8_t kInterruptPin = 6;
 constexpr uint32_t kSpiClockHz = 1000000UL;
 
-constexpr float kSeaLevelPressureHpa = 1018.8f;
+constexpr float kSeaLevelPressureHpa = settings::sensors::bmp581::kSeaLevelPressureHpa;
 constexpr float kSeaLevelPressureInv = 1.0f / kSeaLevelPressureHpa;
+constexpr float kMaxAltitudeRateFeetPerSecond = settings::sensors::bmp581::kMaxAltitudeRateFeetPerSecond;
+constexpr float kMinSpikeJumpFeet = settings::sensors::bmp581::kMinSpikeJumpFeet;
+constexpr float kMaxValidAltitudeFeet = settings::sensors::bmp581::kMaxValidAltitudeFeet;
 
 volatile bool g_interruptFlag = false;
 bool g_initialized = false;
@@ -86,6 +90,26 @@ void UpdateCachedSample(float pressureHpa, float temperatureC) {
     g_lastAltitudeFeet = ComputeAltitudeFeet(pressureHpa);
     g_lastTimestamp = static_cast<float>(micros()) * 1.0e-6f;
     g_hasSample = true;
+}
+
+bool IsAltitudeSpike(float candidateAltitudeFeet, float timestampSeconds) {
+    if (!isfinite(candidateAltitudeFeet)) {
+        return true;
+    }
+    if (std::fabs(candidateAltitudeFeet) > kMaxValidAltitudeFeet) {
+        return true;
+    }
+    if (!g_hasSample) {
+        return false;
+    }
+
+    float dt = timestampSeconds - g_lastTimestamp;
+    if (dt < 0.0f) {
+        dt = 0.0f;
+    }
+    const float allowedJumpFeet = std::max(kMinSpikeJumpFeet, kMaxAltitudeRateFeetPerSecond * dt);
+    const float jumpFeet = std::fabs(candidateAltitudeFeet - g_lastAltitudeFeet);
+    return jumpFeet > allowedJumpFeet;
 }
 
 }  // namespace
@@ -163,6 +187,16 @@ bool Bmp581SensorAcquire(SensorData &out) {
     if (!(pressureHpa > 0.0f) || !isfinite(pressureHpa)) {
         return false;
     }
+    const float timestampSeconds = static_cast<float>(micros()) * 1.0e-6f;
+    const float altitudeFeet = ComputeAltitudeFeet(pressureHpa);
+    if (IsAltitudeSpike(altitudeFeet, timestampSeconds)) {
+        out.altitudeFeet = g_lastAltitudeFeet;
+        if (out.timestamp == 0.0f && g_lastTimestamp > 0.0f) {
+            out.timestamp = g_lastTimestamp;
+        }
+        return true;
+    }
+
     UpdateCachedSample(pressureHpa, sample.temperature);
 
     out.altitudeFeet = g_lastAltitudeFeet;

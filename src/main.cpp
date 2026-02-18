@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <Servo.h>
+#include <cmath>
 #include <ctype.h>
 #include <stdlib.h>
 #include <string.h>
@@ -18,11 +19,21 @@ constexpr uint8_t kStatusLedPin = settings::hardware::kStatusLedPin;
 constexpr uint32_t kErrorBlinkIntervalMs = settings::flight::kErrorBlinkIntervalMs;
 constexpr uint32_t kRecoveryBlinkIntervalMs = settings::flight::kRecoveryBlinkIntervalMs;
 constexpr uint8_t kServoPin = settings::hardware::kServoPin;
-constexpr int kServoExtendAngle = settings::hardware::kServoExtendAngle;
 constexpr int kServoRetractAngle = settings::hardware::kServoRetractAngle;
-constexpr float kServoMinExtendAltitudeFeet = 1000.0f;
-constexpr float kServoForceExtendAltitudeFeet = 2000.0f;
-constexpr uint32_t kServoForceExtendHoldMs = 4000.0f;
+constexpr float kServoMinExtendAltitudeFeet = settings::actuation::kServoMinExtendAltitudeFeet;
+constexpr float kServoMaxActuationDeg = settings::actuation::kServoMaxActuationDeg;
+constexpr float kServoLatencySeconds = settings::actuation::kServoLatencySeconds;
+constexpr uint32_t kControlUpdateIntervalMs = settings::actuation::kControlUpdateIntervalMs;
+constexpr float kAngleStepDeg = settings::actuation::kAngleStepDeg;
+constexpr float kAngleCommandDeadbandDeg = settings::actuation::kAngleCommandDeadbandDeg;
+constexpr float kApogeeErrorDeadbandMeters = settings::actuation::kApogeeErrorDeadbandMeters;
+constexpr float kRatePenalty = settings::actuation::kRatePenalty;
+constexpr float kEffortPenalty = settings::actuation::kEffortPenalty;
+constexpr float kUndershootPenalty = settings::actuation::kUndershootPenalty;
+constexpr int kActuationPredictorMaxSteps = settings::actuation::kActuationPredictorMaxSteps;
+constexpr float kCoarseAngleStepDeg = settings::actuation::kCoarseAngleStepDeg;
+constexpr float kCoarseAmbiguityCostThreshold = settings::actuation::kCoarseAmbiguityCostThreshold;
+constexpr float kTargetApogeeMeters = static_cast<float>(settings::flight::kApogeeTargetMeters);
 constexpr bool kEnableCsvReplay = settings::replay::kEnableCsvReplay;
 constexpr const char *kCsvReplayPath = settings::replay::kCsvReplayPath;
 constexpr size_t kCsvLineBufferSize = settings::replay::kCsvLineBufferSize;
@@ -112,6 +123,24 @@ bool InitializeWithRecovery(SystemError error, bool (*initializer)(), const char
     }
 
     return true;
+}
+
+float ClampFloat(float value, float minValue, float maxValue) {
+    if (value < minValue) {
+        return minValue;
+    }
+    if (value > maxValue) {
+        return maxValue;
+    }
+    return value;
+}
+
+float ComputeLagBlend(float dtSeconds, float tauSeconds) {
+    if (tauSeconds <= 0.0f || dtSeconds <= 0.0f) {
+        return 1.0f;
+    }
+    const float alpha = dtSeconds / (tauSeconds + dtSeconds);
+    return ClampFloat(alpha, 0.0f, 1.0f);
 }
 
 }  // namespace
@@ -331,23 +360,131 @@ static bool AcquireSensorData(SensorData &data) {
 
 static FlightComputer flightComputer;
 static CfdTableStorage g_cfdTable;
+static EnvironmentModel g_actuationEnvironment;
+static ApogeePredictor g_actuationPredictor;
 static FlightStatus g_lastLoggedStatus = FlightStatus::Ground;
 static bool g_hasLoggedStatus = false;
 static bool g_hasPadAltitude = false;
 static float g_padAltitudeFeet = 0.0f;
 Servo g_servo;
-static bool g_servoExtended = false;
 static bool g_servoCycleTestMode = false;
-static bool g_servoForcedExtendActive = false;
-static uint32_t g_servoExtendStartMs = 0;
-static bool g_servoExtensionLocked = false;
+static float g_servoCommandDeg = 0.0f;
+static float g_servoEffectiveDeg = 0.0f;
+static float g_lastControlTime = 0.0f;
+static float g_lastZenith = 0.0f;
+static bool g_hasLastZenith = false;
+static uint32_t g_lastControlUpdateMs = 0;
+static int g_lastServoWriteDeg = kServoRetractAngle;
+
+static float EstimateAngularVelocity(const FilteredState &state, float dtSeconds) {
+    if (!g_hasLastZenith || dtSeconds <= 0.0f) {
+        return 0.0f;
+    }
+    return (state.zenith - g_lastZenith) / dtSeconds;
+}
+
+static float SelectActuationCommandDeg(const FilteredState &state,
+                                       float angularVelocityRadPerSec,
+                                       float commandDeg,
+                                       float effectiveDeg) {
+    if (!g_cfdTable.loaded) {
+        return kServoMaxActuationDeg;
+    }
+
+    ApogeeState neutralState;
+    neutralState.altitudeMeters = state.position[2];
+    neutralState.horizontalDistanceMeters = math_utils::Magnitude2(state.position[0], state.position[1]);
+    neutralState.verticalVelocity = state.velocity[2];
+    neutralState.horizontalVelocity = math_utils::Magnitude2(state.velocity[0], state.velocity[1]);
+    neutralState.zenith = state.zenith;
+    neutralState.angularVelocity = angularVelocityRadPerSec;
+    neutralState.acsAngleDeg = 0.0;
+
+    const double neutralApogee = g_actuationPredictor.PredictApogee(neutralState);
+    if (neutralApogee <= static_cast<double>(kTargetApogeeMeters + kApogeeErrorDeadbandMeters)) {
+        return 0.0f;
+    }
+
+    const float assumedDt = static_cast<float>(kControlUpdateIntervalMs) * 1.0e-3f;
+    const float lagBlend = ComputeLagBlend(assumedDt, kServoLatencySeconds);
+
+    auto evaluateCost = [&](float candidateDeg) -> float {
+        const float predictedEffectiveDeg = effectiveDeg + (candidateDeg - effectiveDeg) * lagBlend;
+
+        ApogeeState testState = neutralState;
+        testState.acsAngleDeg = predictedEffectiveDeg;
+        const float predictedApogee = static_cast<float>(g_actuationPredictor.PredictApogee(testState));
+        float apogeeError = predictedApogee - kTargetApogeeMeters;
+        float errorCost = std::fabs(apogeeError);
+        if (apogeeError < 0.0f) {
+            errorCost *= kUndershootPenalty;
+        }
+
+        const float rateCost = kRatePenalty * std::fabs(candidateDeg - commandDeg);
+        const float normAngle = candidateDeg / kServoMaxActuationDeg;
+        const float effortCost = kEffortPenalty * normAngle * normAngle;
+        return errorCost + rateCost + effortCost;
+    };
+
+    float bestAngleDeg = commandDeg;
+    float bestCost = evaluateCost(commandDeg);
+    auto sweepRange = [&](float startDeg, float endDeg, float stepDeg) {
+        for (float candidate = startDeg; candidate <= endDeg + 0.001f; candidate += stepDeg) {
+            const float bounded = ClampFloat(candidate, 0.0f, kServoMaxActuationDeg);
+            const float totalCost = evaluateCost(bounded);
+            if (totalCost < bestCost) {
+                bestCost = totalCost;
+                bestAngleDeg = bounded;
+            }
+        }
+    };
+
+    const float coarseStep = (kCoarseAngleStepDeg >= kAngleStepDeg) ? kCoarseAngleStepDeg : kAngleStepDeg;
+    float coarseBestAngle = 0.0f;
+    float coarseBestCost = 1.0e30f;
+    float coarseSecondBestCost = 1.0e30f;
+    for (float candidate = 0.0f; candidate <= kServoMaxActuationDeg + 0.001f; candidate += coarseStep) {
+        const float totalCost = evaluateCost(candidate);
+        if (totalCost < coarseBestCost) {
+            coarseSecondBestCost = coarseBestCost;
+            coarseBestCost = totalCost;
+            coarseBestAngle = candidate;
+        } else if (totalCost < coarseSecondBestCost) {
+            coarseSecondBestCost = totalCost;
+        }
+    }
+
+    const bool ambiguousCoarse = (coarseSecondBestCost - coarseBestCost) <= kCoarseAmbiguityCostThreshold;
+    if (ambiguousCoarse) {
+        sweepRange(0.0f, kServoMaxActuationDeg, kAngleStepDeg);
+    } else {
+        const float refineHalfWindow = coarseStep;
+        const float refineStart = coarseBestAngle - refineHalfWindow;
+        const float refineEnd = coarseBestAngle + refineHalfWindow;
+        sweepRange(refineStart, refineEnd, kAngleStepDeg);
+    }
+
+    if (std::fabs(bestAngleDeg - commandDeg) <= kAngleCommandDeadbandDeg) {
+        return commandDeg;
+    }
+    return ClampFloat(bestAngleDeg, 0.0f, kServoMaxActuationDeg);
+}
+
+static void WriteServoAngleDeg(float angleDeg) {
+    const int writeDeg = static_cast<int>(std::lround(ClampFloat(angleDeg, 0.0f, kServoMaxActuationDeg)));
+    if (writeDeg == g_lastServoWriteDeg) {
+        return;
+    }
+    g_servo.write(writeDeg);
+    g_lastServoWriteDeg = writeDeg;
+}
 
 void setup() {
     pinMode(kStatusLedPin, OUTPUT);
     digitalWrite(kStatusLedPin, LOW);
 
-    g_servo.attach(18);
-    g_servo.write(0);
+    g_servo.attach(kServoPin);
+    g_servo.write(kServoRetractAngle);
 
     Serial.begin(115200);
     if (kEnableSerialTelemetry) {
@@ -398,6 +535,12 @@ void setup() {
                          vehicleParameters,
                          g_cfdTable.loaded ? &g_cfdTable.table : nullptr);
 
+    g_actuationEnvironment.Configure(environmentConfig);
+    g_actuationPredictor.SetEnvironment(g_actuationEnvironment);
+    g_actuationPredictor.SetVehicleParameters(vehicleParameters);
+    g_actuationPredictor.SetForceTable(g_cfdTable.loaded ? &g_cfdTable.table : nullptr);
+    g_actuationPredictor.SetMaxIntegrationSteps(kActuationPredictorMaxSteps);
+
     flightComputer.SetSerialReportingEnabled(kEnableSerialTelemetry);
 
     if (kEnableSerialTelemetry && Serial) {
@@ -406,6 +549,12 @@ void setup() {
 
     g_lastLoggedStatus = flightComputer.Status();
     g_hasLoggedStatus = false;
+    g_servoCommandDeg = 0.0f;
+    g_servoEffectiveDeg = 0.0f;
+    g_lastControlTime = 0.0f;
+    g_hasLastZenith = false;
+    g_lastControlUpdateMs = millis();
+    g_lastServoWriteDeg = kServoRetractAngle;
 }
 
 void loop() {
@@ -445,6 +594,15 @@ void loop() {
 
     if (hasFilteredState) {
         const FlightStatus status = flightComputer.Status();
+        float dtState = state.time - g_lastControlTime;
+        if (dtState < 0.0f || dtState > 1.0f) {
+            dtState = settings::flight::kDefaultDtSeconds;
+        }
+        const float angularVelocityRadPerSec = EstimateAngularVelocity(state, dtState);
+        const float lagBlend = ComputeLagBlend(dtState, kServoLatencySeconds);
+        g_servoEffectiveDeg += (g_servoCommandDeg - g_servoEffectiveDeg) * lagBlend;
+        g_servoEffectiveDeg = ClampFloat(g_servoEffectiveDeg, 0.0f, kServoMaxActuationDeg);
+
         float altitudeAglFeet = 0.0f;
         if (g_hasPadAltitude) {
             altitudeAglFeet = data.altitudeFeet - g_padAltitudeFeet;
@@ -454,57 +612,21 @@ void loop() {
         }
 
         const bool aboveMinExtendAltitude = altitudeAglFeet >= kServoMinExtendAltitudeFeet;
-        const bool aboveForceExtendAltitude = altitudeAglFeet >= kServoForceExtendAltitudeFeet;
-
-        if (!g_servoExtensionLocked && aboveForceExtendAltitude) {
-            g_servoForcedExtendActive = true;
-            if (!g_servoExtended) {
-                g_servoExtendStartMs = millis();
-                g_servo.write(60);
-                g_servoExtended = true;
-                if (kEnableSerialTelemetry && Serial) {
-                    Serial.println("Servo extended (failsafe altitude).");
-                }
+        if (status == FlightStatus::Coast && aboveMinExtendAltitude) {
+            const uint32_t nowMs = millis();
+            if ((nowMs - g_lastControlUpdateMs) >= kControlUpdateIntervalMs) {
+                g_servoCommandDeg = SelectActuationCommandDeg(state,
+                                                              angularVelocityRadPerSec,
+                                                              g_servoCommandDeg,
+                                                              g_servoEffectiveDeg);
+                g_lastControlUpdateMs = nowMs;
             }
+        } else {
+            g_servoCommandDeg = 0.0f;
         }
 
-        if (!g_servoExtensionLocked && !g_servoForcedExtendActive &&
-            !g_servoExtended && status == FlightStatus::Coast && aboveMinExtendAltitude) {
-            g_servoExtendStartMs = millis();
-            g_servo.write(60);
-            g_servoExtended = true;
-            if (kEnableSerialTelemetry && Serial) {
-                Serial.println("Servo extended (coast).");
-            }
-        }
+        WriteServoAngleDeg(g_servoCommandDeg);
 
-        if (g_servoExtended && g_servoExtendStartMs == 0) {
-            g_servoExtendStartMs = millis();
-        }
-
-        if (g_servoExtended && g_servoExtendStartMs != 0) {
-            const uint32_t elapsedMs = millis() - g_servoExtendStartMs;
-            if (elapsedMs >= kServoForceExtendHoldMs) {
-                g_servo.write(0);
-                g_servoExtended = false;
-                g_servoForcedExtendActive = false;
-                g_servoExtensionLocked = true;
-                g_servoExtendStartMs = 0;
-                
-                if (kEnableSerialTelemetry && Serial) {
-                    Serial.println("Servo retracted (max hold).");
-                }
-            }
-        }
-
-        if (g_servoExtended && status == FlightStatus::Descent && !g_servoForcedExtendActive) {
-            g_servo.write(0);
-            g_servoExtended = false;
-            g_servoExtendStartMs = 0;
-            if (kEnableSerialTelemetry && Serial) {
-                Serial.println("Servo retracted (descent).");
-            }
-        }
         if (!g_hasLoggedStatus || status != g_lastLoggedStatus) {
             DataLoggerLogEvent(FlightEventType::StageChange,
                                status,
@@ -515,6 +637,9 @@ void loop() {
             g_lastLoggedStatus = status;
             g_hasLoggedStatus = true;
         }
+        g_lastControlTime = state.time;
+        g_lastZenith = state.zenith;
+        g_hasLastZenith = true;
     }
 
     if (hasFilteredState && kEnableSerialTelemetry && Serial) {
@@ -532,6 +657,10 @@ void loop() {
         Serial.print(state.inertialAcceleration[2], 2);
         Serial.print(" apg=");
         Serial.print(state.apogeeEstimate, 2);
+        Serial.print(" cmd=");
+        Serial.print(g_servoCommandDeg, 1);
+        Serial.print(" eff=");
+        Serial.print(g_servoEffectiveDeg, 1);
         Serial.print(" status=");
         Serial.println(FlightStatusToString(flightComputer.Status()));
     }

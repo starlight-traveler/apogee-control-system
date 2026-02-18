@@ -47,6 +47,39 @@ constexpr int kServoRetractAngle = 0;
 }
 
 // ---------------------------------------------------------------------------
+// Actuation Settings
+// Deployment gating thresholds for the ACS servo logic.
+// ---------------------------------------------------------------------------
+namespace actuation {
+// Minimum altitude above pad reference (feet AGL) before coast-phase extension.
+constexpr float kServoMinExtendAltitudeFeet = 1000.0f;
+// Physical full-deployment angle (degrees). 0 deg is fully retracted.
+constexpr float kServoMaxActuationDeg = 60.0f;
+// First-order servo/flap response time constant (seconds).
+constexpr float kServoLatencySeconds = 0.20f;
+// Controller update period for angle optimization.
+constexpr uint32_t kControlUpdateIntervalMs = 40;
+// Candidate angle spacing used by the optimizer search (degrees).
+constexpr float kAngleStepDeg = 2.0f;
+// Ignore tiny command changes to reduce chatter (degrees).
+constexpr float kAngleCommandDeadbandDeg = 1.0f;
+// Do not add drag when within this apogee error band (meters).
+constexpr float kApogeeErrorDeadbandMeters = 6.0f;
+// Cost weight for command slew (penalizes large step changes).
+constexpr float kRatePenalty = 0.15f;
+// Cost weight for high actuation angles (conserves control authority).
+constexpr float kEffortPenalty = 0.20f;
+// Extra cost multiplier when predicted apogee falls below target.
+constexpr float kUndershootPenalty = 2.0f;
+// Integration step cap for the actuation-side predictor (kept at flight default for accuracy).
+constexpr int kActuationPredictorMaxSteps = APOGEE_PREDICTOR_MAX_STEPS;
+// Coarse search spacing for two-stage command optimization (degrees).
+constexpr float kCoarseAngleStepDeg = 8.0f;
+// If top coarse candidates are too close in cost, use full-resolution sweep.
+constexpr float kCoarseAmbiguityCostThreshold = 2.0f;
+}
+
+// ---------------------------------------------------------------------------
 // Replay Settings
 // Controls local CSV replay mode and parser buffer sizing.
 // ---------------------------------------------------------------------------
@@ -101,5 +134,22 @@ constexpr double kProcessNoiseZ = 1.0;
 constexpr double kApogeeTargetMeters = 1711.;
 
 constexpr int kApogeePredictorMaxSteps = APOGEE_PREDICTOR_MAX_STEPS;
+}
+
+// ---------------------------------------------------------------------------
+// Sensor Settings
+// Sensor-specific configuration and runtime sanity checks.
+// ---------------------------------------------------------------------------
+namespace sensors {
+namespace bmp581 {
+// Pressure reference used by barometric altitude conversion.
+constexpr float kSeaLevelPressureHpa = 1018.8f;
+// Reject altitude jumps that imply faster vertical motion than this rate.
+constexpr float kMaxAltitudeRateFeetPerSecond = 2500.0f;
+// Minimum single-sample jump (feet) required before classifying as a spike.
+constexpr float kMinSpikeJumpFeet = 500.0f;
+// Absolute altitude magnitude limit for invalid sample rejection.
+constexpr float kMaxValidAltitudeFeet = 120000.0f;
+}
 }
 }  // namespace settings

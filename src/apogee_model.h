@@ -38,6 +38,7 @@ struct ApogeeState {
     double horizontalVelocity = 0.0;
     double zenith = 0.0;
     double angularVelocity = 0.0;
+    double acsAngleDeg = 0.0;
 };
 
 class ApogeePredictor {
@@ -81,6 +82,11 @@ class ApogeePredictor {
         double horizontalAcceleration;
         double zenithRate;
         double angularAcceleration;
+    };
+
+    struct InterpolatedForces {
+        double axial;
+        double normal;
     };
 
     struct AccelResult {
@@ -166,33 +172,39 @@ class ApogeePredictor {
         return table[index];
     }
 
-    static double InterpolateTable(const ApogeeForceTable &table,
-                                   const double *values,
-                                   double acsDeg,
-                                   double atkDeg,
-                                   double mach) {
+    static InterpolatedForces InterpolateForces(const ApogeeForceTable &table,
+                                                double acsDeg,
+                                                double atkDeg,
+                                                double mach) {
         const AxisInterp acs = InterpolateAxis(table.acsAnglesDeg, table.acsCount, acsDeg);
         const AxisInterp atk = InterpolateAxis(table.atkAnglesDeg, table.atkCount, atkDeg);
         const AxisInterp mch = InterpolateAxis(table.machNumbers, table.machCount, mach);
 
-        const double v000 = SampleTable(values, table.atkCount, table.machCount, acs.lower, atk.lower, mch.lower);
-        const double v100 = SampleTable(values, table.atkCount, table.machCount, acs.upper, atk.lower, mch.lower);
-        const double v010 = SampleTable(values, table.atkCount, table.machCount, acs.lower, atk.upper, mch.lower);
-        const double v110 = SampleTable(values, table.atkCount, table.machCount, acs.upper, atk.upper, mch.lower);
-        const double v001 = SampleTable(values, table.atkCount, table.machCount, acs.lower, atk.lower, mch.upper);
-        const double v101 = SampleTable(values, table.atkCount, table.machCount, acs.upper, atk.lower, mch.upper);
-        const double v011 = SampleTable(values, table.atkCount, table.machCount, acs.lower, atk.upper, mch.upper);
-        const double v111 = SampleTable(values, table.atkCount, table.machCount, acs.upper, atk.upper, mch.upper);
+        auto interpValues = [&](const double *values) -> double {
+            const double v000 = SampleTable(values, table.atkCount, table.machCount, acs.lower, atk.lower, mch.lower);
+            const double v100 = SampleTable(values, table.atkCount, table.machCount, acs.upper, atk.lower, mch.lower);
+            const double v010 = SampleTable(values, table.atkCount, table.machCount, acs.lower, atk.upper, mch.lower);
+            const double v110 = SampleTable(values, table.atkCount, table.machCount, acs.upper, atk.upper, mch.lower);
+            const double v001 = SampleTable(values, table.atkCount, table.machCount, acs.lower, atk.lower, mch.upper);
+            const double v101 = SampleTable(values, table.atkCount, table.machCount, acs.upper, atk.lower, mch.upper);
+            const double v011 = SampleTable(values, table.atkCount, table.machCount, acs.lower, atk.upper, mch.upper);
+            const double v111 = SampleTable(values, table.atkCount, table.machCount, acs.upper, atk.upper, mch.upper);
 
-        const double v00 = v000 + (v100 - v000) * acs.t;
-        const double v10 = v010 + (v110 - v010) * acs.t;
-        const double v01 = v001 + (v101 - v001) * acs.t;
-        const double v11 = v011 + (v111 - v011) * acs.t;
+            const double v00 = v000 + (v100 - v000) * acs.t;
+            const double v10 = v010 + (v110 - v010) * acs.t;
+            const double v01 = v001 + (v101 - v001) * acs.t;
+            const double v11 = v011 + (v111 - v011) * acs.t;
 
-        const double v0 = v00 + (v10 - v00) * atk.t;
-        const double v1 = v01 + (v11 - v01) * atk.t;
+            const double v0 = v00 + (v10 - v00) * atk.t;
+            const double v1 = v01 + (v11 - v01) * atk.t;
 
-        return v0 + (v1 - v0) * mch.t;
+            return v0 + (v1 - v0) * mch.t;
+        };
+
+        InterpolatedForces result;
+        result.axial = interpValues(table.axialForces);
+        result.normal = interpValues(table.normalForces);
+        return result;
     }
 
     AccelResult ComputeAcceleration(const ApogeeState &state) {
@@ -234,7 +246,7 @@ class ApogeePredictor {
         const ApogeeForceTable *table = forceTable_;
         if (mach >= 0.025 && table != nullptr && table->IsValid() &&
             vehicle_.dryMass > 0.0 && vehicle_.momentOfInertia > 0.0) {
-            double atkAngle = state.zenith - std::fabs(std::atan(relY / relX));
+            double atkAngle = state.zenith - std::fabs(math_utils::FastAtan2(relY, relX));
             bool liftState = true;
             if (atkAngle < 0.0) {
                 liftState = false;
@@ -243,10 +255,11 @@ class ApogeePredictor {
 
             constexpr double kRadToDeg = 57.29577951308232;
             const double atkDeg = atkAngle * kRadToDeg;
-            const double acsDeg = 0.0;
+            const double acsDeg = state.acsAngleDeg;
 
-            const double axialForceMag = InterpolateTable(*table, table->axialForces, acsDeg, atkDeg, mach);
-            const double normalForceMag = InterpolateTable(*table, table->normalForces, acsDeg, atkDeg, mach);
+            const InterpolatedForces forces = InterpolateForces(*table, acsDeg, atkDeg, mach);
+            const double axialForceMag = forces.axial;
+            const double normalForceMag = forces.normal;
 
             float sinZf = 0.0f;
             float cosZf = 1.0f;
