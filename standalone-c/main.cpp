@@ -29,6 +29,9 @@ namespace {
 bool CaseInsensitiveEquals(const std::string &a, const std::string &b);
 enum class SampleValueId;
 
+constexpr float kAltimeterMinFeet = 700.0f;
+constexpr float kAltimeterMaxFeet = 6000.0f;
+
 enum class FieldId {
     Timestamp,
     AltitudeFeet,
@@ -1084,6 +1087,7 @@ int main(int argc, char **argv) {
     std::size_t lineNumber = 1;
     std::size_t processedRows = 0;
     std::size_t skippedRows = 0;
+    std::size_t outlierAltimeterRows = 0;
     std::size_t emittedStates = 0;
     while (std::getline(input, line)) {
         ++lineNumber;
@@ -1097,6 +1101,13 @@ int main(int argc, char **argv) {
         if (!PopulateSensorData(row, indices, sample, altimeterMeasurementMeters, error)) {
             ++skippedRows;
             std::cerr << "Skipping line " << lineNumber << ": " << error << std::endl;
+            continue;
+        }
+        if (sample.altitudeFeet < kAltimeterMinFeet || sample.altitudeFeet > kAltimeterMaxFeet) {
+            ++skippedRows;
+            ++outlierAltimeterRows;
+            std::cerr << "Skipping line " << lineNumber << ": altimeter out of range ("
+                      << sample.altitudeFeet << " ft)" << std::endl;
             continue;
         }
         ++processedRows;
@@ -1132,6 +1143,9 @@ int main(int argc, char **argv) {
     std::cout << std::endl;
     std::cout << "Samples processed: " << processedRows << std::endl;
     std::cout << "Rows skipped: " << skippedRows << std::endl;
+    if (outlierAltimeterRows > 0) {
+        std::cout << "Altimeter outliers skipped: " << outlierAltimeterRows << std::endl;
+    }
     std::cout << "States generated: " << emittedStates << std::endl;
     if (flightComputer.ApogeeReached()) {
         std::cout << "Apogee recorded at " << flightComputer.ApogeeAltitude() << " m" << std::endl;
