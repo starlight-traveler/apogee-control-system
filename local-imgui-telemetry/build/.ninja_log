@@ -1,0 +1,14 @@
+# ninja log v7
+2	152	1771824268504763637	CMakeFiles/imgui_vendor.dir/_deps/imgui-src/backends/imgui_impl_opengl3.cpp.o	8036db804480f85e
+2	249	1771824268504511216	CMakeFiles/imgui_vendor.dir/_deps/imgui-src/backends/imgui_impl_glfw.cpp.o	3cd58bd95de8b06a
+2	455	1771824268504916939	CMakeFiles/teensy_imgui_telemetry.dir/main.cpp.o	3785703ee58e8819
+1	1110	1771824268504060107	CMakeFiles/imgui_vendor.dir/_deps/imgui-src/imgui_tables.cpp.o	6f1b4de27b4d7214
+1	1471	1771824268503777754	CMakeFiles/imgui_vendor.dir/_deps/imgui-src/imgui_draw.cpp.o	893fa54c3cc194c3
+2	1821	1771824268504306603	CMakeFiles/imgui_vendor.dir/_deps/imgui-src/imgui_widgets.cpp.o	88f49dd63f0975b8
+1	2178	1771824268502962057	CMakeFiles/imgui_vendor.dir/_deps/imgui-src/imgui.cpp.o	37fc03e91f4b517c
+2178	2270	1771824270679953263	libimgui_vendor.a	4d885330f250c9fb
+2270	2365	1771824270771952892	teensy_imgui_telemetry	4a7e4101f3677a36
+4	443	1771825364199278215	CMakeFiles/teensy_imgui_telemetry.dir/main.cpp.o	3785703ee58e8819
+443	540	1771825364638278093	teensy_imgui_telemetry	4a7e4101f3677a36
+9	423	1771863567573875446	CMakeFiles/teensy_imgui_telemetry.dir/main.cpp.o	3785703ee58e8819
+423	493	1771863567988000163	teensy_imgui_telemetry	4a7e4101f3677a36

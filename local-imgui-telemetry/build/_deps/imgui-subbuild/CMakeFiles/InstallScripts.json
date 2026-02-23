@@ -1,0 +1,7 @@
+{
+	"InstallScripts" : 
+	[
+		"/local/rocketry/apogee-control-system-teensy/local-imgui-telemetry/build/_deps/imgui-subbuild/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

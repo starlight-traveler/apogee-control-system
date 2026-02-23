@@ -1,0 +1,46 @@
+{
+	"sources" : 
+	[
+		{
+			"file" : "/local/rocketry/apogee-control-system-teensy/local-imgui-telemetry/build/_deps/imgui-subbuild/CMakeFiles/imgui-populate"
+		},
+		{
+			"file" : "/local/rocketry/apogee-control-system-teensy/local-imgui-telemetry/build/_deps/imgui-subbuild/CMakeFiles/imgui-populate.rule"
+		},
+		{
+			"file" : "/local/rocketry/apogee-control-system-teensy/local-imgui-telemetry/build/_deps/imgui-subbuild/CMakeFiles/imgui-populate-complete.rule"
+		},
+		{
+			"file" : "/local/rocketry/apogee-control-system-teensy/local-imgui-telemetry/build/_deps/imgui-subbuild/imgui-populate-prefix/src/imgui-populate-stamp/imgui-populate-build.rule"
+		},
+		{
+			"file" : "/local/rocketry/apogee-control-system-teensy/local-imgui-telemetry/build/_deps/imgui-subbuild/imgui-populate-prefix/src/imgui-populate-stamp/imgui-populate-configure.rule"
+		},
+		{
+			"file" : "/local/rocketry/apogee-control-system-teensy/local-imgui-telemetry/build/_deps/imgui-subbuild/imgui-populate-prefix/src/imgui-populate-stamp/imgui-populate-download.rule"
+		},
+		{
+			"file" : "/local/rocketry/apogee-control-system-teensy/local-imgui-telemetry/build/_deps/imgui-subbuild/imgui-populate-prefix/src/imgui-populate-stamp/imgui-populate-install.rule"
+		},
+		{
+			"file" : "/local/rocketry/apogee-control-system-teensy/local-imgui-telemetry/build/_deps/imgui-subbuild/imgui-populate-prefix/src/imgui-populate-stamp/imgui-populate-mkdir.rule"
+		},
+		{
+			"file" : "/local/rocketry/apogee-control-system-teensy/local-imgui-telemetry/build/_deps/imgui-subbuild/imgui-populate-prefix/src/imgui-populate-stamp/imgui-populate-patch.rule"
+		},
+		{
+			"file" : "/local/rocketry/apogee-control-system-teensy/local-imgui-telemetry/build/_deps/imgui-subbuild/imgui-populate-prefix/src/imgui-populate-stamp/imgui-populate-test.rule"
+		},
+		{
+			"file" : "/local/rocketry/apogee-control-system-teensy/local-imgui-telemetry/build/_deps/imgui-subbuild/imgui-populate-prefix/src/imgui-populate-stamp/imgui-populate-update.rule"
+		}
+	],
+	"target" : 
+	{
+		"labels" : 
+		[
+			"imgui-populate"
+		],
+		"name" : "imgui-populate"
+	}
+}
