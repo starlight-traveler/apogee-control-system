@@ -20,7 +20,6 @@ events:
     names:
       - "uname"
     candidate_directories:
-      - "/home/rpaillet/.codex/tmp/arg0/codex-arg0qA4b3H/"
       - "/usr/local/sbin/"
       - "/usr/local/bin/"
       - "/usr/bin/"
@@ -28,15 +27,14 @@ events:
       - "/usr/bin/vendor_perl/"
       - "/usr/bin/core_perl/"
       - "/usr/lib/rustup/bin/"
+      - "/home/rpaillet/.vscode/extensions/ms-python.debugpy-2025.18.0-linux-x64/bundled/scripts/noConfigScripts/"
       - "/bin/"
     searched_directories:
-      - "/home/rpaillet/.codex/tmp/arg0/codex-arg0qA4b3H/uname"
       - "/usr/local/sbin/uname"
       - "/usr/local/bin/uname"
     found: "/usr/bin/uname"
     search_context:
       ENV{PATH}:
-        - "/home/rpaillet/.codex/tmp/arg0/codex-arg0qA4b3H"
         - "/usr/local/sbin"
         - "/usr/local/bin"
         - "/usr/bin"
@@ -44,6 +42,7 @@ events:
         - "/usr/bin/vendor_perl"
         - "/usr/bin/core_perl"
         - "/usr/lib/rustup/bin"
+        - "/home/rpaillet/.vscode/extensions/ms-python.debugpy-2025.18.0-linux-x64/bundled/scripts/noConfigScripts"
   -
     kind: "message-v1"
     backtrace:

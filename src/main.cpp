@@ -10,8 +10,11 @@
 #include "cfd_table.h"
 #include "data_logger.h"
 #include "flight_computer.h"
+#include "icm20948_sensor.h"
+#include "network_telemetry.h"
+#include "serial_logging.h"
 #include "settings.h"
-constexpr bool kEnableSerialTelemetry = settings::build::kEnableSerialTelemetry;
+#include "status_leds.h"
 
 namespace {
 
@@ -40,8 +43,9 @@ constexpr size_t kCsvLineBufferSize = settings::replay::kCsvLineBufferSize;
 
 enum class SystemError : uint8_t {
     BnoInitialization = 0,
-    BmpInitialization = 1,
-    DataLoggerInitialization = 2,
+    IcmInitialization = 1,
+    BmpInitialization = 2,
+    DataLoggerInitialization = 3,
 };
 
 struct CsvReplayState {
@@ -55,7 +59,11 @@ struct CsvReplayState {
     int idxAccelIcm[3] = {-1, -1, -1};
     int idxQuat[4] = {-1, -1, -1, -1};
     int idxGyro[3] = {-1, -1, -1};
+    int idxIcmQuat[4] = {-1, -1, -1, -1};
+    int idxIcmYpr[3] = {-1, -1, -1};
     int idxHasQuaternion = -1;
+    int idxHasIcmQuaternion = -1;
+    int idxHasIcmYpr = -1;
     float lastTimestamp = 0.0f;
     bool hasLastTimestamp = false;
     uint32_t lastSampleMicros = 0;
@@ -67,10 +75,12 @@ uint8_t BlinkCountForError(SystemError error) {
     switch (error) {
         case SystemError::BnoInitialization:
             return 2;
-        case SystemError::BmpInitialization:
+        case SystemError::IcmInitialization:
             return 3;
-        case SystemError::DataLoggerInitialization:
+        case SystemError::BmpInitialization:
             return 4;
+        case SystemError::DataLoggerInitialization:
+            return 5;
     }
     return 1;
 }
@@ -100,8 +110,8 @@ bool InitializeWithRecovery(SystemError error, bool (*initializer)(), const char
     uint32_t retryDelayMs = 200;
     while (!initializer()) {
         hadFailure = true;
-        if (!loggedFailure && failureMessage != nullptr && kEnableSerialTelemetry && Serial) {
-            Serial.println(failureMessage);
+        if (!loggedFailure && failureMessage != nullptr) {
+            LOG_PRINTLN(failureMessage);
             loggedFailure = true;
         }
         IndicateError(error);
@@ -118,8 +128,8 @@ bool InitializeWithRecovery(SystemError error, bool (*initializer)(), const char
         IndicateRecovery();
     }
 
-    if (loggedFailure && failureMessage != nullptr && kEnableSerialTelemetry && Serial) {
-        Serial.println("Recovered successfully.");
+    if (loggedFailure && failureMessage != nullptr) {
+        LOG_PRINTLN("Recovered successfully.");
     }
 
     return true;
@@ -233,7 +243,16 @@ static bool CsvReplayInit() {
         CsvAssignIndexIfMatch(fields[i], "sensor_gyro_x", g_csvReplay.idxGyro[0], i);
         CsvAssignIndexIfMatch(fields[i], "sensor_gyro_y", g_csvReplay.idxGyro[1], i);
         CsvAssignIndexIfMatch(fields[i], "sensor_gyro_z", g_csvReplay.idxGyro[2], i);
+        CsvAssignIndexIfMatch(fields[i], "sensor_icm_quat_w", g_csvReplay.idxIcmQuat[0], i);
+        CsvAssignIndexIfMatch(fields[i], "sensor_icm_quat_x", g_csvReplay.idxIcmQuat[1], i);
+        CsvAssignIndexIfMatch(fields[i], "sensor_icm_quat_y", g_csvReplay.idxIcmQuat[2], i);
+        CsvAssignIndexIfMatch(fields[i], "sensor_icm_quat_z", g_csvReplay.idxIcmQuat[3], i);
+        CsvAssignIndexIfMatch(fields[i], "sensor_icm_yaw_deg", g_csvReplay.idxIcmYpr[0], i);
+        CsvAssignIndexIfMatch(fields[i], "sensor_icm_pitch_deg", g_csvReplay.idxIcmYpr[1], i);
+        CsvAssignIndexIfMatch(fields[i], "sensor_icm_roll_deg", g_csvReplay.idxIcmYpr[2], i);
         CsvAssignIndexIfMatch(fields[i], "sensor_has_quaternion", g_csvReplay.idxHasQuaternion, i);
+        CsvAssignIndexIfMatch(fields[i], "sensor_has_icm_quaternion", g_csvReplay.idxHasIcmQuaternion, i);
+        CsvAssignIndexIfMatch(fields[i], "sensor_has_icm_ypr", g_csvReplay.idxHasIcmYpr, i);
     }
 
     if (g_csvReplay.idxTimestamp < 0 || g_csvReplay.idxAltitudeFeet < 0) {
@@ -243,10 +262,8 @@ static bool CsvReplayInit() {
     g_csvReplay.enabled = true;
     g_csvReplay.headerParsed = true;
     g_csvReplay.hasLastTimestamp = false;
-    if (kEnableSerialTelemetry && Serial) {
-        Serial.print("CSV replay enabled: ");
-        Serial.println(kCsvReplayPath);
-    }
+    LOG_PRINT("CSV replay enabled: ");
+    LOG_PRINTLN(kCsvReplayPath);
     return true;
 }
 
@@ -339,13 +356,45 @@ static bool CsvReplayNextSample(SensorData &data) {
             data.hasQuaternion = hasQuatValues;
         }
 
+        bool hasIcmQuatValues = true;
+        for (int i = 0; i < 4; ++i) {
+            if (g_csvReplay.idxIcmQuat[i] >= 0 && g_csvReplay.idxIcmQuat[i] < count) {
+                if (!ParseFloatField(fields[g_csvReplay.idxIcmQuat[i]], data.icmQuaternion[i])) {
+                    hasIcmQuatValues = false;
+                }
+            } else {
+                hasIcmQuatValues = false;
+            }
+        }
+
+        bool hasIcmYprValues = true;
+        for (int i = 0; i < 3; ++i) {
+            if (g_csvReplay.idxIcmYpr[i] >= 0 && g_csvReplay.idxIcmYpr[i] < count) {
+                if (!ParseFloatField(fields[g_csvReplay.idxIcmYpr[i]], data.icmYprDeg[i])) {
+                    hasIcmYprValues = false;
+                }
+            } else {
+                hasIcmYprValues = false;
+            }
+        }
+
+        if (g_csvReplay.idxHasIcmQuaternion >= 0 && g_csvReplay.idxHasIcmQuaternion < count) {
+            ParseBoolField(fields[g_csvReplay.idxHasIcmQuaternion], data.hasIcmQuaternion);
+        } else {
+            data.hasIcmQuaternion = hasIcmQuatValues;
+        }
+
+        if (g_csvReplay.idxHasIcmYpr >= 0 && g_csvReplay.idxHasIcmYpr < count) {
+            ParseBoolField(fields[g_csvReplay.idxHasIcmYpr], data.hasIcmYpr);
+        } else {
+            data.hasIcmYpr = hasIcmYprValues;
+        }
+
         return true;
     }
 
     g_csvReplay.completed = true;
-    if (kEnableSerialTelemetry && Serial) {
-        Serial.println("CSV replay complete.");
-    }
+    LOG_PRINTLN("CSV replay complete.");
     return false;
 }
 
@@ -353,9 +402,10 @@ static bool AcquireSensorData(SensorData &data) {
     if (g_csvReplay.enabled) {
         return CsvReplayNextSample(data);
     }
-    bool hasImu = Bno055SensorAcquire(data);
-    bool hasAltimeter = Bmp581SensorAcquire(data);
-    return hasImu || hasAltimeter;
+    const bool hasBnoImu = Bno055SensorAcquire(data);
+    const bool hasIcmImu = Icm20948SensorAcquire(data);
+    const bool hasAltimeter = Bmp581SensorAcquire(data);
+    return hasBnoImu || hasIcmImu || hasAltimeter;
 }
 
 static FlightComputer flightComputer;
@@ -376,6 +426,14 @@ static bool g_hasLastZenith = false;
 static uint32_t g_lastControlUpdateMs = 0;
 static int g_lastServoWriteDeg = kServoRetractAngle;
 
+static void ServiceStatusLeds(uint32_t nowMs, bool manualOverrideActive) {
+    StatusLedsSetFault(!DataLoggerIsInitialized());
+    StatusLedsSetFlightStatus(flightComputer.Status());
+    StatusLedsSetComms(NetworkTelemetryConnected(), NetworkTelemetrySubscriberActive());
+    StatusLedsSetManualOverride(manualOverrideActive);
+    StatusLedsService(nowMs);
+}
+
 static float EstimateAngularVelocity(const FilteredState &state, float dtSeconds) {
     if (!g_hasLastZenith || dtSeconds <= 0.0f) {
         return 0.0f;
@@ -388,7 +446,8 @@ static float SelectActuationCommandDeg(const FilteredState &state,
                                        float commandDeg,
                                        float effectiveDeg) {
     if (!g_cfdTable.loaded) {
-        return kServoMaxActuationDeg;
+        // Fail-safe: with no aero model available, keep ACS neutral.
+        return 0.0f;
     }
 
     ApogeeState neutralState;
@@ -407,8 +466,23 @@ static float SelectActuationCommandDeg(const FilteredState &state,
 
     const float assumedDt = static_cast<float>(kControlUpdateIntervalMs) * 1.0e-3f;
     const float lagBlend = ComputeLagBlend(assumedDt, kServoLatencySeconds);
+    struct CostEvalEntry {
+        float angleDeg = 0.0f;
+        float cost = 0.0f;
+        bool valid = false;
+    };
+    constexpr int kMaxCachedAngles = settings::actuation::kEvalCacheMaxEntries;
+    CostEvalEntry evalCache[kMaxCachedAngles];
+    int evalCacheCount = 0;
 
     auto evaluateCost = [&](float candidateDeg) -> float {
+        for (int i = 0; i < evalCacheCount; ++i) {
+            if (evalCache[i].valid &&
+                std::fabs(evalCache[i].angleDeg - candidateDeg) <= settings::actuation::kEvalCacheMatchEpsilonDeg) {
+                return evalCache[i].cost;
+            }
+        }
+
         const float predictedEffectiveDeg = effectiveDeg + (candidateDeg - effectiveDeg) * lagBlend;
 
         ApogeeState testState = neutralState;
@@ -423,18 +497,34 @@ static float SelectActuationCommandDeg(const FilteredState &state,
         const float rateCost = kRatePenalty * std::fabs(candidateDeg - commandDeg);
         const float normAngle = candidateDeg / kServoMaxActuationDeg;
         const float effortCost = kEffortPenalty * normAngle * normAngle;
-        return errorCost + rateCost + effortCost;
+        const float totalCost = errorCost + rateCost + effortCost;
+        if (evalCacheCount < kMaxCachedAngles) {
+            evalCache[evalCacheCount].angleDeg = candidateDeg;
+            evalCache[evalCacheCount].cost = totalCost;
+            evalCache[evalCacheCount].valid = true;
+            ++evalCacheCount;
+        }
+        return totalCost;
     };
 
     float bestAngleDeg = commandDeg;
     float bestCost = evaluateCost(commandDeg);
-    auto sweepRange = [&](float startDeg, float endDeg, float stepDeg) {
+    auto sweepRange = [&](float startDeg, float endDeg, float stepDeg, bool allowPrune) {
+        int consecutiveWorse = 0;
         for (float candidate = startDeg; candidate <= endDeg + 0.001f; candidate += stepDeg) {
             const float bounded = ClampFloat(candidate, 0.0f, kServoMaxActuationDeg);
             const float totalCost = evaluateCost(bounded);
             if (totalCost < bestCost) {
                 bestCost = totalCost;
                 bestAngleDeg = bounded;
+                consecutiveWorse = 0;
+            } else if (allowPrune && settings::actuation::kEnableSweepPruning) {
+                ++consecutiveWorse;
+                // In full-range sweep, when cost has been worse for several consecutive bins,
+                // additional angles are unlikely to beat the current minimum.
+                if (consecutiveWorse >= settings::actuation::kSweepPruneConsecutiveWorse) {
+                    break;
+                }
             }
         }
     };
@@ -456,12 +546,12 @@ static float SelectActuationCommandDeg(const FilteredState &state,
 
     const bool ambiguousCoarse = (coarseSecondBestCost - coarseBestCost) <= kCoarseAmbiguityCostThreshold;
     if (ambiguousCoarse) {
-        sweepRange(0.0f, kServoMaxActuationDeg, kAngleStepDeg);
+        sweepRange(0.0f, kServoMaxActuationDeg, kAngleStepDeg, true);
     } else {
         const float refineHalfWindow = coarseStep;
         const float refineStart = coarseBestAngle - refineHalfWindow;
         const float refineEnd = coarseBestAngle + refineHalfWindow;
-        sweepRange(refineStart, refineEnd, kAngleStepDeg);
+        sweepRange(refineStart, refineEnd, kAngleStepDeg, false);
     }
 
     if (std::fabs(bestAngleDeg - commandDeg) <= kAngleCommandDeadbandDeg) {
@@ -486,13 +576,11 @@ void setup() {
     g_servo.attach(kServoPin);
     g_servo.write(kServoRetractAngle);
 
-    Serial.begin(115200);
-    if (kEnableSerialTelemetry) {
-        while (!Serial && millis() < 2000) {
-        }
+    LOG_BEGIN(115200);
+#if ENABLE_SERIAL_LOGGING
+    while (!Serial && millis() < 2000) {
     }
-
-    DataLoggerSetSerialLoggingEnabled(kEnableSerialTelemetry);
+#endif
 
     InitializeWithRecovery(SystemError::DataLoggerInitialization,
                            &DataLoggerBegin,
@@ -506,17 +594,24 @@ void setup() {
                                &Bno055SensorBegin,
                                "Failed to initialize BNO055 sensor.");
 
+        InitializeWithRecovery(SystemError::IcmInitialization,
+                               &Icm20948SensorBegin,
+                               "Failed to initialize ICM-20948 sensor.");
+
         InitializeWithRecovery(SystemError::BmpInitialization,
                                &Bmp581SensorBegin,
                                "Failed to initialize BMP581 sensor.");
     }
 
-    if (!CfdTableLoadFromSd("cfd.csv", &g_cfdTable, kEnableSerialTelemetry)) {
-        CfdTableLoadFromSd("lib/cfd.csv", &g_cfdTable, kEnableSerialTelemetry);
+    if (!CfdTableLoadFromSd("cfd.csv", &g_cfdTable)) {
+        CfdTableLoadFromSd("lib/cfd.csv", &g_cfdTable);
     }
 
     const EnvironmentModel::Config environmentConfig;
     ApogeeVehicleParameters vehicleParameters;
+    vehicleParameters.centerOfPressureOffsetMeters = settings::vehicle::kCenterOfPressureOffsetMeters;
+    vehicleParameters.momentOfInertia = settings::vehicle::kMomentOfInertiaKgM2;
+    vehicleParameters.dryMass = settings::vehicle::kDryMassKg;
 
     const double sigmaAccelXY = settings::flight::kSigmaAccelXY;
     const double sigmaAccelZ = settings::flight::kSigmaAccelZ;
@@ -541,11 +636,10 @@ void setup() {
     g_actuationPredictor.SetForceTable(g_cfdTable.loaded ? &g_cfdTable.table : nullptr);
     g_actuationPredictor.SetMaxIntegrationSteps(kActuationPredictorMaxSteps);
 
-    flightComputer.SetSerialReportingEnabled(kEnableSerialTelemetry);
+    LOG_PRINTLN("Flight computer initialized.");
 
-    if (kEnableSerialTelemetry && Serial) {
-        Serial.println("Flight computer initialized.");
-    }
+    NetworkTelemetryBegin();
+    StatusLedsBegin();
 
     g_lastLoggedStatus = flightComputer.Status();
     g_hasLoggedStatus = false;
@@ -558,12 +652,15 @@ void setup() {
 }
 
 void loop() {
+    const uint32_t nowMs = millis();
     if (g_servoCycleTestMode) {
+        ServiceStatusLeds(nowMs, false);
         delay(1000);
         return;
     }
 
     if (!DataLoggerIsInitialized()) {
+        ServiceStatusLeds(nowMs, false);
         InitializeWithRecovery(SystemError::DataLoggerInitialization,
                                &DataLoggerBegin,
                                "Data logger unavailable. Retrying...");
@@ -572,6 +669,7 @@ void loop() {
 
     SensorData data;
     if (!AcquireSensorData(data)) {
+        ServiceStatusLeds(nowMs, false);
         delay(1);
         return;
     }
@@ -579,14 +677,23 @@ void loop() {
     if (!g_hasPadAltitude && data.altitudeFeet != 0.0f) {
         g_padAltitudeFeet = data.altitudeFeet;
         g_hasPadAltitude = true;
-        if (kEnableSerialTelemetry && Serial) {
-            Serial.print("Pad altitude reference (ft): ");
-            Serial.println(g_padAltitudeFeet, 2);
+        LOG_PRINT("Pad altitude reference (ft): ");
+        LOG_PRINTLN(g_padAltitudeFeet, 2);
+    }
+
+    float altitudeAglFeet = 0.0f;
+    if (g_hasPadAltitude) {
+        altitudeAglFeet = data.altitudeFeet - g_padAltitudeFeet;
+        if (altitudeAglFeet < 0.0f) {
+            altitudeAglFeet = 0.0f;
         }
     }
 
     FilteredState state;
     const bool hasFilteredState = flightComputer.Update(data, state);
+    float manualOverrideDeg = 0.0f;
+    const bool manualOverrideActive = NetworkTelemetryManualActuationOverride(manualOverrideDeg);
+    manualOverrideDeg = ClampFloat(manualOverrideDeg, 0.0f, kServoMaxActuationDeg);
 
     if (!g_csvReplay.enabled) {
         DataLoggerLogTelemetry(data, flightComputer.Status(), hasFilteredState ? &state : nullptr);
@@ -603,17 +710,10 @@ void loop() {
         g_servoEffectiveDeg += (g_servoCommandDeg - g_servoEffectiveDeg) * lagBlend;
         g_servoEffectiveDeg = ClampFloat(g_servoEffectiveDeg, 0.0f, kServoMaxActuationDeg);
 
-        float altitudeAglFeet = 0.0f;
-        if (g_hasPadAltitude) {
-            altitudeAglFeet = data.altitudeFeet - g_padAltitudeFeet;
-            if (altitudeAglFeet < 0.0f) {
-                altitudeAglFeet = 0.0f;
-            }
-        }
-
         const bool aboveMinExtendAltitude = altitudeAglFeet >= kServoMinExtendAltitudeFeet;
-        if (status == FlightStatus::Coast && aboveMinExtendAltitude) {
-            const uint32_t nowMs = millis();
+        if (manualOverrideActive) {
+            g_servoCommandDeg = manualOverrideDeg;
+        } else if (status == FlightStatus::Coast && aboveMinExtendAltitude) {
             if ((nowMs - g_lastControlUpdateMs) >= kControlUpdateIntervalMs) {
                 g_servoCommandDeg = SelectActuationCommandDeg(state,
                                                               angularVelocityRadPerSec,
@@ -640,30 +740,48 @@ void loop() {
         g_lastControlTime = state.time;
         g_lastZenith = state.zenith;
         g_hasLastZenith = true;
+    } else if (manualOverrideActive) {
+        g_servoCommandDeg = manualOverrideDeg;
+        g_servoEffectiveDeg = manualOverrideDeg;
+        WriteServoAngleDeg(g_servoCommandDeg);
     }
 
-    if (hasFilteredState && kEnableSerialTelemetry && Serial) {
-        Serial.print("t=");
-        Serial.print(state.time, 3);
-        Serial.print(" alt=");
-        Serial.print(data.altitudeFeet, 2);
-        Serial.print(" z=");
-        Serial.print(state.position[2], 2);
-        Serial.print(" vz=");
-        Serial.print(state.velocity[2], 2);
-        Serial.print(" az=");
-        Serial.print(state.acceleration[2], 2);
-        Serial.print(" iaz=");
-        Serial.print(state.inertialAcceleration[2], 2);
-        Serial.print(" apg=");
-        Serial.print(state.apogeeEstimate, 2);
-        Serial.print(" cmd=");
-        Serial.print(g_servoCommandDeg, 1);
-        Serial.print(" eff=");
-        Serial.print(g_servoEffectiveDeg, 1);
-        Serial.print(" status=");
-        Serial.println(FlightStatusToString(flightComputer.Status()));
+    if (hasFilteredState) {
+        LOG_PRINT("t=");
+        LOG_PRINT(state.time, 3);
+        LOG_PRINT(" alt=");
+        LOG_PRINT(data.altitudeFeet, 2);
+        LOG_PRINT(" z=");
+        LOG_PRINT(state.position[2], 2);
+        LOG_PRINT(" vz=");
+        LOG_PRINT(state.velocity[2], 2);
+        LOG_PRINT(" az=");
+        LOG_PRINT(state.acceleration[2], 2);
+        LOG_PRINT(" iaz=");
+        LOG_PRINT(state.inertialAcceleration[2], 2);
+        LOG_PRINT(" apg=");
+        LOG_PRINT(state.apogeeEstimate, 2);
+        LOG_PRINT(" cmd=");
+        LOG_PRINT(g_servoCommandDeg, 1);
+        LOG_PRINT(" eff=");
+        LOG_PRINT(g_servoEffectiveDeg, 1);
+        LOG_PRINT(" mode=");
+        LOG_PRINT(manualOverrideActive ? "manual" : "auto");
+        LOG_PRINT(" status=");
+        LOG_PRINTLN(FlightStatusToString(flightComputer.Status()));
     }
+
+    TelemetrySnapshot telemetrySnapshot;
+    telemetrySnapshot.sensor = &data;
+    telemetrySnapshot.state = hasFilteredState ? &state : nullptr;
+    telemetrySnapshot.status = flightComputer.Status();
+    telemetrySnapshot.servoCommandDeg = g_servoCommandDeg;
+    telemetrySnapshot.servoEffectiveDeg = g_servoEffectiveDeg;
+    telemetrySnapshot.altitudeAglFeet = altitudeAglFeet;
+    telemetrySnapshot.hasPadAltitude = g_hasPadAltitude;
+    telemetrySnapshot.manualActuationOverride = manualOverrideActive;
+    NetworkTelemetryService(telemetrySnapshot);
+    ServiceStatusLeds(nowMs, manualOverrideActive);
 
     DataLoggerService();
 }

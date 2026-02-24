@@ -15,7 +15,7 @@ from typing import BinaryIO, Iterable, Iterator, Tuple
 
 
 _RECORD_HEADER_STRUCT = struct.Struct("<BBBB")
-_SENSOR_STRUCT = struct.Struct("<ff fff fff ffff fff ?3x")
+_SENSOR_STRUCT = struct.Struct("<ff fff fff ffff fff ffff fff ???x")
 _FILTERED_STRUCT = struct.Struct("<f fff fff fff fff f f")
 _EVENT_PAYLOAD_STRUCT = struct.Struct("<ffff")
 
@@ -47,7 +47,16 @@ _SENSOR_FIELD_NAMES = [
     "sensor_gyro_x",
     "sensor_gyro_y",
     "sensor_gyro_z",
+    "sensor_icm_quat_w",
+    "sensor_icm_quat_x",
+    "sensor_icm_quat_y",
+    "sensor_icm_quat_z",
+    "sensor_icm_yaw_deg",
+    "sensor_icm_pitch_deg",
+    "sensor_icm_roll_deg",
     "sensor_has_quaternion",
+    "sensor_has_icm_quaternion",
+    "sensor_has_icm_ypr",
 ]
 
 _FILTERED_FIELD_NAMES = [
@@ -154,7 +163,7 @@ def _build_telemetry_row(data: dict) -> dict:
     }
 
     for name, value in zip(_SENSOR_FIELD_NAMES, data["sensor"]):
-        if name == "sensor_has_quaternion":
+        if name in {"sensor_has_quaternion", "sensor_has_icm_quaternion", "sensor_has_icm_ypr"}:
             row[name] = bool(value)
         else:
             row[name] = value

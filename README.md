@@ -19,6 +19,21 @@ Apogee Control System firmware plus Python-based analysis and tuning tools.
 3. `src/kalman_filters.h`, `src/apogee_model.h`, `src/environment_model.h` provide the
    embedded equivalents of the Python models.
 4. `src/data_logger.*` writes telemetry/event records for offline decoding.
+5. `src/network_telemetry.*` streams fixed-rate UDP telemetry over Wi-Fi for live ground display.
+
+## Live network telemetry (Teensy + AirLift)
+
+- Firmware packet schema: `include/telemetry_packet.h` (`telemetry::PacketV1`).
+- Wi-Fi and UDP configuration: `src/settings.h` under `settings::network`.
+- AirLift pins are configurable via:
+  - `settings::network::kAirliftSsPin`
+  - `settings::network::kAirliftAckPin`
+  - `settings::network::kAirliftResetPin`
+  - `settings::network::kAirliftGpio0Pin`
+- Stream rate is capped by `settings::network::kTelemetryIntervalMs` to limit loop overhead.
+- Telemetry can be subscriber-gated via heartbeat (`kRequireSubscriberHeartbeat`), so send work is skipped when the ground client disconnects.
+
+Local ImGui receiver app: `local-imgui-telemetry/`.
 
 ## Python analysis flow
 

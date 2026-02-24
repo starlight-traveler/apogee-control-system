@@ -7,6 +7,7 @@
 #include <type_traits>
 
 #include "settings.h"
+#include "serial_logging.h"
 
 namespace {
 
@@ -18,16 +19,15 @@ alignas(uint32_t) uint8_t g_buffer[kBufferSize];
 size_t g_bufferPosition = 0;
 uint32_t g_lastFlushMicros = 0;
 bool g_loggerInitialized = false;
-bool g_serialLoggingEnabled = true;
 
 constexpr uint32_t kFlushIntervalMicros = settings::build::kDataLoggerFlushIntervalUs;
 
 constexpr const char *kLogPrefix = "SENS";
 constexpr const char *kLogExtension = "BIN";
 
-static_assert(sizeof(SensorData) == 64, "SensorData size mismatch.");
+static_assert(sizeof(SensorData) == 92, "SensorData size mismatch.");
 static_assert(sizeof(FilteredState) == 60, "FilteredState size mismatch.");
-static_assert(sizeof(TelemetryLogRecord) == 128, "TelemetryLogRecord size mismatch.");
+static_assert(sizeof(TelemetryLogRecord) == 156, "TelemetryLogRecord size mismatch.");
 static_assert(sizeof(EventLogRecord) == 20, "EventLogRecord size mismatch.");
 
 static_assert(std::is_trivially_copyable<SensorData>::value, "SensorData must be trivially copyable.");
@@ -102,25 +102,19 @@ bool DataLoggerBegin() {
     }
 
     if (!g_sd.begin(SdioConfig(FIFO_SDIO))) {
-        if (g_serialLoggingEnabled && Serial) {
-            Serial.println("SD card initialization failed.");
-        }
+        LOG_PRINTLN("SD card initialization failed.");
         return false;
     }
 
     char filename[32];
     if (!NextLogFilename(filename, sizeof(filename))) {
-        if (g_serialLoggingEnabled && Serial) {
-            Serial.println("Unable to create log filename.");
-        }
+        LOG_PRINTLN("Unable to create log filename.");
         return false;
     }
 
     g_logFile = g_sd.open(filename, O_WRONLY | O_CREAT | O_TRUNC);
     if (!g_logFile) {
-        if (g_serialLoggingEnabled && Serial) {
-            Serial.println("Failed to open log file.");
-        }
+        LOG_PRINTLN("Failed to open log file.");
         return false;
     }
 
@@ -128,15 +122,9 @@ bool DataLoggerBegin() {
     g_lastFlushMicros = micros();
 
     g_loggerInitialized = true;
-    if (g_serialLoggingEnabled && Serial) {
-        Serial.print("Logging sensor data to ");
-        Serial.println(filename);
-    }
+    LOG_PRINT("Logging sensor data to ");
+    LOG_PRINTLN(filename);
     return true;
-}
-
-void DataLoggerSetSerialLoggingEnabled(bool enabled) {
-    g_serialLoggingEnabled = enabled;
 }
 
 void DataLoggerLogTelemetry(const SensorData &sensor, FlightStatus status, const FilteredState *state) {
@@ -153,8 +141,8 @@ void DataLoggerLogTelemetry(const SensorData &sensor, FlightStatus status, const
         record.state = *state;
     }
 
-    if (!AppendRecord(&record, sizeof(record)) && g_serialLoggingEnabled && Serial) {
-        Serial.println("Failed to append telemetry record to log.");
+    if (!AppendRecord(&record, sizeof(record))) {
+        LOG_PRINTLN("Failed to append telemetry record to log.");
     }
 }
 
@@ -177,8 +165,8 @@ void DataLoggerLogEvent(FlightEventType type,
     record.verticalVelocity = verticalVelocity;
     record.apogeeEstimate = apogeeEstimate;
 
-    if (!AppendRecord(&record, sizeof(record)) && g_serialLoggingEnabled && Serial) {
-        Serial.println("Failed to append event record to log.");
+    if (!AppendRecord(&record, sizeof(record))) {
+        LOG_PRINTLN("Failed to append event record to log.");
     }
 }
 
@@ -196,8 +184,8 @@ void DataLoggerService() {
         return;
     }
 
-    if (!FlushBuffer() && g_serialLoggingEnabled && Serial) {
-        Serial.println("Failed to flush sensor log buffer.");
+    if (!FlushBuffer()) {
+        LOG_PRINTLN("Failed to flush sensor log buffer.");
     }
 }
 

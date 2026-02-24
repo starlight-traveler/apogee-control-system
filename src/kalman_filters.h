@@ -3,9 +3,8 @@
 #include <cmath>
 #include <string.h>
 
-#include "constants.h"
-
-// Implements the lightweight Kalman filters from filter.py without dynamic allocations.
+// Hand-unrolled 3-state Kalman filters.
+// Uses double precision to preserve numeric fidelity with Python reference flow.
 
 class KalmanFilterAccel {
   public:
@@ -50,8 +49,6 @@ class KalmanFilterAccel {
         const double p20 = covariance_[2][0];
         const double p21 = covariance_[2][1];
         const double p22 = covariance_[2][2];
-        (void)p11;
-        (void)p21;
 
         const double fp00 = p00 + dt * p10 + half_dt2 * p20;
         const double fp01 = p01 + dt * p11 + half_dt2 * p21;
@@ -89,7 +86,6 @@ class KalmanFilterAccel {
         covariance_[2][2] = newP22;
     }
 
-    // Measurement update using Joseph form to mirror the FilterPy implementation.
     void Update(double accelMeasurement) {
         const double residual = accelMeasurement - state_[2];
         double innovation = covariance_[2][2] + measurementVariance_;
@@ -129,13 +125,13 @@ class KalmanFilterAccel {
 
         double newP00 = temp00;
         double newP01 = temp01;
-        double newP02 = -k0 * temp00 - k1 * temp01 + (1.0 - k2) * temp02;
+        double newP02 = -k0 * temp00 - k1 * temp01 + oneMinusK2 * temp02;
         double newP10 = temp10;
         double newP11 = temp11;
-        double newP12 = -k0 * temp10 - k1 * temp11 + (1.0 - k2) * temp12;
+        double newP12 = -k0 * temp10 - k1 * temp11 + oneMinusK2 * temp12;
         double newP20 = temp20;
         double newP21 = temp21;
-        double newP22 = -k0 * temp20 - k1 * temp21 + (1.0 - k2) * temp22;
+        double newP22 = -k0 * temp20 - k1 * temp21 + oneMinusK2 * temp22;
 
         const double measVar = measurementVariance_;
         const double add00 = measVar * k0 * k0;
@@ -201,48 +197,72 @@ class KalmanFilterAccelAlt {
         const double dt2 = dt * dt;
         const double dt3 = dt2 * dt;
         const double dt4 = dt3 * dt;
+        const double h = 0.5 * dt2;
 
-        const double F[3][3] = {
-            {1.0, dt, 0.5 * dt2},
-            {0.0, 1.0, dt},
-            {0.0, 0.0, 1.0},
-        };
+        const double x0 = state_[0];
+        const double x1 = state_[1];
+        const double x2 = state_[2];
+        state_[0] = x0 + dt * x1 + h * x2;
+        state_[1] = x1 + dt * x2;
 
-        double newState[3];
-        for (int i = 0; i < 3; ++i) {
-            newState[i] = F[i][0] * state_[0] + F[i][1] * state_[1] + F[i][2] * state_[2];
-        }
-        memcpy(state_, newState, sizeof(state_));
+        const double p00 = covariance_[0][0];
+        const double p01 = covariance_[0][1];
+        const double p02 = covariance_[0][2];
+        const double p10 = covariance_[1][0];
+        const double p11 = covariance_[1][1];
+        const double p12 = covariance_[1][2];
+        const double p20 = covariance_[2][0];
+        const double p21 = covariance_[2][1];
+        const double p22 = covariance_[2][2];
 
-        double temp[3][3];
-        for (int i = 0; i < 3; ++i) {
-            for (int j = 0; j < 3; ++j) {
-                temp[i][j] = F[i][0] * covariance_[0][j] + F[i][1] * covariance_[1][j] + F[i][2] * covariance_[2][j];
-            }
-        }
+        const double t00 = p00 + dt * p10 + h * p20;
+        const double t01 = p01 + dt * p11 + h * p21;
+        const double t02 = p02 + dt * p12 + h * p22;
+        const double t10 = p10 + dt * p20;
+        const double t11 = p11 + dt * p21;
+        const double t12 = p12 + dt * p22;
+        const double t20 = p20;
+        const double t21 = p21;
+        const double t22 = p22;
 
-        double updated[3][3];
-        for (int i = 0; i < 3; ++i) {
-            for (int j = 0; j < 3; ++j) {
-                updated[i][j] = temp[i][0] * F[j][0] + temp[i][1] * F[j][1] + temp[i][2] * F[j][2];
-            }
-        }
+        double newP00 = t00 + dt * t01 + h * t02;
+        double newP01 = t01 + dt * t02;
+        double newP02 = t02;
+        double newP10 = t10 + dt * t11 + h * t12;
+        double newP11 = t11 + dt * t12;
+        double newP12 = t12;
+        double newP20 = t20 + dt * t21 + h * t22;
+        double newP21 = t21 + dt * t22;
+        double newP22 = t22;
 
         const double qVar = processSigma * processSigma;
-        const double Q[3][3] = {
-            {0.25 * dt4 * qVar, 0.5 * dt3 * qVar, 0.5 * dt2 * qVar},
-            {0.5 * dt3 * qVar, dt2 * qVar, dt * qVar},
-            {0.5 * dt2 * qVar, dt * qVar, qVar},
-        };
+        const double q00 = 0.25 * dt4 * qVar;
+        const double q01 = 0.5 * dt3 * qVar;
+        const double q02 = 0.5 * dt2 * qVar;
+        const double q11 = dt2 * qVar;
+        const double q12 = dt * qVar;
 
-        for (int i = 0; i < 3; ++i) {
-            for (int j = 0; j < 3; ++j) {
-                covariance_[i][j] = updated[i][j] + Q[i][j];
-            }
-        }
+        newP00 += q00;
+        newP01 += q01;
+        newP02 += q02;
+        newP10 += q01;
+        newP11 += q11;
+        newP12 += q12;
+        newP20 += q02;
+        newP21 += q12;
+        newP22 += qVar;
+
+        covariance_[0][0] = newP00;
+        covariance_[0][1] = 0.5 * (newP01 + newP10);
+        covariance_[0][2] = 0.5 * (newP02 + newP20);
+        covariance_[1][0] = covariance_[0][1];
+        covariance_[1][1] = newP11;
+        covariance_[1][2] = 0.5 * (newP12 + newP21);
+        covariance_[2][0] = covariance_[0][2];
+        covariance_[2][1] = covariance_[1][2];
+        covariance_[2][2] = newP22;
     }
 
-    // Joint acceleration/altimeter update using Joseph form for numerical stability.
     void Update(double accelMeasurement, double altitudeMeasurement) {
         const double residualAccel = accelMeasurement - state_[2];
         const double residualAlt = altitudeMeasurement - state_[0];
@@ -257,19 +277,19 @@ class KalmanFilterAccelAlt {
         const double p21 = covariance_[2][1];
         const double p22 = covariance_[2][2];
 
-        const double S00 = p22 + accelVariance_;
-        const double S01 = p20;
-        const double S10 = p02;
-        const double S11 = p00 + altitudeVariance_;
-        double det = S00 * S11 - S01 * S10;
-        if (std::fabs(det) < 1e-12) {
-            det = (det >= 0.0 ? 1e-12 : -1e-12);
+        const double s00 = p22 + accelVariance_;
+        const double s01 = p20;
+        const double s10 = p02;
+        const double s11 = p00 + altitudeVariance_;
+        double det = s00 * s11 - s01 * s10;
+        if (std::fabs(det) < 1.0e-12) {
+            det = (det >= 0.0) ? 1.0e-12 : -1.0e-12;
         }
         const double invDet = 1.0 / det;
-        const double invS00 = S11 * invDet;
-        const double invS01 = -S01 * invDet;
-        const double invS10 = -S10 * invDet;
-        const double invS11 = S00 * invDet;
+        const double invS00 = s11 * invDet;
+        const double invS01 = -s01 * invDet;
+        const double invS10 = -s10 * invDet;
+        const double invS11 = s00 * invDet;
 
         const double k00 = p02 * invS00 + p00 * invS10;
         const double k01 = p02 * invS01 + p00 * invS11;
@@ -292,47 +312,47 @@ class KalmanFilterAccelAlt {
         const double m21 = 0.0;
         const double m22 = 1.0 - k20;
 
-        double M[3][3] = {
-            {m00, m01, m02},
-            {m10, m11, m12},
-            {m20, m21, m22},
-        };
+        const double mp00 = m00 * p00 + m01 * p10 + m02 * p20;
+        const double mp01 = m00 * p01 + m01 * p11 + m02 * p21;
+        const double mp02 = m00 * p02 + m01 * p12 + m02 * p22;
+        const double mp10 = m10 * p00 + m11 * p10 + m12 * p20;
+        const double mp11 = m10 * p01 + m11 * p11 + m12 * p21;
+        const double mp12 = m10 * p02 + m11 * p12 + m12 * p22;
+        const double mp20 = m20 * p00 + m21 * p10 + m22 * p20;
+        const double mp21 = m20 * p01 + m21 * p11 + m22 * p21;
+        const double mp22 = m20 * p02 + m21 * p12 + m22 * p22;
 
-        double MP[3][3];
-        for (int i = 0; i < 3; ++i) {
-            for (int j = 0; j < 3; ++j) {
-                MP[i][j] = M[i][0] * covariance_[0][j] + M[i][1] * covariance_[1][j] + M[i][2] * covariance_[2][j];
-            }
-        }
-
-        double newP[3][3];
-        for (int i = 0; i < 3; ++i) {
-            for (int j = 0; j < 3; ++j) {
-                newP[i][j] = MP[i][0] * M[j][0] + MP[i][1] * M[j][1] + MP[i][2] * M[j][2];
-            }
-        }
+        double newP00 = mp00 * m00 + mp01 * m01 + mp02 * m02;
+        double newP01 = mp00 * m10 + mp01 * m11 + mp02 * m12;
+        double newP02 = mp00 * m20 + mp01 * m21 + mp02 * m22;
+        double newP10 = mp10 * m00 + mp11 * m01 + mp12 * m02;
+        double newP11 = mp10 * m10 + mp11 * m11 + mp12 * m12;
+        double newP12 = mp10 * m20 + mp11 * m21 + mp12 * m22;
+        double newP20 = mp20 * m00 + mp21 * m01 + mp22 * m02;
+        double newP21 = mp20 * m10 + mp21 * m11 + mp22 * m12;
+        double newP22 = mp20 * m20 + mp21 * m21 + mp22 * m22;
 
         const double accelVar = accelVariance_;
         const double altVar = altitudeVariance_;
-        for (int i = 0; i < 3; ++i) {
-            const double k0i = (i == 0 ? k00 : (i == 1 ? k10 : k20));
-            const double k1i = (i == 0 ? k01 : (i == 1 ? k11 : k21));
-            for (int j = 0; j < 3; ++j) {
-                const double k0j = (j == 0 ? k00 : (j == 1 ? k10 : k20));
-                const double k1j = (j == 0 ? k01 : (j == 1 ? k11 : k21));
-                newP[i][j] += accelVar * k0i * k0j + altVar * k1i * k1j;
-            }
-        }
+        newP00 += accelVar * k00 * k00 + altVar * k01 * k01;
+        newP01 += accelVar * k00 * k10 + altVar * k01 * k11;
+        newP02 += accelVar * k00 * k20 + altVar * k01 * k21;
+        newP10 += accelVar * k10 * k00 + altVar * k11 * k01;
+        newP11 += accelVar * k10 * k10 + altVar * k11 * k11;
+        newP12 += accelVar * k10 * k20 + altVar * k11 * k21;
+        newP20 += accelVar * k20 * k00 + altVar * k21 * k01;
+        newP21 += accelVar * k20 * k10 + altVar * k21 * k11;
+        newP22 += accelVar * k20 * k20 + altVar * k21 * k21;
 
-        covariance_[0][0] = newP[0][0];
-        covariance_[0][1] = newP[0][1];
-        covariance_[0][2] = newP[0][2];
-        covariance_[1][0] = newP[1][0];
-        covariance_[1][1] = newP[1][1];
-        covariance_[1][2] = newP[1][2];
-        covariance_[2][0] = newP[2][0];
-        covariance_[2][1] = newP[2][1];
-        covariance_[2][2] = newP[2][2];
+        covariance_[0][0] = newP00;
+        covariance_[0][1] = 0.5 * (newP01 + newP10);
+        covariance_[0][2] = 0.5 * (newP02 + newP20);
+        covariance_[1][0] = covariance_[0][1];
+        covariance_[1][1] = newP11;
+        covariance_[1][2] = 0.5 * (newP12 + newP21);
+        covariance_[2][0] = covariance_[0][2];
+        covariance_[2][1] = covariance_[1][2];
+        covariance_[2][2] = newP22;
     }
 
     double Position() const { return state_[0]; }

@@ -11,7 +11,7 @@
 
 struct ApogeeVehicleParameters {
     double centerOfPressureOffsetMeters = 0.0;  // cp_cg in Python (m)
-    double momentOfInertia = 1.0;               // kg·m^2
+    double momentOfInertia = 1.0;               // kg*m^2
     double dryMass = 1.0;                       // kg
 };
 
@@ -60,19 +60,43 @@ class ApogeePredictor {
             return initialState.altitudeMeters;
         }
         ApogeeState state = initialState;
+        InterpHintSet hints;
         int steps = 0;
         while (state.verticalVelocity > 0.0 && steps < maxIntegrationSteps_) {
-            state = IntegrateStep(state, timeStep_);
+            state = IntegrateStep(state, timeStep_, hints);
             ++steps;
         }
         return state.altitudeMeters;
     }
 
   private:
+    static double WrapToPi(double angle) {
+        constexpr double kPi = 3.14159265358979323846;
+        constexpr double kTwoPi = 6.28318530717958647692;
+        while (angle > kPi) {
+            angle -= kTwoPi;
+        }
+        while (angle < -kPi) {
+            angle += kTwoPi;
+        }
+        return angle;
+    }
+
     struct AxisInterp {
         int lower;
         int upper;
         double t;
+    };
+
+    struct AxisHint {
+        int lower = -1;
+        bool valid = false;
+    };
+
+    struct InterpHintSet {
+        AxisHint acs;
+        AxisHint atk;
+        AxisHint mach;
     };
 
     struct Derivative {
@@ -96,13 +120,13 @@ class ApogeePredictor {
         double angular;
     };
 
-    ApogeeState IntegrateStep(const ApogeeState &state, double dt) {
+    ApogeeState IntegrateStep(const ApogeeState &state, double dt, InterpHintSet &hints) {
         const double halfDt = dt * 0.5;
         const double sixthDt = dt * (1.0 / 6.0);
-        const Derivative k1 = Evaluate(state);
-        const Derivative k2 = Evaluate(Apply(state, k1, halfDt));
-        const Derivative k3 = Evaluate(Apply(state, k2, halfDt));
-        const Derivative k4 = Evaluate(Apply(state, k3, dt));
+        const Derivative k1 = Evaluate(state, hints);
+        const Derivative k2 = Evaluate(Apply(state, k1, halfDt), hints);
+        const Derivative k3 = Evaluate(Apply(state, k2, halfDt), hints);
+        const Derivative k4 = Evaluate(Apply(state, k3, dt), hints);
 
         ApogeeState result = state;
         result.altitudeMeters += sixthDt * (k1.altitudeRate + 2.0 * k2.altitudeRate + 2.0 * k3.altitudeRate + k4.altitudeRate);
@@ -125,8 +149,8 @@ class ApogeePredictor {
         return result;
     }
 
-    Derivative Evaluate(const ApogeeState &state) {
-        const AccelResult accel = ComputeAcceleration(state);
+    Derivative Evaluate(const ApogeeState &state, InterpHintSet &hints) {
+        const AccelResult accel = ComputeAcceleration(state, hints);
         Derivative derivative;
         derivative.altitudeRate = state.verticalVelocity;
         derivative.horizontalRate = state.horizontalVelocity;
@@ -137,10 +161,31 @@ class ApogeePredictor {
         return derivative;
     }
 
-    static AxisInterp InterpolateAxis(const double *grid, int count, double value) {
+    static AxisInterp InterpolateAxis(const double *grid, int count, double value, AxisHint *hint) {
         AxisInterp result{0, 0, 0.0};
         if (grid == nullptr || count < 2) {
             return result;
+        }
+        if (hint != nullptr && hint->valid && hint->lower >= 0 && hint->lower + 1 < count) {
+            int low = hint->lower;
+            if (value < grid[low]) {
+                while (low > 0 && value < grid[low]) {
+                    --low;
+                }
+            } else if (value > grid[low + 1]) {
+                while (low + 2 < count && value > grid[low + 1]) {
+                    ++low;
+                }
+            }
+            if (value >= grid[low] && value <= grid[low + 1]) {
+                result.lower = low;
+                result.upper = low + 1;
+                const double denom = grid[result.upper] - grid[result.lower];
+                result.t = (denom != 0.0) ? (value - grid[result.lower]) / denom : 0.0;
+                hint->lower = low;
+                hint->valid = true;
+                return result;
+            }
         }
         if (value <= grid[0]) {
             result.lower = 0;
@@ -164,6 +209,10 @@ class ApogeePredictor {
         }
         const double denom = grid[result.upper] - grid[result.lower];
         result.t = (denom != 0.0) ? (value - grid[result.lower]) / denom : 0.0;
+        if (hint != nullptr) {
+            hint->lower = result.lower;
+            hint->valid = true;
+        }
         return result;
     }
 
@@ -175,10 +224,14 @@ class ApogeePredictor {
     static InterpolatedForces InterpolateForces(const ApogeeForceTable &table,
                                                 double acsDeg,
                                                 double atkDeg,
-                                                double mach) {
-        const AxisInterp acs = InterpolateAxis(table.acsAnglesDeg, table.acsCount, acsDeg);
-        const AxisInterp atk = InterpolateAxis(table.atkAnglesDeg, table.atkCount, atkDeg);
-        const AxisInterp mch = InterpolateAxis(table.machNumbers, table.machCount, mach);
+                                                double mach,
+                                                InterpHintSet *hints) {
+        AxisHint *acsHint = (hints != nullptr) ? &hints->acs : nullptr;
+        AxisHint *atkHint = (hints != nullptr) ? &hints->atk : nullptr;
+        AxisHint *mchHint = (hints != nullptr) ? &hints->mach : nullptr;
+        const AxisInterp acs = InterpolateAxis(table.acsAnglesDeg, table.acsCount, acsDeg, acsHint);
+        const AxisInterp atk = InterpolateAxis(table.atkAnglesDeg, table.atkCount, atkDeg, atkHint);
+        const AxisInterp mch = InterpolateAxis(table.machNumbers, table.machCount, mach, mchHint);
 
         auto interpValues = [&](const double *values) -> double {
             const double v000 = SampleTable(values, table.atkCount, table.machCount, acs.lower, atk.lower, mch.lower);
@@ -207,7 +260,7 @@ class ApogeePredictor {
         return result;
     }
 
-    AccelResult ComputeAcceleration(const ApogeeState &state) {
+    AccelResult ComputeAcceleration(const ApogeeState &state, InterpHintSet &hints) {
         const double velX = state.verticalVelocity;
         const double velY = state.horizontalVelocity;
         double relX = velX;
@@ -246,18 +299,19 @@ class ApogeePredictor {
         const ApogeeForceTable *table = forceTable_;
         if (mach >= 0.025 && table != nullptr && table->IsValid() &&
             vehicle_.dryMass > 0.0 && vehicle_.momentOfInertia > 0.0) {
-            double atkAngle = state.zenith - std::fabs(math_utils::FastAtan2(relY, relX));
-            bool liftState = true;
-            if (atkAngle < 0.0) {
-                liftState = false;
-                atkAngle = std::fabs(atkAngle);
-            }
+            // Signed AoA from body axis angle minus relative-velocity angle.
+            // Use atan2 + wrap so crosswind/quadrant behavior is physically consistent.
+            const double velocityAngle = static_cast<double>(math_utils::FastAtan2(static_cast<float>(relY),
+                                                                                    static_cast<float>(relX)));
+            const double signedAtkAngle = WrapToPi(state.zenith - velocityAngle);
+            const bool liftState = (signedAtkAngle >= 0.0);
+            const double atkAngle = std::fabs(signedAtkAngle);
 
             constexpr double kRadToDeg = 57.29577951308232;
             const double atkDeg = atkAngle * kRadToDeg;
             const double acsDeg = state.acsAngleDeg;
 
-            const InterpolatedForces forces = InterpolateForces(*table, acsDeg, atkDeg, mach);
+            const InterpolatedForces forces = InterpolateForces(*table, acsDeg, atkDeg, mach, &hints);
             const double axialForceMag = forces.axial;
             const double normalForceMag = forces.normal;
 

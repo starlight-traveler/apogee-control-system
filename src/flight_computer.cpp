@@ -4,6 +4,7 @@
 
 #include "constants.h"
 #include "math_utils.h"
+#include "serial_logging.h"
 #include "settings.h"
 
 namespace {
@@ -113,7 +114,7 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
 
     kalmanX_.Update(inertialAcceleration.x);
     kalmanY_.Update(inertialAcceleration.y);
-    kalmanZ_.Update(inertialAcceleration.z, altitudeMeters);
+    kalmanZ_.Update(static_cast<float>(inertialAcceleration.z), static_cast<float>(altitudeMeters));
 
     const double posX = kalmanX_.Position();
     const double posY = kalmanY_.Position();
@@ -137,20 +138,49 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
     }
 
     if (status_ == FlightStatus::Ground) {
-        if (accZ > settings::flight::kLiftoffAccelerationThresholdMps2 &&
-            std::fabs(posZ) > settings::flight::kLiftoffAltitudeThresholdM) {
+        const bool accelerationSuggestsLiftoff =
+            accZ > settings::flight::kLiftoffAccelerationThresholdMps2;
+        const bool altitudeSuggestsLiftoff =
+            std::fabs(posZ) > settings::flight::kLiftoffAltitudeThresholdM;
+        const bool velocitySuggestsLiftoff =
+            velZ > settings::flight::kLiftoffVelocityThresholdMps;
+
+        if (accelerationSuggestsLiftoff && altitudeSuggestsLiftoff && velocitySuggestsLiftoff) {
+            if (liftoffCandidateCount_ < 255) {
+                ++liftoffCandidateCount_;
+            }
+        } else {
+            liftoffCandidateCount_ = 0;
+        }
+
+        if (liftoffCandidateCount_ >= settings::flight::kLiftoffConfirmSamples) {
             status_ = FlightStatus::Burn;
             burnTimestamp_ = static_cast<double>(data.timestamp);
+            liftoffCandidateCount_ = 0;
+            burnoutCandidateCount_ = 0;
             ReportEvent(false, data.timestamp, "Engine burn");
         }
     }
 
     if (status_ == FlightStatus::Burn) {
-        if (accZ < settings::flight::kBurnoutAccelerationThresholdMps2 &&
-            posZ < apogeeTargetMeters_ &&
-            velZ > settings::flight::kBurnoutVelocityThresholdMps) {
+        const double timeSinceBurn = static_cast<double>(data.timestamp) - burnTimestamp_;
+        const bool afterMinimumBurn = timeSinceBurn >= settings::flight::kBurnoutMinDurationSeconds;
+        const bool accelerationSuggestsBurnout = accZ < settings::flight::kBurnoutAccelerationThresholdMps2;
+        const bool stillAscending = velZ > settings::flight::kBurnoutVelocityThresholdMps;
+        const bool belowTarget = posZ < apogeeTargetMeters_;
+
+        if (afterMinimumBurn && accelerationSuggestsBurnout && stillAscending && belowTarget) {
+            if (burnoutCandidateCount_ < 255) {
+                ++burnoutCandidateCount_;
+            }
+        } else {
+            burnoutCandidateCount_ = 0;
+        }
+
+        if (burnoutCandidateCount_ >= settings::flight::kBurnoutConfirmSamples) {
             status_ = FlightStatus::Coast;
             burnoutTimestamp_ = static_cast<double>(data.timestamp);
+            burnoutCandidateCount_ = 0;
             ReportEvent(false, data.timestamp, "Engine burnout");
         }
     }
@@ -210,22 +240,21 @@ void FlightComputer::ResetInternalState() {
     burnTimestamp_ = 0.0;
     burnoutTimestamp_ = 0.0;
     apogeeTimestamp_ = 0.0;
+    liftoffCandidateCount_ = 0;
+    burnoutCandidateCount_ = 0;
 }
 
 void FlightComputer::ReportEvent(bool includeAltitude, float timeSeconds, const char *label) {
-    if (!serialReportingEnabled_ || !Serial) {
-        return;
-    }
-    Serial.print(label);
-    Serial.print(" at t = ");
-    Serial.print(timeSeconds, 4);
-    Serial.print(" s");
+    LOG_PRINT(label);
+    LOG_PRINT(" at t = ");
+    LOG_PRINT(timeSeconds, 4);
+    LOG_PRINT(" s");
     if (includeAltitude) {
-        Serial.print(", altitude = ");
-        Serial.print(apogeeAltitude_, 2);
-        Serial.print(" m");
+        LOG_PRINT(", altitude = ");
+        LOG_PRINT(apogeeAltitude_, 2);
+        LOG_PRINT(" m");
     }
-    Serial.println();
+    LOG_PRINTLN();
 }
 
 math_utils::Quaternion FlightComputer::TeasleyFilter(const math_utils::Quaternion &quat, const float gyro[3], float dt) {

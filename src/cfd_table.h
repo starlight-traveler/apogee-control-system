@@ -9,4 +9,4 @@ struct CfdTableStorage {
 
 // Loads the CFD force table from the SD card. Intended to run once at setup.
 // Returns true on success and populates storage.table.
-bool CfdTableLoadFromSd(const char *path, CfdTableStorage *storage, bool logSerial);
+bool CfdTableLoadFromSd(const char *path, CfdTableStorage *storage);

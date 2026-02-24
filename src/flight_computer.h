@@ -16,7 +16,11 @@ struct SensorData {
     float accelICM[3] = {0.0f, 0.0f, 0.0f};
     float quaternion[4] = {1.0f, 0.0f, 0.0f, 0.0f};
     float gyro[3] = {0.0f, 0.0f, 0.0f};
+    float icmQuaternion[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+    float icmYprDeg[3] = {0.0f, 0.0f, 0.0f};
     bool hasQuaternion = false;
+    bool hasIcmQuaternion = false;
+    bool hasIcmYpr = false;
 };
 
 struct FilteredState {
@@ -47,7 +51,7 @@ class FlightComputer {
 
     bool Update(const SensorData &data, FilteredState &output);
 
-    void SetSerialReportingEnabled(bool enabled) { serialReportingEnabled_ = enabled; }
+    void SetSerialReportingEnabled(bool enabled) { (void)enabled; }
 
     FlightStatus Status() const { return status_; }
     double ApogeePrediction() const { return lastApogeePrediction_; }
@@ -85,11 +89,11 @@ class FlightComputer {
     double burnTimestamp_ = 0.0;
     double burnoutTimestamp_ = 0.0;
     double apogeeTimestamp_ = 0.0;
+    uint8_t liftoffCandidateCount_ = 0;
+    uint8_t burnoutCandidateCount_ = 0;
 
     double processNoiseXY_ = 0.5;
     double processNoiseZ_ = 1.0;
-
-    bool serialReportingEnabled_ = true;
 
 };
 

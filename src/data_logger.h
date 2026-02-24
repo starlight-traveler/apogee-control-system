@@ -32,7 +32,6 @@ struct EventLogRecord {
 };
 
 bool DataLoggerBegin();
-void DataLoggerSetSerialLoggingEnabled(bool enabled);
 void DataLoggerLogTelemetry(const SensorData &sensor,
                             FlightStatus status,
                             const FilteredState *state);

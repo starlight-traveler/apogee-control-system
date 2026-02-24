@@ -125,6 +125,7 @@ using FieldOverrideMap = std::unordered_map<FieldId, std::string, FieldIdHash>;
 
 struct ProgramOptions {
     std::string csvPath;
+    std::string cfdPath = "lib/cfd.csv";
     bool showHelp = false;
     bool quiet = false;
     float sigmaAccelXY = 0.5f;
@@ -133,6 +134,8 @@ struct ProgramOptions {
     float processXY = 0.5f;
     float processZ = 1.0f;
     float apogeeTargetMeters = 1550.0f;
+    std::optional<float> signCheckTimeSeconds;
+    float signCheckWindowSeconds = 0.05f;
     FieldOverrideMap fieldOverrides;
     std::vector<SampleValueId> extraOutputFields;
     std::vector<SampleValueId> graphFields;
@@ -536,6 +539,130 @@ std::optional<bool> ParseBool(const std::string &value) {
         return false;
     }
     return std::nullopt;
+}
+
+struct StandaloneCfdTableStorage {
+    std::vector<double> acs;
+    std::vector<double> atk;
+    std::vector<double> mach;
+    std::vector<double> axial;
+    std::vector<double> normal;
+    ApogeeForceTable table;
+    bool loaded = false;
+};
+
+bool ParseCfdNumericRow(const std::string &line, std::array<double, 5> &out) {
+    const std::vector<std::string> cols = ParseCsvLine(line);
+    if (cols.size() < 5) {
+        return false;
+    }
+    for (int i = 0; i < 5; ++i) {
+        char *end = nullptr;
+        const double value = std::strtod(cols[i].c_str(), &end);
+        if (end == cols[i].c_str()) {
+            return false;
+        }
+        out[static_cast<std::size_t>(i)] = value;
+    }
+    return true;
+}
+
+bool LoadStandaloneCfdTable(const std::string &path, StandaloneCfdTableStorage &storage) {
+    std::ifstream input(path);
+    if (!input.is_open()) {
+        return false;
+    }
+
+    std::string header;
+    if (!std::getline(input, header)) {
+        return false;
+    }
+
+    struct RawRow {
+        double acs;
+        double atk;
+        double mach;
+        double axial;
+        double normal;
+    };
+
+    std::vector<RawRow> rows;
+    rows.reserve(6000);
+    std::array<double, 5> parsed{};
+    std::string line;
+    while (std::getline(input, line)) {
+        if (Trim(line).empty()) {
+            continue;
+        }
+        if (!ParseCfdNumericRow(line, parsed)) {
+            continue;
+        }
+        rows.push_back(RawRow{parsed[0], parsed[1], parsed[2], parsed[3], parsed[4]});
+    }
+    if (rows.empty()) {
+        return false;
+    }
+
+    storage.acs.clear();
+    storage.atk.clear();
+    storage.mach.clear();
+    storage.acs.reserve(rows.size());
+    storage.atk.reserve(rows.size());
+    storage.mach.reserve(rows.size());
+    for (const RawRow &row : rows) {
+        storage.acs.push_back(row.acs);
+        storage.atk.push_back(row.atk);
+        storage.mach.push_back(row.mach);
+    }
+    auto sortUnique = [](std::vector<double> &values) {
+        std::sort(values.begin(), values.end());
+        values.erase(std::unique(values.begin(), values.end()), values.end());
+    };
+    sortUnique(storage.acs);
+    sortUnique(storage.atk);
+    sortUnique(storage.mach);
+
+    const int acsCount = static_cast<int>(storage.acs.size());
+    const int atkCount = static_cast<int>(storage.atk.size());
+    const int machCount = static_cast<int>(storage.mach.size());
+    if (acsCount < 2 || atkCount < 2 || machCount < 2) {
+        return false;
+    }
+
+    const int total = acsCount * atkCount * machCount;
+    storage.axial.assign(total, std::numeric_limits<double>::quiet_NaN());
+    storage.normal.assign(total, std::numeric_limits<double>::quiet_NaN());
+
+    auto findIndex = [](const std::vector<double> &values, double value) -> int {
+        auto it = std::lower_bound(values.begin(), values.end(), value);
+        if (it == values.end() || *it != value) {
+            return -1;
+        }
+        return static_cast<int>(it - values.begin());
+    };
+
+    for (const RawRow &row : rows) {
+        const int i = findIndex(storage.acs, row.acs);
+        const int j = findIndex(storage.atk, row.atk);
+        const int k = findIndex(storage.mach, row.mach);
+        if (i < 0 || j < 0 || k < 0) {
+            continue;
+        }
+        const int idx = (i * atkCount + j) * machCount + k;
+        storage.axial[static_cast<std::size_t>(idx)] = row.axial;
+        storage.normal[static_cast<std::size_t>(idx)] = row.normal;
+    }
+
+    storage.table.acsAnglesDeg = storage.acs.data();
+    storage.table.atkAnglesDeg = storage.atk.data();
+    storage.table.machNumbers = storage.mach.data();
+    storage.table.axialForces = storage.axial.data();
+    storage.table.normalForces = storage.normal.data();
+    storage.table.acsCount = acsCount;
+    storage.table.atkCount = atkCount;
+    storage.table.machCount = machCount;
+    storage.loaded = storage.table.IsValid();
+    return storage.loaded;
 }
 
 std::optional<std::size_t> FindHeaderIndex(const std::vector<std::string> &headers,
@@ -975,6 +1102,9 @@ void PrintUsage(const char *program) {
               << "  --process-xy <value>       Process noise for XY axes (default 0.5).\n"
               << "  --process-z <value>        Process noise for Z axis (default 1.0).\n"
               << "  --apogee-target <value>    Target apogee altitude in meters (default 1550).\n"
+              << "  --cfd-path <path>          CFD CSV path for sign check (default lib/cfd.csv).\n"
+              << "  --sign-check-time <sec>    Evaluate apogee at ACS 0/10/20 deg near this time.\n"
+              << "  --sign-check-window <sec>  Match window for sign-check sample (default 0.05).\n"
               << "  --include-raw-altimeter    Append raw altimeter measurements to output CSV.\n"
               << "  --include-raw <fields>    Append raw sensor fields (comma-separated).\n"
              << "  --graph <fields>          Render ASCII graphs and Matplot++ images for the requested fields.\n"
@@ -1122,6 +1252,28 @@ bool ParseArgs(int argc, char **argv, ProgramOptions &options) {
             }
             continue;
         }
+        if (arg == "--sign-check-time") {
+            float value = 0.0f;
+            if (!parseFloatArg(value)) {
+                return false;
+            }
+            options.signCheckTimeSeconds = value;
+            continue;
+        }
+        if (arg == "--sign-check-window") {
+            if (!parseFloatArg(options.signCheckWindowSeconds)) {
+                return false;
+            }
+            continue;
+        }
+        if (arg == "--cfd-path") {
+            if (i + 1 >= argc) {
+                std::cerr << "Missing value for --cfd-path" << std::endl;
+                return false;
+            }
+            options.cfdPath = argv[++i];
+            continue;
+        }
         if (arg == "--field") {
             if (i + 1 >= argc) {
                 std::cerr << "Missing value for --field" << std::endl;
@@ -1136,6 +1288,30 @@ bool ParseArgs(int argc, char **argv, ProgramOptions &options) {
             if (!ParseFieldOverride(arg.substr(8), options.fieldOverrides)) {
                 return false;
             }
+            continue;
+        }
+        if (arg.rfind("--sign-check-time=", 0) == 0) {
+            std::optional<float> value = ParseFloat(arg.substr(18));
+            if (!value.has_value()) {
+                std::cerr << "Invalid numeric value for --sign-check-time: " << arg.substr(18)
+                          << std::endl;
+                return false;
+            }
+            options.signCheckTimeSeconds = *value;
+            continue;
+        }
+        if (arg.rfind("--sign-check-window=", 0) == 0) {
+            std::optional<float> value = ParseFloat(arg.substr(20));
+            if (!value.has_value()) {
+                std::cerr << "Invalid numeric value for --sign-check-window: " << arg.substr(20)
+                          << std::endl;
+                return false;
+            }
+            options.signCheckWindowSeconds = *value;
+            continue;
+        }
+        if (arg.rfind("--cfd-path=", 0) == 0) {
+            options.cfdPath = arg.substr(11);
             continue;
         }
         if (!arg.empty() && arg[0] == '-') {
@@ -1230,6 +1406,9 @@ int main(int argc, char **argv) {
 
     EnvironmentModel::Config environmentConfig;
     ApogeeVehicleParameters vehicleParameters;
+    vehicleParameters.centerOfPressureOffsetMeters = settings::vehicle::kCenterOfPressureOffsetMeters;
+    vehicleParameters.momentOfInertia = settings::vehicle::kMomentOfInertiaKgM2;
+    vehicleParameters.dryMass = settings::vehicle::kDryMassKg;
     EnvironmentModel environment(environmentConfig);
     FlightComputer flightComputer;
     flightComputer.Begin(options.sigmaAccelXY,
@@ -1270,6 +1449,11 @@ int main(int argc, char **argv) {
     bool hasPreviousZenith = false;
     float previousZenithRadians = 0.0f;
     float previousTimeSeconds = 0.0f;
+    bool hasSignCheckState = false;
+    float signCheckAngularRate = 0.0f;
+    float signCheckMatchedTime = 0.0f;
+    float signCheckBestDelta = std::numeric_limits<float>::infinity();
+    FilteredState signCheckState{};
     while (std::getline(input, line)) {
         ++lineNumber;
         if (Trim(line).empty()) {
@@ -1331,6 +1515,16 @@ int main(int argc, char **argv) {
             if (graphingEnabled) {
                 snapshots.push_back(SampleSnapshot{state, sample, altimeterMeasurementMeters, derived});
             }
+            if (options.signCheckTimeSeconds.has_value()) {
+                const float delta = std::fabs(state.time - *options.signCheckTimeSeconds);
+                if (delta <= options.signCheckWindowSeconds && delta < signCheckBestDelta) {
+                    signCheckBestDelta = delta;
+                    signCheckState = state;
+                    signCheckMatchedTime = state.time;
+                    signCheckAngularRate = derived.zenithRateDps * 0.017453292519943295f;
+                    hasSignCheckState = true;
+                }
+            }
             hasPreviousZenith = true;
             previousZenithRadians = state.zenith;
             previousTimeSeconds = state.time;
@@ -1352,6 +1546,81 @@ int main(int argc, char **argv) {
         std::cout << "Apogee recorded at " << flightComputer.ApogeeAltitude() << " m" << std::endl;
     } else {
         std::cout << "Latest apogee prediction: " << flightComputer.ApogeePrediction() << " m" << std::endl;
+    }
+    if (options.signCheckTimeSeconds.has_value()) {
+        std::cout << std::endl;
+        std::cout << "Apogee sign-check requested at t=" << *options.signCheckTimeSeconds
+                  << " s (window +/-" << options.signCheckWindowSeconds << " s)" << std::endl;
+        if (!hasSignCheckState) {
+            std::cout << "No filtered sample matched the requested time window." << std::endl;
+        } else {
+            StandaloneCfdTableStorage cfdStorage;
+            if (!LoadStandaloneCfdTable(options.cfdPath, cfdStorage)) {
+                std::cout << "Failed to load CFD table from '" << options.cfdPath << "'." << std::endl;
+            } else {
+                ApogeePredictor predictor;
+                predictor.SetEnvironment(environment);
+                predictor.SetVehicleParameters(vehicleParameters);
+                predictor.SetForceTable(&cfdStorage.table);
+                predictor.SetMaxIntegrationSteps(settings::actuation::kActuationPredictorMaxSteps);
+
+                ApogeeState baseState;
+                baseState.altitudeMeters = signCheckState.position[2];
+                baseState.horizontalDistanceMeters =
+                    math_utils::Magnitude2(signCheckState.position[0], signCheckState.position[1]);
+                baseState.verticalVelocity = signCheckState.velocity[2];
+                baseState.horizontalVelocity =
+                    math_utils::Magnitude2(signCheckState.velocity[0], signCheckState.velocity[1]);
+                baseState.zenith = signCheckState.zenith;
+                baseState.angularVelocity = signCheckAngularRate;
+
+                const math_utils::Vec3 wind = environment.GradientWind();
+                const double relX = static_cast<double>(baseState.verticalVelocity) - static_cast<double>(wind.x);
+                const double relY = static_cast<double>(baseState.horizontalVelocity) - static_cast<double>(wind.y);
+                const double relSpeed = std::sqrt(relX * relX + relY * relY);
+                const double tempK = environment.TemperatureKelvin(baseState.altitudeMeters);
+                const double speedOfSound =
+                    (tempK > 0.0) ? std::sqrt(constants::kGamma * constants::kGasConstant * tempK) : 0.0;
+                const double mach = (speedOfSound > 0.0) ? (relSpeed / speedOfSound) : 0.0;
+
+                auto predictAt = [&](double acsDeg) {
+                    ApogeeState state = baseState;
+                    state.acsAngleDeg = acsDeg;
+                    return predictor.PredictApogee(state);
+                };
+
+                const double apg0 = predictAt(0.0);
+                const double apg10 = predictAt(10.0);
+                const double apg20 = predictAt(20.0);
+                const double apg40 = predictAt(40.0);
+                const bool monotonicDrop = (apg10 < apg0) && (apg20 < apg10) && (apg40 < apg20);
+                const bool stateAscending = baseState.verticalVelocity > 0.0;
+                const bool enoughDynamicPressure = mach >= 0.08;
+
+                std::cout << "Matched sample at t=" << signCheckMatchedTime << " s" << std::endl;
+                std::cout << "Matched state: z=" << baseState.altitudeMeters
+                          << " m, vz=" << baseState.verticalVelocity
+                          << " m/s, vh=" << baseState.horizontalVelocity
+                          << " m/s, mach=" << mach << std::endl;
+                std::cout << "Predicted apogee @ ACS  0 deg: " << apg0 << " m" << std::endl;
+                std::cout << "Predicted apogee @ ACS 10 deg: " << apg10 << " m" << std::endl;
+                std::cout << "Predicted apogee @ ACS 20 deg: " << apg20 << " m" << std::endl;
+                std::cout << "Predicted apogee @ ACS 40 deg: " << apg40 << " m" << std::endl;
+                std::cout << "Delta (10-0): " << (apg10 - apg0) << " m" << std::endl;
+                std::cout << "Delta (20-10): " << (apg20 - apg10) << " m" << std::endl;
+                std::cout << "Delta (40-20): " << (apg40 - apg20) << " m" << std::endl;
+                if (!stateAscending) {
+                    std::cout << "Sign-check: INCONCLUSIVE (matched sample is not ascending)." << std::endl;
+                } else if (!enoughDynamicPressure) {
+                    std::cout << "Sign-check: INCONCLUSIVE (mach too low for strong aero sensitivity)." << std::endl;
+                } else {
+                    std::cout << "Sign-check: "
+                              << (monotonicDrop ? "PASS (more ACS lowers apogee)"
+                                                : "FAIL (ACS direction likely incorrect)")
+                              << std::endl;
+                }
+            }
+        }
     }
     if (flightComputer.BurnTime() > 0.0f) {
         std::cout << "Burn detected at t=" << flightComputer.BurnTime() << " s" << std::endl;

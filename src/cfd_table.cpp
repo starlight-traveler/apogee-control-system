@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "data_logger.h"
+#include "serial_logging.h"
 
 namespace {
 
@@ -101,7 +102,7 @@ bool FillTableLine(const char *line, void *context) {
 
 }  // namespace
 
-bool CfdTableLoadFromSd(const char *path, CfdTableStorage *storage, bool logSerial) {
+bool CfdTableLoadFromSd(const char *path, CfdTableStorage *storage) {
     if (storage == nullptr || path == nullptr) {
         return false;
     }
@@ -111,9 +112,7 @@ bool CfdTableLoadFromSd(const char *path, CfdTableStorage *storage, bool logSeri
     axes.atk.reserve(5200);
     axes.mach.reserve(5200);
     if (!DataLoggerReadTextFile(path, &CollectAxisLine, &axes) || !axes.sawData) {
-        if (logSerial && Serial) {
-            Serial.println("Failed to read CFD table.");
-        }
+        LOG_PRINTLN("Failed to read CFD table.");
         storage->loaded = false;
         return false;
     }
@@ -128,9 +127,7 @@ bool CfdTableLoadFromSd(const char *path, CfdTableStorage *storage, bool logSeri
     const int total = acsCount * atkCount * machCount;
 
     if (acsCount < 2 || atkCount < 2 || machCount < 2 || total <= 0) {
-        if (logSerial && Serial) {
-            Serial.println("CFD table is empty or invalid.");
-        }
+        LOG_PRINTLN("CFD table is empty or invalid.");
         storage->loaded = false;
         return false;
     }
@@ -149,9 +146,7 @@ bool CfdTableLoadFromSd(const char *path, CfdTableStorage *storage, bool logSeri
     fill.machCount = machCount;
 
     if (!DataLoggerReadTextFile(path, &FillTableLine, &fill)) {
-        if (logSerial && Serial) {
-            Serial.println("Failed to load CFD table data.");
-        }
+        LOG_PRINTLN("Failed to load CFD table data.");
         storage->loaded = false;
         return false;
     }
@@ -166,18 +161,16 @@ bool CfdTableLoadFromSd(const char *path, CfdTableStorage *storage, bool logSeri
     storage->table.machCount = machCount;
     storage->loaded = true;
 
-    if (logSerial && Serial) {
-        Serial.print("Loaded CFD table: ");
-        Serial.print(acsCount);
-        Serial.print(" x ");
-        Serial.print(atkCount);
-        Serial.print(" x ");
-        Serial.print(machCount);
-        Serial.println(".");
-        if (fill.missing > 0) {
-            Serial.print("CFD table missing entries: ");
-            Serial.println(fill.missing);
-        }
+    LOG_PRINT("Loaded CFD table: ");
+    LOG_PRINT(acsCount);
+    LOG_PRINT(" x ");
+    LOG_PRINT(atkCount);
+    LOG_PRINT(" x ");
+    LOG_PRINT(machCount);
+    LOG_PRINTLN(".");
+    if (fill.missing > 0) {
+        LOG_PRINT("CFD table missing entries: ");
+        LOG_PRINTLN(fill.missing);
     }
 
     return true;

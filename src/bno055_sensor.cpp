@@ -59,9 +59,6 @@ bool Bno055SensorAcquire(SensorData &out) {
     out.accelBNO[0] = accelX;
     out.accelBNO[1] = accelY;
     out.accelBNO[2] = accelZ;
-    out.accelICM[0] = accelX;
-    out.accelICM[1] = accelY;
-    out.accelICM[2] = accelZ;
 
     const imu::Vector<3> rawGyro = g_bno.getVector(Adafruit_BNO055::VECTOR_GYROSCOPE);
     float gyroX;

@@ -65,12 +65,12 @@ def acceleration(acs_ang, state):
 
     # Calculate Aerodynamic Forces
     if mach >= 0.025:
-        # Angle of Attack using zenith angle and velocity angle
-        lift_state = True
-        atk_ang = zenith - abs(np.arctan(vel_rel[1] / vel_rel[0]))
-        if atk_ang < 0:
-            lift_state = False
-        atk_ang = abs(atk_ang)
+        # Signed angle-of-attack from body axis angle minus relative-velocity angle.
+        # atan2 + wrap handles all quadrants and crosswind cases robustly.
+        vel_ang = np.arctan2(vel_rel[1], vel_rel[0])
+        atk_signed = (zenith - vel_ang + np.pi) % (2 * np.pi) - np.pi
+        lift_state = atk_signed >= 0
+        atk_ang = abs(atk_signed)
 
         # Aerodynamic Forces and Moments
         aero_point = np.array([acs_ang, np.degrees(atk_ang), mach])

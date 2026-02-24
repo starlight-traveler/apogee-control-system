@@ -5,10 +5,6 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#ifndef ENABLE_SERIAL_TELEMETRY
-#define ENABLE_SERIAL_TELEMETRY 1
-#endif
-
 #ifndef DATA_LOGGER_BUFFER_SIZE
 #define DATA_LOGGER_BUFFER_SIZE 4096
 #endif
@@ -27,8 +23,6 @@ namespace settings {
 // These are controlled by platformio build flags and affect runtime behavior.
 // ---------------------------------------------------------------------------
 namespace build {
-// Enables/disables serial telemetry printing in main loop and init paths.
-constexpr bool kEnableSerialTelemetry = (ENABLE_SERIAL_TELEMETRY != 0);
 // Byte size of SD log staging buffer before writes are flushed to the card.
 constexpr size_t kDataLoggerBufferSize = DATA_LOGGER_BUFFER_SIZE;
 // Minimum elapsed time between forced log buffer flushes (microseconds).
@@ -44,6 +38,36 @@ constexpr uint8_t kStatusLedPin = LED_BUILTIN;
 constexpr uint8_t kServoPin = 18;
 constexpr int kServoExtendAngle = 60;
 constexpr int kServoRetractAngle = 0;
+}
+
+// ---------------------------------------------------------------------------
+// Network / Telemetry Settings
+// WiFi AirLift mapping and UDP stream controls.
+// ---------------------------------------------------------------------------
+namespace network {
+constexpr bool kEnableTelemetry = true;
+// `true` = Teensy hosts AP; `false` = Teensy joins existing WiFi as station.
+constexpr bool kUseAccessPointMode = true;
+constexpr const char *kSsid = "Hi_Madelyn";
+constexpr const char *kPassword = "11112222";
+// WiFiNINA `setPins()` arguments for the AirLift coprocessor.
+constexpr int8_t kAirliftSsPin = 10;
+constexpr int8_t kAirliftAckPin = 5;
+constexpr int8_t kAirliftResetPin = 4;
+constexpr int8_t kAirliftGpio0Pin = -1;
+// Stream packet cadence. 20 ms = 50 Hz.
+constexpr uint32_t kTelemetryIntervalMs = 250;
+// How often to refresh WiFi link status checks in telemetry service.
+constexpr uint32_t kWiFiStatusCheckIntervalMs = 5000;
+constexpr uint16_t kTelemetryUdpLocalPort = 5006;
+constexpr uint16_t kTelemetryUdpRemotePort = 5005;
+constexpr bool kRequireSubscriberHeartbeat = true;
+constexpr uint32_t kSubscriberHeartbeatTimeoutMs = 600;
+// Ground-station receiver target (default 192.168.4.2 on AP subnet).
+constexpr uint8_t kTelemetryRemoteIp0 = 192;
+constexpr uint8_t kTelemetryRemoteIp1 = 168;
+constexpr uint8_t kTelemetryRemoteIp2 = 4;
+constexpr uint8_t kTelemetryRemoteIp3 = 2;
 }
 
 // ---------------------------------------------------------------------------
@@ -77,6 +101,65 @@ constexpr int kActuationPredictorMaxSteps = APOGEE_PREDICTOR_MAX_STEPS;
 constexpr float kCoarseAngleStepDeg = 8.0f;
 // If top coarse candidates are too close in cost, use full-resolution sweep.
 constexpr float kCoarseAmbiguityCostThreshold = 2.0f;
+// Max unique angle evaluations cached per control cycle.
+constexpr int kEvalCacheMaxEntries = 64;
+// Equality epsilon when matching candidate angles against cache.
+constexpr float kEvalCacheMatchEpsilonDeg = 0.001f;
+// Enable early-stop pruning in full-range sweeps.
+constexpr bool kEnableSweepPruning = true;
+// Number of consecutively worse bins before pruning the sweep.
+constexpr int kSweepPruneConsecutiveWorse = 6;
+}
+
+// ---------------------------------------------------------------------------
+// Status LED Settings (AirLift RGB LEDs)
+// Low-rate, non-blocking status indication.
+// ---------------------------------------------------------------------------
+namespace status_leds {
+// LED service period. 500 ms = 2 Hz blink cadence.
+constexpr uint32_t kUpdateIntervalMs = 500;
+
+// Fault (highest priority): RED
+constexpr uint8_t kFaultR = 140;
+constexpr uint8_t kFaultG = 0;
+constexpr uint8_t kFaultB = 0;
+
+// WiFi disconnected: AMBER/ORANGE
+constexpr uint8_t kWifiDownR = 80;
+constexpr uint8_t kWifiDownG = 24;
+constexpr uint8_t kWifiDownB = 0;
+
+// Manual override active: MAGENTA/PURPLE
+constexpr uint8_t kManualR = 120;
+constexpr uint8_t kManualG = 0;
+constexpr uint8_t kManualB = 120;
+
+// WiFi up, no subscriber heartbeat: BLUE BLINK
+constexpr uint8_t kNoSubscriberR = 0;
+constexpr uint8_t kNoSubscriberG = 0;
+constexpr uint8_t kNoSubscriberB = 96;
+
+// Flight phase colors when subscriber is active:
+// Ground = BLUE
+constexpr uint8_t kGroundR = 0;
+constexpr uint8_t kGroundG = 0;
+constexpr uint8_t kGroundB = 96;
+// Burn = ORANGE
+constexpr uint8_t kBurnR = 128;
+constexpr uint8_t kBurnG = 48;
+constexpr uint8_t kBurnB = 0;
+// Coast = GREEN
+constexpr uint8_t kCoastR = 0;
+constexpr uint8_t kCoastG = 120;
+constexpr uint8_t kCoastB = 0;
+// Overshoot = YELLOW
+constexpr uint8_t kOvershootR = 120;
+constexpr uint8_t kOvershootG = 120;
+constexpr uint8_t kOvershootB = 0;
+// Descent = CYAN
+constexpr uint8_t kDescentR = 0;
+constexpr uint8_t kDescentG = 96;
+constexpr uint8_t kDescentB = 96;
 }
 
 // ---------------------------------------------------------------------------
@@ -111,6 +194,20 @@ constexpr float kMeasurementHeightMeters = 10.0f;
 }
 
 // ---------------------------------------------------------------------------
+// Vehicle Model Settings
+// Parameters used by the apogee predictor dynamics.
+// ---------------------------------------------------------------------------
+namespace vehicle {
+// Aerodynamic moment arm CP-CG during coast/burnout [m].
+// CP from tip: 1.7537 m, CG from tip: 1.31 m.
+constexpr double kCenterOfPressureOffsetMeters = 0.4437;
+// Longitudinal moment of inertia during coast [kg*m^2].
+constexpr double kMomentOfInertiaKgM2 = 8.28;
+// Rocket dry mass / burnout mass [kg].
+constexpr double kDryMassKg = 18.24;
+}
+
+// ---------------------------------------------------------------------------
 // Flight/Estimator Settings
 // Core thresholds and filter/prediction tuning values.
 // ---------------------------------------------------------------------------
@@ -121,8 +218,13 @@ constexpr uint32_t kRecoveryBlinkIntervalMs = 60;
 constexpr float kDefaultDtSeconds = 0.03f;
 constexpr float kLiftoffAccelerationThresholdMps2 = 20.0f;
 constexpr float kLiftoffAltitudeThresholdM = 40.0f;
-constexpr float kBurnoutAccelerationThresholdMps2 = 0.0f;
-constexpr float kBurnoutVelocityThresholdMps = 0.0f;
+constexpr float kLiftoffVelocityThresholdMps = 10.0f;
+constexpr uint8_t kLiftoffConfirmSamples = 3;
+// Burnout confirmation requires sustained low/negative accel while still ascending.
+constexpr float kBurnoutAccelerationThresholdMps2 = 2.0f;
+constexpr float kBurnoutVelocityThresholdMps = 5.0f;
+constexpr float kBurnoutMinDurationSeconds = 1.0f;
+constexpr uint8_t kBurnoutConfirmSamples = 10;
 constexpr float kDescentVelocityThresholdMps = 0.0f;
 constexpr float kDescentAccelerationThresholdMps2 = 0.0f;
 
@@ -131,7 +233,7 @@ constexpr double kSigmaAccelZ = 0.5;
 constexpr double kSigmaAltimeter = 0.5;
 constexpr double kProcessNoiseXY = 0.5;
 constexpr double kProcessNoiseZ = 1.0;
-constexpr double kApogeeTargetMeters = 1711.;
+constexpr double kApogeeTargetMeters = 1700;
 
 constexpr int kApogeePredictorMaxSteps = APOGEE_PREDICTOR_MAX_STEPS;
 }
@@ -150,6 +252,36 @@ constexpr float kMaxAltitudeRateFeetPerSecond = 2500.0f;
 constexpr float kMinSpikeJumpFeet = 500.0f;
 // Absolute altitude magnitude limit for invalid sample rejection.
 constexpr float kMaxValidAltitudeFeet = 120000.0f;
+}
+
+namespace icm20948 {
+// ICM-20948 SPI chip-select pin.
+constexpr uint8_t kChipSelectPin = 37;
+// Local magnetic declination used for compass yaw correction.
+constexpr float kMagDeclinationDeg = -14.84f;
+// Mahony filter proportional and integral gains.
+constexpr float kMahonyKp = 50.0f;
+constexpr float kMahonyKi = 0.0f;
+// Gyro conversion scale used by the reference Mahony implementation.
+constexpr float kGyroScaleRadPerSecPerLsb = 0.000133168788f;  // (PI/180)*0.00763
+// Calibrated gyro zero-rate offsets.
+constexpr float kGyroOffset[3] = {74.3f, 153.8f, -5.5f};
+// Calibrated accelerometer hard-iron offsets.
+constexpr float kAccelBias[3] = {79.60f, -18.56f, 383.31f};
+// Calibrated accelerometer soft-iron inverse matrix.
+constexpr float kAccelAinv[3][3] = {
+    {1.00847f, 0.00470f, -0.00428f},
+    {0.00470f, 1.00846f, -0.00328f},
+    {-0.00428f, -0.00328f, 0.99559f},
+};
+// Calibrated magnetometer hard-iron offsets.
+constexpr float kMagBias[3] = {-156.70f, -52.79f, -141.07f};
+// Calibrated magnetometer soft-iron inverse matrix.
+constexpr float kMagAinv[3][3] = {
+    {1.12823f, -0.01142f, 0.00980f},
+    {-0.01142f, 1.09539f, 0.00927f},
+    {0.00980f, 0.00927f, 1.10625f},
+};
 }
 }
 }  // namespace settings

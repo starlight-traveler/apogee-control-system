@@ -14,6 +14,24 @@
 # EXTERNAL cache entries
 ########################
 
+//Bootstrap local Python venv for voice control during build
+ACS_SETUP_VOICE_ENV:BOOL=OFF
+
+//Download/unpack Vosk model during build
+ACS_SETUP_VOICE_MODEL:BOOL=OFF
+
+//Local Python venv path for voice control
+ACS_VOICE_VENV_DIR:PATH=/local/rocketry/apogee-control-system-teensy/local-imgui-telemetry/.venv
+
+//Directory where Vosk models are stored
+ACS_VOSK_MODEL_DIR:STRING=$<TARGET_FILE_DIR:teensy_imgui_telemetry>/models
+
+//Vosk model folder name
+ACS_VOSK_MODEL_NAME:STRING=vosk-model-en-us-0.22
+
+//Vosk model zip URL
+ACS_VOSK_MODEL_URL:STRING=https://alphacephei.com/vosk/models/vosk-model-en-us-0.22.zip
+
 //Path to a program.
 CMAKE_ADDR2LINE:FILEPATH=/usr/bin/addr2line
 
@@ -414,8 +432,6 @@ CMAKE_UNAME:INTERNAL=/usr/bin/uname
 CMAKE_VERBOSE_MAKEFILE-ADVANCED:INTERNAL=1
 //Details about finding OpenGL
 FIND_PACKAGE_MESSAGE_DETAILS_OpenGL:INTERNAL=[/usr/lib/libOpenGL.so][/usr/lib/libGLX.so][/usr/include][ ][v()]
-//Details about finding Threads
-FIND_PACKAGE_MESSAGE_DETAILS_Threads:INTERNAL=[TRUE][v()]
 //ADVANCED property for variable: GIT_EXECUTABLE
 GIT_EXECUTABLE-ADVANCED:INTERNAL=1
 //ADVANCED property for variable: OPENGL_EGL_INCLUDE_DIR
@@ -444,4 +460,15 @@ OPENGL_glx_LIBRARY-ADVANCED:INTERNAL=1
 OPENGL_opengl_LIBRARY-ADVANCED:INTERNAL=1
 //ADVANCED property for variable: OPENGL_xmesa_INCLUDE_DIR
 OPENGL_xmesa_INCLUDE_DIR-ADVANCED:INTERNAL=1
+//Compiler reason failure
+_Python3_Compiler_REASON_FAILURE:INTERNAL=
+//Development reason failure
+_Python3_Development_REASON_FAILURE:INTERNAL=
+//Path to a program.
+_Python3_EXECUTABLE:INTERNAL=/usr/bin/python3.14
+//Python3 Properties
+_Python3_INTERPRETER_PROPERTIES:INTERNAL=Python;3;14;3;64;32;<none>;cpython-314-x86_64-linux-gnu;abi3;/usr/lib/python3.14;/usr/lib/python3.14;/usr/lib/python3.14/site-packages;/usr/lib/python3.14/site-packages
+_Python3_INTERPRETER_SIGNATURE:INTERNAL=3bf3d4a11a6246bc9624d29f98b51476
+//NumPy reason failure
+_Python3_NumPy_REASON_FAILURE:INTERNAL=
 

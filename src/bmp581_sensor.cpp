@@ -11,6 +11,7 @@
 #include <arm_math.h>
 
 #include "SparkFun_BMP581_Arduino_Library.h"
+#include "serial_logging.h"
 #include "settings.h"
 
 namespace {
@@ -124,13 +125,13 @@ bool Bmp581SensorBegin() {
     while(g_pressureSensor.beginSPI(kChipSelectPin, kSpiClockHz) != BMP5_OK)
     {
         // Not connected, inform user
-        Serial.println("Error: BMP581 not connected, check wiring and CS pin!");
+        LOG_PRINTLN("Error: BMP581 not connected, check wiring and CS pin!");
 
         // Wait a bit to see if connection is established
         delay(1000);
     }
     
-    Serial.println("BMP581 connected!");
+    LOG_PRINTLN("BMP581 connected!");
 
     if (!ConfigureSensor()) {
         return false;
