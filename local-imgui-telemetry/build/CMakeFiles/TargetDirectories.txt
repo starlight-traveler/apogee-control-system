@@ -1,6 +1,0 @@
-/local/rocketry/apogee-control-system-teensy/local-imgui-telemetry/build/CMakeFiles/imgui_vendor.dir
-/local/rocketry/apogee-control-system-teensy/local-imgui-telemetry/build/CMakeFiles/teensy_imgui_telemetry.dir
-/local/rocketry/apogee-control-system-teensy/local-imgui-telemetry/build/CMakeFiles/voice_model.dir
-/local/rocketry/apogee-control-system-teensy/local-imgui-telemetry/build/CMakeFiles/voice_env.dir
-/local/rocketry/apogee-control-system-teensy/local-imgui-telemetry/build/CMakeFiles/edit_cache.dir
-/local/rocketry/apogee-control-system-teensy/local-imgui-telemetry/build/CMakeFiles/rebuild_cache.dir

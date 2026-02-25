@@ -71,3 +71,11 @@ venv/
 data/
 *.log
 standalone-c/sensor_data/
+
+# Large local artifacts
+local-imgui-telemetry/build/
+standalone-c/matplotplusplus.zip
+standalone-c/matplotplusplus/source/matplot/util/world_map_10m.cpp
+standalone-c/shortened.csv
+tools/SENS073.BIN
+tools/file.csv
