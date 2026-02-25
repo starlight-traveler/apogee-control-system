@@ -74,6 +74,10 @@ standalone-c/sensor_data/
 
 # Large local artifacts
 local-imgui-telemetry/build/
+local-imgui-telemetry/models/
+local-imgui-telemetry/build/models/
+local-imgui-telemetry/build/vosk-model-en-us-0.22.zip
+local-imgui-telemetry/models/vosk-model-small-en-us-0.15.zip
 standalone-c/matplotplusplus.zip
 standalone-c/matplotplusplus/source/matplot/util/world_map_10m.cpp
 standalone-c/shortened.csv
