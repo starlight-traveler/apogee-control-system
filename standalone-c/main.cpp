@@ -1038,6 +1038,8 @@ void RenderMatplotGraph(const SampleValueInfo &info, const std::vector<std::pair
         auto ax = fig->current_axes();
         ax->plot(times, values);
         ax->xlabel("Time (s)");
+        // Keep metric names literal (e.g. accel_icm_z) instead of gnuplot enhanced-text parsing.
+        ax->title_enhanced(false);
         ax->ylabel(info.cliName);
         ax->title(std::string(info.cliName) + " - " + info.description);
         ax->grid(true);
