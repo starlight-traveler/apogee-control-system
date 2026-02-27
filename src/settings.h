@@ -228,11 +228,12 @@ constexpr uint8_t kBurnoutConfirmSamples = 10;
 constexpr float kDescentVelocityThresholdMps = 0.0f;
 constexpr float kDescentAccelerationThresholdMps2 = 0.0f;
 
-constexpr double kSigmaAccelXY = 0.5;
-constexpr double kSigmaAccelZ = 0.5;
-constexpr double kSigmaAltimeter = 0.5;
-constexpr double kProcessNoiseXY = 0.5;
-constexpr double kProcessNoiseZ = 1.0;
+// Smoother defaults to reduce velocity chatter in logged/telemetry states.
+constexpr double kSigmaAccelXY = 1.2;
+constexpr double kSigmaAccelZ = 1.5;
+constexpr double kSigmaAltimeter = 3.0;
+constexpr double kProcessNoiseXY = 0.20;
+constexpr double kProcessNoiseZ = 0.35;
 constexpr double kApogeeTargetMeters = 1700;
 
 constexpr int kApogeePredictorMaxSteps = APOGEE_PREDICTOR_MAX_STEPS;

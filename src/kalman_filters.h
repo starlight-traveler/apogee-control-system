@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <cmath>
 #include <string.h>
 
@@ -30,13 +31,13 @@ class KalmanFilterAccel {
         const double dt2 = dt * dt;
         const double dt3 = dt2 * dt;
         const double dt4 = dt3 * dt;
-        const double half_dt2 = 0.5 * dt2;
+        const double h = 0.5 * dt2;
 
         const double x0 = state_[0];
         const double x1 = state_[1];
         const double x2 = state_[2];
 
-        state_[0] = x0 + dt * x1 + half_dt2 * x2;
+        state_[0] = x0 + dt * x1 + h * x2;
         state_[1] = x1 + dt * x2;
         state_[2] = x2;
 
@@ -50,44 +51,61 @@ class KalmanFilterAccel {
         const double p21 = covariance_[2][1];
         const double p22 = covariance_[2][2];
 
-        const double fp00 = p00 + dt * p10 + half_dt2 * p20;
-        const double fp01 = p01 + dt * p11 + half_dt2 * p21;
-        const double fp02 = p02 + dt * p12 + half_dt2 * p22;
-        const double fp10 = p10 + dt * p20;
-        const double fp11 = p11 + dt * p21;
-        const double fp12 = p12 + dt * p22;
-        const double fp20 = p20;
-        const double fp21 = p21;
-        const double fp22 = p22;
+        const double t00 = p00 + dt * p10 + h * p20;
+        const double t01 = p01 + dt * p11 + h * p21;
+        const double t02 = p02 + dt * p12 + h * p22;
+        const double t10 = p10 + dt * p20;
+        const double t11 = p11 + dt * p21;
+        const double t12 = p12 + dt * p22;
+        const double t20 = p20;
+        const double t21 = p21;
+        const double t22 = p22;
 
-        double newP00 = fp00;
-        double newP01 = fp00 * dt + fp01;
-        double newP02 = fp00 * half_dt2 + fp01 * dt + fp02;
-        double newP11 = fp10 * dt + fp11;
-        double newP12 = fp10 * half_dt2 + fp11 * dt + fp12;
-        double newP22 = fp20 * half_dt2 + fp21 * dt + fp22;
+        double newP00 = t00 + dt * t01 + h * t02;
+        double newP01 = t01 + dt * t02;
+        double newP02 = t02;
+        double newP10 = t10 + dt * t11 + h * t12;
+        double newP11 = t11 + dt * t12;
+        double newP12 = t12;
+        double newP20 = t20 + dt * t21 + h * t22;
+        double newP21 = t21 + dt * t22;
+        double newP22 = t22;
 
         const double qVar = processSigma * processSigma;
-        newP00 += qVar * (0.25 * dt4);
-        newP01 += qVar * (0.5 * dt3);
-        newP02 += qVar * (0.5 * dt2);
-        newP11 += qVar * dt2;
-        newP12 += qVar * dt;
+        const double q00 = 0.25 * dt4 * qVar;
+        const double q01 = 0.5 * dt3 * qVar;
+        const double q02 = 0.5 * dt2 * qVar;
+        const double q11 = dt2 * qVar;
+        const double q12 = dt * qVar;
+
+        newP00 += q00;
+        newP01 += q01;
+        newP02 += q02;
+        newP10 += q01;
+        newP11 += q11;
+        newP12 += q12;
+        newP20 += q02;
+        newP21 += q12;
         newP22 += qVar;
 
         covariance_[0][0] = newP00;
-        covariance_[0][1] = newP01;
-        covariance_[0][2] = newP02;
-        covariance_[1][0] = newP01;
+        covariance_[0][1] = 0.5 * (newP01 + newP10);
+        covariance_[0][2] = 0.5 * (newP02 + newP20);
+        covariance_[1][0] = covariance_[0][1];
         covariance_[1][1] = newP11;
-        covariance_[1][2] = newP12;
-        covariance_[2][0] = newP02;
-        covariance_[2][1] = newP12;
+        covariance_[1][2] = 0.5 * (newP12 + newP21);
+        covariance_[2][0] = covariance_[0][2];
+        covariance_[2][1] = covariance_[1][2];
         covariance_[2][2] = newP22;
     }
 
     void Update(double accelMeasurement) {
-        const double residual = accelMeasurement - state_[2];
+        if (!std::isfinite(accelMeasurement)) {
+            return;
+        }
+        constexpr double kMaxAccelResidual = 80.0;
+        const double residual =
+            std::clamp(accelMeasurement - state_[2], -kMaxAccelResidual, kMaxAccelResidual);
         double innovation = covariance_[2][2] + measurementVariance_;
         if (innovation <= 0.0) {
             innovation = measurementVariance_;
@@ -112,26 +130,36 @@ class KalmanFilterAccel {
         const double p21 = covariance_[2][1];
         const double p22 = covariance_[2][2];
 
-        const double temp00 = p00 - k0 * p20;
-        const double temp01 = p01 - k0 * p21;
-        const double temp02 = p02 - k0 * p22;
-        const double temp10 = p10 - k1 * p20;
-        const double temp11 = p11 - k1 * p21;
-        const double temp12 = p12 - k1 * p22;
-        const double oneMinusK2 = 1.0 - k2;
-        const double temp20 = oneMinusK2 * p20;
-        const double temp21 = oneMinusK2 * p21;
-        const double temp22 = oneMinusK2 * p22;
+        // Joseph-form covariance update for H = [0 0 1], keeps P symmetric/PSD.
+        const double m00 = 1.0;
+        const double m01 = 0.0;
+        const double m02 = -k0;
+        const double m10 = 0.0;
+        const double m11 = 1.0;
+        const double m12 = -k1;
+        const double m20 = 0.0;
+        const double m21 = 0.0;
+        const double m22 = 1.0 - k2;
 
-        double newP00 = temp00;
-        double newP01 = temp01;
-        double newP02 = -k0 * temp00 - k1 * temp01 + oneMinusK2 * temp02;
-        double newP10 = temp10;
-        double newP11 = temp11;
-        double newP12 = -k0 * temp10 - k1 * temp11 + oneMinusK2 * temp12;
-        double newP20 = temp20;
-        double newP21 = temp21;
-        double newP22 = -k0 * temp20 - k1 * temp21 + oneMinusK2 * temp22;
+        const double mp00 = m00 * p00 + m01 * p10 + m02 * p20;
+        const double mp01 = m00 * p01 + m01 * p11 + m02 * p21;
+        const double mp02 = m00 * p02 + m01 * p12 + m02 * p22;
+        const double mp10 = m10 * p00 + m11 * p10 + m12 * p20;
+        const double mp11 = m10 * p01 + m11 * p11 + m12 * p21;
+        const double mp12 = m10 * p02 + m11 * p12 + m12 * p22;
+        const double mp20 = m20 * p00 + m21 * p10 + m22 * p20;
+        const double mp21 = m20 * p01 + m21 * p11 + m22 * p21;
+        const double mp22 = m20 * p02 + m21 * p12 + m22 * p22;
+
+        double newP00 = mp00 * m00 + mp01 * m01 + mp02 * m02;
+        double newP01 = mp00 * m10 + mp01 * m11 + mp02 * m12;
+        double newP02 = mp00 * m20 + mp01 * m21 + mp02 * m22;
+        double newP10 = mp10 * m00 + mp11 * m01 + mp12 * m02;
+        double newP11 = mp10 * m10 + mp11 * m11 + mp12 * m12;
+        double newP12 = mp10 * m20 + mp11 * m21 + mp12 * m22;
+        double newP20 = mp20 * m00 + mp21 * m01 + mp22 * m02;
+        double newP21 = mp20 * m10 + mp21 * m11 + mp22 * m12;
+        double newP22 = mp20 * m20 + mp21 * m21 + mp22 * m22;
 
         const double measVar = measurementVariance_;
         const double add00 = measVar * k0 * k0;
@@ -264,8 +292,16 @@ class KalmanFilterAccelAlt {
     }
 
     void Update(double accelMeasurement, double altitudeMeasurement) {
-        const double residualAccel = accelMeasurement - state_[2];
-        const double residualAlt = altitudeMeasurement - state_[0];
+        if (!std::isfinite(accelMeasurement) || !std::isfinite(altitudeMeasurement)) {
+            return;
+        }
+        // Limit single-sample innovation so outliers don't create sharp velocity spikes.
+        constexpr double kMaxAccelResidual = 80.0;
+        constexpr double kMaxAltitudeResidual = 60.0;
+        const double residualAccel =
+            std::clamp(accelMeasurement - state_[2], -kMaxAccelResidual, kMaxAccelResidual);
+        const double residualAlt =
+            std::clamp(altitudeMeasurement - state_[0], -kMaxAltitudeResidual, kMaxAltitudeResidual);
 
         const double p00 = covariance_[0][0];
         const double p01 = covariance_[0][1];

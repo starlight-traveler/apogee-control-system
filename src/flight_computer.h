@@ -95,6 +95,11 @@ class FlightComputer {
     double processNoiseXY_ = 0.5;
     double processNoiseZ_ = 1.0;
 
+    // Output-only smoothing state (does not affect estimator internals/status decisions).
+    bool outputFilterInitialized_ = false;
+    double smoothedVelocity_[3] = {0.0, 0.0, 0.0};
+    double smoothedAcceleration_[3] = {0.0, 0.0, 0.0};
+
 };
 
 const char *FlightStatusToString(FlightStatus status);

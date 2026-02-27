@@ -23,6 +23,34 @@ math_utils::Vec3 RotateBodyToInertial(const math_utils::Vec3 &bodyAccel, float z
     return result;
 }
 
+double ComputeSmoothingAlpha(double dt, double tauSeconds) {
+    if (dt <= 0.0 || tauSeconds <= 0.0) {
+        return 1.0;
+    }
+    const double alpha = dt / (tauSeconds + dt);
+    if (alpha < 0.0) {
+        return 0.0;
+    }
+    if (alpha > 1.0) {
+        return 1.0;
+    }
+    return alpha;
+}
+
+double ApplySlewLimit(double previous, double target, double maxDeltaPerStep) {
+    if (maxDeltaPerStep <= 0.0) {
+        return target;
+    }
+    const double delta = target - previous;
+    if (delta > maxDeltaPerStep) {
+        return previous + maxDeltaPerStep;
+    }
+    if (delta < -maxDeltaPerStep) {
+        return previous - maxDeltaPerStep;
+    }
+    return target;
+}
+
 }  // namespace
 
 FlightComputer::FlightComputer() = default;
@@ -203,16 +231,44 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
         }
     }
 
+    // Smooth only published outputs to reduce telemetry/log oscillation.
+    // Detection/state transitions above remain on raw Kalman values.
+    constexpr double kVelocityTauSeconds = 0.22;
+    constexpr double kAccelerationTauSeconds = 0.30;
+    constexpr double kMaxOutputAccelMps2 = 45.0;
+    const double alphaVel = ComputeSmoothingAlpha(dt, kVelocityTauSeconds);
+    const double alphaAcc = ComputeSmoothingAlpha(dt, kAccelerationTauSeconds);
+    if (!outputFilterInitialized_) {
+        smoothedVelocity_[0] = velX;
+        smoothedVelocity_[1] = velY;
+        smoothedVelocity_[2] = velZ;
+        smoothedAcceleration_[0] = accX;
+        smoothedAcceleration_[1] = accY;
+        smoothedAcceleration_[2] = accZ;
+        outputFilterInitialized_ = true;
+    } else {
+        const double maxDv = kMaxOutputAccelMps2 * dt;
+        const double targetVx = smoothedVelocity_[0] + alphaVel * (velX - smoothedVelocity_[0]);
+        const double targetVy = smoothedVelocity_[1] + alphaVel * (velY - smoothedVelocity_[1]);
+        const double targetVz = smoothedVelocity_[2] + alphaVel * (velZ - smoothedVelocity_[2]);
+        smoothedVelocity_[0] = ApplySlewLimit(smoothedVelocity_[0], targetVx, maxDv);
+        smoothedVelocity_[1] = ApplySlewLimit(smoothedVelocity_[1], targetVy, maxDv);
+        smoothedVelocity_[2] = ApplySlewLimit(smoothedVelocity_[2], targetVz, maxDv);
+        smoothedAcceleration_[0] += alphaAcc * (accX - smoothedAcceleration_[0]);
+        smoothedAcceleration_[1] += alphaAcc * (accY - smoothedAcceleration_[1]);
+        smoothedAcceleration_[2] += alphaAcc * (accZ - smoothedAcceleration_[2]);
+    }
+
     output.time = data.timestamp;
     output.position[0] = static_cast<float>(posX);
     output.position[1] = static_cast<float>(posY);
     output.position[2] = static_cast<float>(posZ);
-    output.velocity[0] = static_cast<float>(velX);
-    output.velocity[1] = static_cast<float>(velY);
-    output.velocity[2] = static_cast<float>(velZ);
-    output.acceleration[0] = static_cast<float>(accX);
-    output.acceleration[1] = static_cast<float>(accY);
-    output.acceleration[2] = static_cast<float>(accZ);
+    output.velocity[0] = static_cast<float>(smoothedVelocity_[0]);
+    output.velocity[1] = static_cast<float>(smoothedVelocity_[1]);
+    output.velocity[2] = static_cast<float>(smoothedVelocity_[2]);
+    output.acceleration[0] = static_cast<float>(smoothedAcceleration_[0]);
+    output.acceleration[1] = static_cast<float>(smoothedAcceleration_[1]);
+    output.acceleration[2] = static_cast<float>(smoothedAcceleration_[2]);
     output.inertialAcceleration[0] = static_cast<float>(inertialAcceleration.x);
     output.inertialAcceleration[1] = static_cast<float>(inertialAcceleration.y);
     output.inertialAcceleration[2] = static_cast<float>(inertialAcceleration.z);
@@ -242,6 +298,13 @@ void FlightComputer::ResetInternalState() {
     apogeeTimestamp_ = 0.0;
     liftoffCandidateCount_ = 0;
     burnoutCandidateCount_ = 0;
+    outputFilterInitialized_ = false;
+    smoothedVelocity_[0] = 0.0;
+    smoothedVelocity_[1] = 0.0;
+    smoothedVelocity_[2] = 0.0;
+    smoothedAcceleration_[0] = 0.0;
+    smoothedAcceleration_[1] = 0.0;
+    smoothedAcceleration_[2] = 0.0;
 }
 
 void FlightComputer::ReportEvent(bool includeAltitude, float timeSeconds, const char *label) {

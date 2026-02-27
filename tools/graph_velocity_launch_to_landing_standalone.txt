@@ -1,0 +1,31 @@
+
+Graph: velocity_mps - Filtered vertical velocity in m/s.
+Time range: 245.298s to 330.118s
+Value range: -51.4087 to 50.0785
+*                                                                               
+|                                                                               
+*                                                                               
+|                                                                               
+|                                                                               
+|                                                                               
+|                                                                               
+|                                                                               
+*                                                                               
+*                                                                               
+*                                                                    **         
+*                                            *       *************************  
+*                                           ***     **                       ***
+*                                           * * *****                          *
+**               *            **          *** *** **                            
+|***** **        **    **    ***   **    **   **   *                            
+|********* **    **** ********************    **                                
+|*** **  * ** *** *****  *****  ***   **                                        
+|    **  *** **** ****    * *                                                   
++-----------**--*----*----------------------------------------------------------
+Saved Matplot++ graph: graph_velocity_mps.png
+
+Samples processed: 14767
+Rows skipped: 272
+Altimeter outliers skipped: 272
+States generated: 6539
+Latest apogee prediction: 0 m
