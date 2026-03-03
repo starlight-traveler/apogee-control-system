@@ -29,7 +29,7 @@ namespace {
 bool CaseInsensitiveEquals(const std::string &a, const std::string &b);
 enum class SampleValueId;
 
-constexpr float kAltimeterMinFeet = 700.0f;
+constexpr float kAltimeterMinFeet = 0.0f;
 constexpr float kAltimeterMaxFeet = 6000.0f;
 
 enum class FieldId {
@@ -150,6 +150,28 @@ struct FieldIndices {
     std::array<std::optional<std::size_t>, 3> gyro{};
     std::array<std::optional<std::size_t>, 4> quaternion{};
     std::optional<std::size_t> hasQuaternionFlag;
+};
+
+struct ReplaySeedIndices {
+    std::optional<std::size_t> hasFilteredState;
+    std::optional<std::size_t> flightStatus;
+    std::optional<std::size_t> stateTime;
+    std::array<std::optional<std::size_t>, 3> position{};
+    std::array<std::optional<std::size_t>, 3> velocity{};
+    std::array<std::optional<std::size_t>, 3> acceleration{};
+    std::array<std::optional<std::size_t>, 3> inertialAcceleration{};
+    std::optional<std::size_t> zenith;
+    std::optional<std::size_t> apogeeEstimate;
+
+    bool HasAnySeedColumns() const {
+        return stateTime.has_value() || position[2].has_value() || velocity[2].has_value() ||
+               zenith.has_value() || apogeeEstimate.has_value();
+    }
+
+    bool HasRequiredStateColumns() const {
+        return stateTime.has_value() && position[2].has_value() && velocity[2].has_value() &&
+               zenith.has_value();
+    }
 };
 
 std::string ToLower(std::string value) {
@@ -677,6 +699,10 @@ std::optional<std::size_t> FindHeaderIndex(const std::vector<std::string> &heade
     return std::nullopt;
 }
 
+std::optional<std::size_t> FindHeaderIndexSingle(const std::vector<std::string> &headers, const std::string &name) {
+    return FindHeaderIndex(headers, {name});
+}
+
 std::optional<std::size_t> ResolveFieldIndex(FieldId field,
                                              const std::vector<std::string> &headers,
                                              const FieldOverrideMap &overrides,
@@ -724,6 +750,28 @@ FieldIndices BuildFieldIndices(const std::vector<std::string> &headers, const Fi
     resolve(FieldId::QuatY, indices.quaternion[2]);
     resolve(FieldId::QuatZ, indices.quaternion[3]);
     resolve(FieldId::HasQuaternion, indices.hasQuaternionFlag);
+    return indices;
+}
+
+ReplaySeedIndices BuildReplaySeedIndices(const std::vector<std::string> &headers) {
+    ReplaySeedIndices indices;
+    indices.hasFilteredState = FindHeaderIndexSingle(headers, "has_filtered_state");
+    indices.flightStatus = FindHeaderIndexSingle(headers, "flight_status");
+    indices.stateTime = FindHeaderIndexSingle(headers, "state_time");
+    indices.position[0] = FindHeaderIndexSingle(headers, "state_position_x");
+    indices.position[1] = FindHeaderIndexSingle(headers, "state_position_y");
+    indices.position[2] = FindHeaderIndexSingle(headers, "state_position_z");
+    indices.velocity[0] = FindHeaderIndexSingle(headers, "state_velocity_x");
+    indices.velocity[1] = FindHeaderIndexSingle(headers, "state_velocity_y");
+    indices.velocity[2] = FindHeaderIndexSingle(headers, "state_velocity_z");
+    indices.acceleration[0] = FindHeaderIndexSingle(headers, "state_acceleration_x");
+    indices.acceleration[1] = FindHeaderIndexSingle(headers, "state_acceleration_y");
+    indices.acceleration[2] = FindHeaderIndexSingle(headers, "state_acceleration_z");
+    indices.inertialAcceleration[0] = FindHeaderIndexSingle(headers, "state_inertial_acceleration_x");
+    indices.inertialAcceleration[1] = FindHeaderIndexSingle(headers, "state_inertial_acceleration_y");
+    indices.inertialAcceleration[2] = FindHeaderIndexSingle(headers, "state_inertial_acceleration_z");
+    indices.zenith = FindHeaderIndexSingle(headers, "state_zenith");
+    indices.apogeeEstimate = FindHeaderIndexSingle(headers, "state_apogee_estimate");
     return indices;
 }
 
@@ -819,6 +867,145 @@ bool PopulateSensorData(const std::vector<std::string> &row,
     }
 
     return true;
+}
+
+std::optional<FlightStatus> ParseFlightStatusValue(const std::string &value) {
+    const std::string lowered = ToLower(Trim(value));
+    if (lowered == "ground") {
+        return FlightStatus::Ground;
+    }
+    if (lowered == "burn") {
+        return FlightStatus::Burn;
+    }
+    if (lowered == "coast") {
+        return FlightStatus::Coast;
+    }
+    if (lowered == "overshoot") {
+        return FlightStatus::Overshoot;
+    }
+    if (lowered == "descent") {
+        return FlightStatus::Descent;
+    }
+    return std::nullopt;
+}
+
+bool TryPopulateSeededState(const std::vector<std::string> &row,
+                            const ReplaySeedIndices &indices,
+                            FilteredState &state,
+                            FlightStatus &status) {
+    if (!indices.HasRequiredStateColumns()) {
+        return false;
+    }
+    if (indices.hasFilteredState.has_value()) {
+        const auto hasFilteredState = ExtractBool(row, indices.hasFilteredState);
+        if (!hasFilteredState.has_value() || !*hasFilteredState) {
+            return false;
+        }
+    }
+
+    const auto stateTime = ExtractFloat(row, indices.stateTime);
+    const auto posZ = ExtractFloat(row, indices.position[2]);
+    const auto velZ = ExtractFloat(row, indices.velocity[2]);
+    const auto zenith = ExtractFloat(row, indices.zenith);
+    const auto apogeeEstimate = ExtractFloat(row, indices.apogeeEstimate);
+    if (!stateTime.has_value() || !posZ.has_value() || !velZ.has_value() || !zenith.has_value()) {
+        return false;
+    }
+
+    FlightStatus parsedStatus = status;
+    if (indices.flightStatus.has_value()) {
+        const std::size_t index = *indices.flightStatus;
+        if (index < row.size()) {
+            const auto maybeStatus = ParseFlightStatusValue(row[index]);
+            if (maybeStatus.has_value()) {
+                parsedStatus = *maybeStatus;
+            }
+        }
+    }
+
+    state = FilteredState{};
+    state.time = *stateTime;
+    state.position[2] = *posZ;
+    state.velocity[2] = *velZ;
+    state.zenith = *zenith;
+    state.apogeeEstimate = apogeeEstimate.value_or(*posZ);
+    for (int i = 0; i < 3; ++i) {
+        if (const auto value = ExtractFloat(row, indices.position[i]); value.has_value()) {
+            state.position[i] = *value;
+        }
+        if (const auto value = ExtractFloat(row, indices.velocity[i]); value.has_value()) {
+            state.velocity[i] = *value;
+        }
+        if (const auto value = ExtractFloat(row, indices.acceleration[i]); value.has_value()) {
+            state.acceleration[i] = *value;
+        }
+        if (const auto value = ExtractFloat(row, indices.inertialAcceleration[i]); value.has_value()) {
+            state.inertialAcceleration[i] = *value;
+        }
+    }
+    status = parsedStatus;
+    return true;
+}
+
+double ComputeSeededHorizontalVelocityOption1(const FilteredState &state) {
+    const double cosZenith = std::cos(static_cast<double>(state.zenith));
+    const double clampedCos = std::clamp(cosZenith, 0.1, 1.0);
+    const double speedAlongAxis = static_cast<double>(state.velocity[2]) / clampedCos;
+    const double verticalSquared =
+        static_cast<double>(state.velocity[2]) * static_cast<double>(state.velocity[2]);
+    const double speedSquared = speedAlongAxis * speedAlongAxis;
+    const double horizontalSquared = speedSquared - verticalSquared;
+    return (horizontalSquared > 0.0) ? std::sqrt(horizontalSquared) : 0.0;
+}
+
+double ComputeSeededAngularRate(float currentTimeSeconds,
+                                float currentZenithRadians,
+                                float previousTimeSeconds,
+                                float previousZenithRadians,
+                                bool hasPreviousZenith) {
+    if (!hasPreviousZenith) {
+        return 0.0;
+    }
+    const double dt = static_cast<double>(currentTimeSeconds) - static_cast<double>(previousTimeSeconds);
+    if (dt <= 0.0) {
+        return 0.0;
+    }
+    return (static_cast<double>(currentZenithRadians) - static_cast<double>(previousZenithRadians)) / dt;
+}
+
+double RecomputeSeededApogeeEstimate(const FilteredState &state,
+                                     FlightStatus status,
+                                     double angularRate,
+                                     ApogeePredictor &predictor,
+                                     double &lastPredictionMeters,
+                                     float &lastPredictionTimeSeconds,
+                                     bool &hasLastPrediction) {
+    const bool ascending = state.velocity[2] > 0.0f;
+    const bool shouldPredict =
+        ascending && (status == FlightStatus::Burn || status == FlightStatus::Coast);
+    if (shouldPredict) {
+        const bool shouldRefresh = !hasLastPrediction ||
+                                   (state.time - lastPredictionTimeSeconds) >= 0.1f;
+        if (shouldRefresh) {
+            ApogeeState predictorState;
+            predictorState.altitudeMeters = static_cast<double>(state.position[2]);
+            predictorState.horizontalDistanceMeters = 0.0;
+            predictorState.verticalVelocity = static_cast<double>(state.velocity[2]);
+            predictorState.horizontalVelocity = ComputeSeededHorizontalVelocityOption1(state);
+            predictorState.zenith = static_cast<double>(state.zenith);
+            predictorState.angularVelocity = angularRate;
+            predictorState.acsAngleDeg = 0.0;
+            lastPredictionMeters = predictor.PredictApogee(predictorState);
+            lastPredictionTimeSeconds = state.time;
+            hasLastPrediction = true;
+        }
+        return lastPredictionMeters;
+    }
+
+    if (hasLastPrediction) {
+        return lastPredictionMeters;
+    }
+    return state.apogeeEstimate;
 }
 
 struct SampleValueContext {
@@ -1392,6 +1579,7 @@ int main(int argc, char **argv) {
     }
     std::vector<std::string> headers = ParseCsvLine(headerLine);
     FieldIndices indices = BuildFieldIndices(headers, options.fieldOverrides);
+    const ReplaySeedIndices replaySeedIndices = BuildReplaySeedIndices(headers);
 
     if (!indices.timestamp.has_value()) {
         std::cerr << "Unable to locate a timestamp column. Use --field to specify one." << std::endl;
@@ -1404,6 +1592,11 @@ int main(int argc, char **argv) {
 
     if (!options.quiet) {
         PrintFieldMappingSummary(indices, headers);
+        if (replaySeedIndices.HasAnySeedColumns()) {
+            std::cout << "Smart seed: logged filtered-state columns detected; using them when available and"
+                         " recomputing apogee look-ahead from the seeded state."
+                      << std::endl;
+        }
     }
 
     EnvironmentModel::Config environmentConfig;
@@ -1423,6 +1616,18 @@ int main(int argc, char **argv) {
                          vehicleParameters,
                          nullptr);
     flightComputer.SetSerialReportingEnabled(false);
+
+    StandaloneCfdTableStorage seededReplayCfdStorage;
+    const bool loadedSeededReplayCfd = LoadStandaloneCfdTable(options.cfdPath, seededReplayCfdStorage) ||
+                                       (options.cfdPath == "lib/cfd.csv" &&
+                                        LoadStandaloneCfdTable("../lib/cfd.csv", seededReplayCfdStorage));
+    ApogeePredictor seededReplayPredictor;
+    seededReplayPredictor.SetEnvironment(environment);
+    seededReplayPredictor.SetVehicleParameters(vehicleParameters);
+    seededReplayPredictor.SetMaxIntegrationSteps(settings::flight::kApogeePredictorMaxSteps);
+    if (loadedSeededReplayCfd) {
+        seededReplayPredictor.SetForceTable(&seededReplayCfdStorage.table);
+    }
 
     if (!options.quiet) {
         std::cout << "time_s,altitude_m,velocity_mps,apogee_prediction_m,status";
@@ -1456,6 +1661,12 @@ int main(int argc, char **argv) {
     float signCheckMatchedTime = 0.0f;
     float signCheckBestDelta = std::numeric_limits<float>::infinity();
     FilteredState signCheckState{};
+    bool usedSeededStateOutput = false;
+    double lastEmittedApogeeMeters = 0.0;
+    FlightStatus lastEmittedStatus = FlightStatus::Ground;
+    bool hasSeededReplayPrediction = false;
+    float lastSeededReplayPredictionTimeSeconds = 0.0f;
+    double lastSeededReplayPredictionMeters = 0.0;
     while (std::getline(input, line)) {
         ++lineNumber;
         if (Trim(line).empty()) {
@@ -1479,9 +1690,32 @@ int main(int argc, char **argv) {
         }
         ++processedRows;
         FilteredState state;
-        const bool hasState = flightComputer.Update(sample, state);
+        FlightStatus emittedStatus = flightComputer.Status();
+        bool hasState = TryPopulateSeededState(row, replaySeedIndices, state, emittedStatus);
+        if (hasState) {
+            usedSeededStateOutput = true;
+            const double seededAngularRate =
+                ComputeSeededAngularRate(state.time,
+                                         state.zenith,
+                                         previousTimeSeconds,
+                                         previousZenithRadians,
+                                         hasPreviousZenith);
+            state.apogeeEstimate =
+                static_cast<float>(RecomputeSeededApogeeEstimate(state,
+                                                                 emittedStatus,
+                                                                 seededAngularRate,
+                                                                 seededReplayPredictor,
+                                                                 lastSeededReplayPredictionMeters,
+                                                                 lastSeededReplayPredictionTimeSeconds,
+                                                                 hasSeededReplayPrediction));
+        } else {
+            hasState = flightComputer.Update(sample, state);
+            emittedStatus = flightComputer.Status();
+        }
         if (hasState) {
             ++emittedStates;
+            lastEmittedApogeeMeters = state.apogeeEstimate;
+            lastEmittedStatus = emittedStatus;
             if (!hasAltitudeReference) {
                 altitudeReferenceMeters = state.position[2];
                 hasAltitudeReference = true;
@@ -1496,7 +1730,7 @@ int main(int argc, char **argv) {
                                                                                      hasPreviousZenith);
             if (!options.quiet) {
                 std::cout << state.time << ',' << state.position[2] << ',' << state.velocity[2] << ','
-                          << state.apogeeEstimate << ',' << FlightStatusToString(flightComputer.Status());
+                          << state.apogeeEstimate << ',' << FlightStatusToString(emittedStatus);
                 if (!options.extraOutputFields.empty()) {
                     SampleValueContext context{
                         state,
@@ -1544,7 +1778,10 @@ int main(int argc, char **argv) {
         std::cout << "Altimeter outliers skipped: " << outlierAltimeterRows << std::endl;
     }
     std::cout << "States generated: " << emittedStates << std::endl;
-    if (flightComputer.ApogeeReached()) {
+    if (usedSeededStateOutput) {
+        std::cout << "Latest emitted apogee: " << lastEmittedApogeeMeters << " m" << std::endl;
+        std::cout << "Latest emitted status: " << FlightStatusToString(lastEmittedStatus) << std::endl;
+    } else if (flightComputer.ApogeeReached()) {
         std::cout << "Apogee recorded at " << flightComputer.ApogeeAltitude() << " m" << std::endl;
     } else {
         std::cout << "Latest apogee prediction: " << flightComputer.ApogeePrediction() << " m" << std::endl;

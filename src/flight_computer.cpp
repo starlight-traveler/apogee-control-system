@@ -147,26 +147,11 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
     kalmanY_.Update(inertialAcceleration.y);
     kalmanZ_.Update(static_cast<float>(inertialAcceleration.z), static_cast<float>(altitudeMeters));
 
-    const double posX = kalmanX_.Position();
-    const double posY = kalmanY_.Position();
     const double posZ = kalmanZ_.Position();
-    const double velX = kalmanX_.Velocity();
-    const double velY = kalmanY_.Velocity();
     const double velZ = kalmanZ_.Velocity();
     const double accX = kalmanX_.Acceleration();
     const double accY = kalmanY_.Acceleration();
     const double accZ = kalmanZ_.Acceleration();
-
-    if (status_ == FlightStatus::Coast) {
-        ApogeeState predictorState;
-        predictorState.altitudeMeters = posZ;
-        predictorState.horizontalDistanceMeters = math_utils::Magnitude2(posX, posY);
-        predictorState.verticalVelocity = velZ;
-        predictorState.horizontalVelocity = math_utils::Magnitude2(velX, velY);
-        predictorState.zenith = zenithRadians_;
-        predictorState.angularVelocity = (dt != 0.0) ? (zenithRadians_ - lastZenith_) / dt : 0.0;
-        lastApogeePrediction_ = apogeePredictor_.PredictApogee(predictorState);
-    }
 
     if (status_ == FlightStatus::Ground) {
         const bool accelerationSuggestsLiftoff =
@@ -234,6 +219,26 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
         }
     }
 
+    const bool shouldPredictApogee =
+        (status_ == FlightStatus::Burn || status_ == FlightStatus::Coast) && velZ > 0.0;
+    if (shouldPredictApogee) {
+        ApogeeState predictorState;
+        predictorState.altitudeMeters = posZ;
+        predictorState.horizontalDistanceMeters = 0.0;
+        predictorState.verticalVelocity = velZ;
+        // Approximate total airspeed from vertical speed and zenith angle.
+        // Assume velocity aligns with body axis; project total speed into horizontal.
+        const double cosZenith = std::cos(zenithRadians_);
+        const double clampedCos = std::clamp(cosZenith, 0.1, 1.0);
+        const double speedAlongAxis = velZ / clampedCos;
+        const double speedSquared = speedAlongAxis * speedAlongAxis;
+        const double horizontalSquared = speedSquared - (velZ * velZ);
+        predictorState.horizontalVelocity = (horizontalSquared > 0.0) ? std::sqrt(horizontalSquared) : 0.0;
+        predictorState.zenith = zenithRadians_;
+        predictorState.angularVelocity = (dt != 0.0) ? (zenithRadians_ - lastZenith_) / dt : 0.0;
+        lastApogeePrediction_ = apogeePredictor_.PredictApogee(predictorState);
+    }
+
     // Smooth only published outputs to reduce telemetry/log oscillation.
     // Detection/state transitions above remain on raw Kalman values.
     // Minimal-lag mode: effectively bypass output smoothing.
@@ -243,8 +248,8 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
     const double alphaVel = ComputeSmoothingAlpha(dt, kVelocityTauSeconds);
     const double alphaAcc = ComputeSmoothingAlpha(dt, kAccelerationTauSeconds);
     if (!outputFilterInitialized_) {
-        smoothedVelocity_[0] = velX;
-        smoothedVelocity_[1] = velY;
+        smoothedVelocity_[0] = 0.0;
+        smoothedVelocity_[1] = 0.0;
         smoothedVelocity_[2] = velZ;
         smoothedAcceleration_[0] = accX;
         smoothedAcceleration_[1] = accY;
@@ -252,8 +257,8 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
         outputFilterInitialized_ = true;
     } else {
         const double maxDv = kMaxOutputAccelMps2 * dt;
-        const double targetVx = smoothedVelocity_[0] + alphaVel * (velX - smoothedVelocity_[0]);
-        const double targetVy = smoothedVelocity_[1] + alphaVel * (velY - smoothedVelocity_[1]);
+        const double targetVx = 0.0;
+        const double targetVy = 0.0;
         const double targetVz = smoothedVelocity_[2] + alphaVel * (velZ - smoothedVelocity_[2]);
         smoothedVelocity_[0] = ApplySlewLimit(smoothedVelocity_[0], targetVx, maxDv);
         smoothedVelocity_[1] = ApplySlewLimit(smoothedVelocity_[1], targetVy, maxDv);
@@ -263,9 +268,14 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
         smoothedAcceleration_[2] += alphaAcc * (accZ - smoothedAcceleration_[2]);
     }
 
+    // XY position/velocity are unobservable in the current estimator because there is
+    // no horizontal measurement update. Publish zero instead of integrated drift.
+    constexpr double kPublishedPosX = 0.0;
+    constexpr double kPublishedPosY = 0.0;
+
     output.time = data.timestamp;
-    output.position[0] = static_cast<float>(posX);
-    output.position[1] = static_cast<float>(posY);
+    output.position[0] = static_cast<float>(kPublishedPosX);
+    output.position[1] = static_cast<float>(kPublishedPosY);
     output.position[2] = static_cast<float>(posZ);
     output.velocity[0] = static_cast<float>(smoothedVelocity_[0]);
     output.velocity[1] = static_cast<float>(smoothedVelocity_[1]);
