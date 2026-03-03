@@ -486,6 +486,23 @@ class UdpReceiver {
         manualActuationAngleDeg_ = ClampFloat(angleDeg, 0.0f, 60.0f);
     }
 
+    void SetTelemetryStreamingEnabled(bool enabled) {
+        std::lock_guard<std::mutex> lock(commandMutex_);
+        if (telemetryStreamingEnabled_ == enabled) {
+            return;
+        }
+        telemetryStreamingEnabled_ = enabled;
+        if (enabled) {
+            heartbeatEnabled_ = true;
+            disconnectPacketsRemaining_ = 0;
+            return;
+        }
+
+        manualActuationOverride_ = false;
+        manualActuationAngleDeg_ = 0.0f;
+        disconnectPacketsRemaining_ = 5;
+    }
+
     std::string LastError() const {
         std::lock_guard<std::mutex> lock(mutex_);
         return lastError_;
@@ -524,7 +541,7 @@ class UdpReceiver {
 
         while (running_.load()) {
             const auto now = std::chrono::steady_clock::now();
-            if (heartbeatEnabled_ &&
+            if (heartbeatEnabled_ && telemetryStreamingEnabled_ &&
                 (now - lastHeartbeatSent_) >= std::chrono::milliseconds(200)) {
                 telemetry::HeartbeatV1 heartbeat{};
                 sendto(socketFd_,
@@ -551,6 +568,25 @@ class UdpReceiver {
                        reinterpret_cast<const sockaddr *>(&teensyAddr_),
                        sizeof(teensyAddr_));
                 lastActuationCommandSent_ = now;
+            }
+            if (heartbeatEnabled_ &&
+                (telemetryStreamingEnabled_ || disconnectPacketsRemaining_ > 0) &&
+                (now - lastTelemetryControlSent_) >= std::chrono::milliseconds(250)) {
+                telemetry::TelemetryControlV1 control{};
+                {
+                    std::lock_guard<std::mutex> lock(commandMutex_);
+                    control.telemetryEnabled = telemetryStreamingEnabled_ ? 1u : 0u;
+                }
+                sendto(socketFd_,
+                       &control,
+                       sizeof(control),
+                       0,
+                       reinterpret_cast<const sockaddr *>(&teensyAddr_),
+                       sizeof(teensyAddr_));
+                lastTelemetryControlSent_ = now;
+                if (!telemetryStreamingEnabled_ && disconnectPacketsRemaining_ > 0) {
+                    --disconnectPacketsRemaining_;
+                }
             }
 
             fd_set readSet;
@@ -615,9 +651,12 @@ class UdpReceiver {
     bool heartbeatEnabled_ = false;
     std::chrono::steady_clock::time_point lastHeartbeatSent_ = std::chrono::steady_clock::time_point::min();
     std::chrono::steady_clock::time_point lastActuationCommandSent_ = std::chrono::steady_clock::time_point::min();
+    std::chrono::steady_clock::time_point lastTelemetryControlSent_ = std::chrono::steady_clock::time_point::min();
     mutable std::mutex commandMutex_;
     bool manualActuationOverride_ = false;
     float manualActuationAngleDeg_ = 0.0f;
+    bool telemetryStreamingEnabled_ = true;
+    uint8_t disconnectPacketsRemaining_ = 0;
 };
 
 const char *FlightStatusName(uint8_t value) {
@@ -867,6 +906,7 @@ int main(int argc, char **argv) {
     const std::string voiceScriptPath = ResolveVoiceScriptPath(argv[0]);
     bool manualActuationOverride = false;
     float manualActuationAngleDeg = 0.0f;
+    bool telemetryStreamingEnabled = true;
     bool voiceListenEnabled = false;
     VoiceCommandReceiver voiceReceiver;
     DashboardState dashboard{};
@@ -990,6 +1030,18 @@ int main(int argc, char **argv) {
             ImGui::TableNextColumn();
             ImGui::BeginChild("right_column", ImVec2(0.0f, 0.0f), false);
             ImGui::Text("Actuation Control");
+            if (!telemetryStreamingEnabled) {
+                ImGui::BeginDisabled();
+            }
+            if (ImGui::Button("Disconnect Telemetry")) {
+                telemetryStreamingEnabled = false;
+            }
+            if (!telemetryStreamingEnabled) {
+                ImGui::EndDisabled();
+            }
+            ImGui::TextDisabled("%s", telemetryStreamingEnabled ? "telemetry streaming enabled"
+                                                                : "telemetry disabled on Teensy until reboot");
+            ImGui::Separator();
             ImGui::Checkbox("Manual flap override", &manualActuationOverride);
             ImGui::SliderFloat("Manual angle (deg)", &manualActuationAngleDeg, 0.0f, 60.0f, "%.1f");
             if (ImGui::Button("Deploy 30 deg")) {
@@ -1006,6 +1058,7 @@ int main(int argc, char **argv) {
                 manualActuationAngleDeg = 0.0f;
             }
             ImGui::ProgressBar(dashboard.servoGaugeAnimated, ImVec2(-1.0f, 8.0f), "");
+            ImGui::Text("Commanded mode: %s", manualActuationOverride ? "manual override" : "auto");
             ImGui::TextDisabled("Manual setpoint %.1f deg", manualActuationAngleDeg);
 
             ImGui::Separator();
@@ -1038,6 +1091,7 @@ int main(int argc, char **argv) {
             }
 
             receiver.SetActuationOverride(manualActuationOverride, manualActuationAngleDeg);
+            receiver.SetTelemetryStreamingEnabled(telemetryStreamingEnabled);
 
             if (snap.hasPacket) {
                 const telemetry::PacketV1 &p = snap.latest;
@@ -1051,6 +1105,7 @@ int main(int argc, char **argv) {
                 ImGui::Text("Sensor altitude: %.2f ft", p.sensorAltitudeFeet);
                 ImGui::Text("Servo command/effective: %.2f / %.2f deg", p.servoCommandDeg, p.servoEffectiveDeg);
                 ImGui::Text("Flight computer mode: %s", flightManualOverride ? "manual override" : "auto");
+                ImGui::TextDisabled("Commanded mode: %s", manualActuationOverride ? "manual override" : "auto");
                 DrawSeriesPlot("Servo Command", dashboard.servoCommand, "deg", ImVec2(-1.0f, 84.0f));
                 DrawSeriesPlot("Servo Effective", dashboard.servoEffective, "deg", ImVec2(-1.0f, 84.0f));
 

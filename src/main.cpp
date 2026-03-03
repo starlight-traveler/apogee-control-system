@@ -1,51 +1,44 @@
 #include <Arduino.h>
-#include <Servo.h>
 #include <cmath>
 #include <ctype.h>
 #include <stdlib.h>
 #include <string.h>
 
-#include "bno055_sensor.h"
-#include "bmp581_sensor.h"
+#include "bno085_sensor.h"
+#include "bmp585_sensor.h"
 #include "cfd_table.h"
 #include "data_logger.h"
 #include "flight_computer.h"
 #include "icm20948_sensor.h"
+#include "ms5611_sensor.h"
 #include "network_telemetry.h"
 #include "serial_logging.h"
 #include "settings.h"
 #include "status_leds.h"
+#include "synced_flap_actuation.h"
 
 namespace {
 
 constexpr uint8_t kStatusLedPin = settings::hardware::kStatusLedPin;
+constexpr uint8_t kBuzzerPin = settings::hardware::kBuzzerPin;
 constexpr uint32_t kErrorBlinkIntervalMs = settings::flight::kErrorBlinkIntervalMs;
 constexpr uint32_t kRecoveryBlinkIntervalMs = settings::flight::kRecoveryBlinkIntervalMs;
-constexpr uint8_t kServoPin = settings::hardware::kServoPin;
-constexpr int kServoRetractAngle = settings::hardware::kServoRetractAngle;
-constexpr float kServoMinExtendAltitudeFeet = settings::actuation::kServoMinExtendAltitudeFeet;
+constexpr float kDeploymentTriggerAltitudeFeet = settings::actuation::kDeploymentTriggerAltitudeFeet;
 constexpr float kServoMaxActuationDeg = settings::actuation::kServoMaxActuationDeg;
-constexpr float kServoLatencySeconds = settings::actuation::kServoLatencySeconds;
-constexpr uint32_t kControlUpdateIntervalMs = settings::actuation::kControlUpdateIntervalMs;
-constexpr float kAngleStepDeg = settings::actuation::kAngleStepDeg;
-constexpr float kAngleCommandDeadbandDeg = settings::actuation::kAngleCommandDeadbandDeg;
-constexpr float kApogeeErrorDeadbandMeters = settings::actuation::kApogeeErrorDeadbandMeters;
-constexpr float kRatePenalty = settings::actuation::kRatePenalty;
-constexpr float kEffortPenalty = settings::actuation::kEffortPenalty;
-constexpr float kUndershootPenalty = settings::actuation::kUndershootPenalty;
-constexpr int kActuationPredictorMaxSteps = settings::actuation::kActuationPredictorMaxSteps;
-constexpr float kCoarseAngleStepDeg = settings::actuation::kCoarseAngleStepDeg;
-constexpr float kCoarseAmbiguityCostThreshold = settings::actuation::kCoarseAmbiguityCostThreshold;
-constexpr float kTargetApogeeMeters = static_cast<float>(settings::flight::kApogeeTargetMeters);
 constexpr bool kEnableCsvReplay = settings::replay::kEnableCsvReplay;
 constexpr const char *kCsvReplayPath = settings::replay::kCsvReplayPath;
 constexpr size_t kCsvLineBufferSize = settings::replay::kCsvLineBufferSize;
+constexpr uint32_t kDebugHeartbeatIntervalMs = 1000;
+constexpr uint32_t kStateLogIntervalMs = 250;
+constexpr uint8_t kDeploymentConfirmSamples = 30;
+constexpr float kBarometerAgreementThresholdFeet = settings::sensors::ms5611::kAgreementThresholdFeet;
 
 enum class SystemError : uint8_t {
     BnoInitialization = 0,
     IcmInitialization = 1,
     BmpInitialization = 2,
-    DataLoggerInitialization = 3,
+    Ms5611Initialization = 3,
+    DataLoggerInitialization = 4,
 };
 
 struct CsvReplayState {
@@ -79,8 +72,10 @@ uint8_t BlinkCountForError(SystemError error) {
             return 3;
         case SystemError::BmpInitialization:
             return 4;
-        case SystemError::DataLoggerInitialization:
+        case SystemError::Ms5611Initialization:
             return 5;
+        case SystemError::DataLoggerInitialization:
+            return 6;
     }
     return 1;
 }
@@ -104,17 +99,58 @@ void IndicateRecovery() {
     delay(kRecoveryBlinkIntervalMs * 2);
 }
 
+void LogSetupCheckpoint(const char *message) {
+    LOG_PRINT("[setup ");
+    LOG_PRINT(millis());
+    LOG_PRINT(" ms] ");
+    LOG_PRINTLN(message);
+}
+
+void PlayStartupMarch() {
+    struct Note {
+        uint16_t frequencyHz;
+        uint16_t durationMs;
+    };
+
+    static const Note kMelody[] = {
+        {440, 500}, {440, 500}, {440, 500}, {349, 350}, {523, 150},
+        {440, 500}, {349, 350}, {523, 150}, {440, 650},
+        {659, 500}, {659, 500}, {659, 500}, {698, 350}, {523, 150},
+        {415, 500}, {349, 350}, {523, 150}, {440, 650},
+    };
+
+    pinMode(kBuzzerPin, OUTPUT);
+    for (const Note &note : kMelody) {
+        tone(kBuzzerPin, note.frequencyHz, note.durationMs);
+        delay(note.durationMs + 30);
+    }
+    noTone(kBuzzerPin);
+}
+
 bool InitializeWithRecovery(SystemError error, bool (*initializer)(), const char *failureMessage) {
     bool hadFailure = false;
     bool loggedFailure = false;
     uint32_t retryDelayMs = 200;
-    while (!initializer()) {
+    uint32_t attempt = 1;
+    while (true) {
+        LOG_PRINT("[init attempt ");
+        LOG_PRINT(attempt);
+        LOG_PRINTLN("] starting");
+        if (initializer()) {
+            break;
+        }
+
         hadFailure = true;
         if (!loggedFailure && failureMessage != nullptr) {
             LOG_PRINTLN(failureMessage);
             loggedFailure = true;
         }
+        LOG_PRINT("[init attempt ");
+        LOG_PRINT(attempt);
+        LOG_PRINTLN("] failed");
         IndicateError(error);
+        LOG_PRINT("[init retry delay ms] ");
+        LOG_PRINTLN(retryDelayMs);
         delay(retryDelayMs);
         if (retryDelayMs < 2000) {
             retryDelayMs += 200;
@@ -122,7 +158,11 @@ bool InitializeWithRecovery(SystemError error, bool (*initializer)(), const char
                 retryDelayMs = 2000;
             }
         }
+        ++attempt;
     }
+
+    LOG_PRINT("[init] success after attempts=");
+    LOG_PRINTLN(attempt);
 
     if (hadFailure) {
         IndicateRecovery();
@@ -143,14 +183,6 @@ float ClampFloat(float value, float minValue, float maxValue) {
         return maxValue;
     }
     return value;
-}
-
-float ComputeLagBlend(float dtSeconds, float tauSeconds) {
-    if (tauSeconds <= 0.0f || dtSeconds <= 0.0f) {
-        return 1.0f;
-    }
-    const float alpha = dtSeconds / (tauSeconds + dtSeconds);
-    return ClampFloat(alpha, 0.0f, 1.0f);
 }
 
 }  // namespace
@@ -402,29 +434,44 @@ static bool AcquireSensorData(SensorData &data) {
     if (g_csvReplay.enabled) {
         return CsvReplayNextSample(data);
     }
-    const bool hasBnoImu = Bno055SensorAcquire(data);
-    const bool hasIcmImu = Icm20948SensorAcquire(data);
-    const bool hasAltimeter = Bmp581SensorAcquire(data);
+    const bool hasBnoImu = Bno085SensorAcquire(data);
+    // ICM-20948 disabled for now.
+    // const bool hasIcmImu = Icm20948SensorAcquire(data);
+    const bool hasIcmImu = false;
+    if (hasBnoImu && !hasIcmImu) {
+        for (int i = 0; i < 3; ++i) {
+            data.accelICM[i] = data.accelBNO[i];
+        }
+        if (data.hasQuaternion && !data.hasIcmQuaternion) {
+            for (int i = 0; i < 4; ++i) {
+                data.icmQuaternion[i] = data.quaternion[i];
+            }
+            data.hasIcmQuaternion = true;
+        }
+    }
+    const bool hasAltimeter = Bmp585SensorAcquire(data);
+    // Secondary barometer disabled for now.
+    // const bool hasMs5611 = Ms5611SensorAcquire();
     return hasBnoImu || hasIcmImu || hasAltimeter;
 }
 
 static FlightComputer flightComputer;
 static CfdTableStorage g_cfdTable;
-static EnvironmentModel g_actuationEnvironment;
-static ApogeePredictor g_actuationPredictor;
+static SyncedFlapActuator g_flapActuator;
 static FlightStatus g_lastLoggedStatus = FlightStatus::Ground;
 static bool g_hasLoggedStatus = false;
 static bool g_hasPadAltitude = false;
 static float g_padAltitudeFeet = 0.0f;
-Servo g_servo;
 static bool g_servoCycleTestMode = false;
 static float g_servoCommandDeg = 0.0f;
 static float g_servoEffectiveDeg = 0.0f;
-static float g_lastControlTime = 0.0f;
-static float g_lastZenith = 0.0f;
-static bool g_hasLastZenith = false;
-static uint32_t g_lastControlUpdateMs = 0;
-static int g_lastServoWriteDeg = kServoRetractAngle;
+static bool g_wasAboveDeploymentThreshold = false;
+static bool g_hasAutoDeployed = false;
+static uint8_t g_aboveDeploymentThresholdCount = 0;
+static uint32_t g_lastNoDataLogMs = 0;
+static uint32_t g_lastNoLoggerLogMs = 0;
+static uint32_t g_lastBarometerLogMs = 0;
+static uint32_t g_lastStateLogMs = 0;
 
 static void ServiceStatusLeds(uint32_t nowMs, bool manualOverrideActive) {
     StatusLedsSetFault(!DataLoggerIsInitialized());
@@ -434,179 +481,134 @@ static void ServiceStatusLeds(uint32_t nowMs, bool manualOverrideActive) {
     StatusLedsService(nowMs);
 }
 
-static float EstimateAngularVelocity(const FilteredState &state, float dtSeconds) {
-    if (!g_hasLastZenith || dtSeconds <= 0.0f) {
-        return 0.0f;
-    }
-    return (state.zenith - g_lastZenith) / dtSeconds;
-}
-
-static float SelectActuationCommandDeg(const FilteredState &state,
-                                       float angularVelocityRadPerSec,
-                                       float commandDeg,
-                                       float effectiveDeg) {
-    if (!g_cfdTable.loaded) {
-        // Fail-safe: with no aero model available, keep ACS neutral.
-        return 0.0f;
-    }
-
-    ApogeeState neutralState;
-    neutralState.altitudeMeters = state.position[2];
-    neutralState.horizontalDistanceMeters = math_utils::Magnitude2(state.position[0], state.position[1]);
-    neutralState.verticalVelocity = state.velocity[2];
-    neutralState.horizontalVelocity = math_utils::Magnitude2(state.velocity[0], state.velocity[1]);
-    neutralState.zenith = state.zenith;
-    neutralState.angularVelocity = angularVelocityRadPerSec;
-    neutralState.acsAngleDeg = 0.0;
-
-    const double neutralApogee = g_actuationPredictor.PredictApogee(neutralState);
-    if (neutralApogee <= static_cast<double>(kTargetApogeeMeters + kApogeeErrorDeadbandMeters)) {
-        return 0.0f;
-    }
-
-    const float assumedDt = static_cast<float>(kControlUpdateIntervalMs) * 1.0e-3f;
-    const float lagBlend = ComputeLagBlend(assumedDt, kServoLatencySeconds);
-    struct CostEvalEntry {
-        float angleDeg = 0.0f;
-        float cost = 0.0f;
-        bool valid = false;
-    };
-    constexpr int kMaxCachedAngles = settings::actuation::kEvalCacheMaxEntries;
-    CostEvalEntry evalCache[kMaxCachedAngles];
-    int evalCacheCount = 0;
-
-    auto evaluateCost = [&](float candidateDeg) -> float {
-        for (int i = 0; i < evalCacheCount; ++i) {
-            if (evalCache[i].valid &&
-                std::fabs(evalCache[i].angleDeg - candidateDeg) <= settings::actuation::kEvalCacheMatchEpsilonDeg) {
-                return evalCache[i].cost;
-            }
-        }
-
-        const float predictedEffectiveDeg = effectiveDeg + (candidateDeg - effectiveDeg) * lagBlend;
-
-        ApogeeState testState = neutralState;
-        testState.acsAngleDeg = predictedEffectiveDeg;
-        const float predictedApogee = static_cast<float>(g_actuationPredictor.PredictApogee(testState));
-        float apogeeError = predictedApogee - kTargetApogeeMeters;
-        float errorCost = std::fabs(apogeeError);
-        if (apogeeError < 0.0f) {
-            errorCost *= kUndershootPenalty;
-        }
-
-        const float rateCost = kRatePenalty * std::fabs(candidateDeg - commandDeg);
-        const float normAngle = candidateDeg / kServoMaxActuationDeg;
-        const float effortCost = kEffortPenalty * normAngle * normAngle;
-        const float totalCost = errorCost + rateCost + effortCost;
-        if (evalCacheCount < kMaxCachedAngles) {
-            evalCache[evalCacheCount].angleDeg = candidateDeg;
-            evalCache[evalCacheCount].cost = totalCost;
-            evalCache[evalCacheCount].valid = true;
-            ++evalCacheCount;
-        }
-        return totalCost;
-    };
-
-    float bestAngleDeg = commandDeg;
-    float bestCost = evaluateCost(commandDeg);
-    auto sweepRange = [&](float startDeg, float endDeg, float stepDeg, bool allowPrune) {
-        int consecutiveWorse = 0;
-        for (float candidate = startDeg; candidate <= endDeg + 0.001f; candidate += stepDeg) {
-            const float bounded = ClampFloat(candidate, 0.0f, kServoMaxActuationDeg);
-            const float totalCost = evaluateCost(bounded);
-            if (totalCost < bestCost) {
-                bestCost = totalCost;
-                bestAngleDeg = bounded;
-                consecutiveWorse = 0;
-            } else if (allowPrune && settings::actuation::kEnableSweepPruning) {
-                ++consecutiveWorse;
-                // In full-range sweep, when cost has been worse for several consecutive bins,
-                // additional angles are unlikely to beat the current minimum.
-                if (consecutiveWorse >= settings::actuation::kSweepPruneConsecutiveWorse) {
-                    break;
-                }
-            }
-        }
-    };
-
-    const float coarseStep = (kCoarseAngleStepDeg >= kAngleStepDeg) ? kCoarseAngleStepDeg : kAngleStepDeg;
-    float coarseBestAngle = 0.0f;
-    float coarseBestCost = 1.0e30f;
-    float coarseSecondBestCost = 1.0e30f;
-    for (float candidate = 0.0f; candidate <= kServoMaxActuationDeg + 0.001f; candidate += coarseStep) {
-        const float totalCost = evaluateCost(candidate);
-        if (totalCost < coarseBestCost) {
-            coarseSecondBestCost = coarseBestCost;
-            coarseBestCost = totalCost;
-            coarseBestAngle = candidate;
-        } else if (totalCost < coarseSecondBestCost) {
-            coarseSecondBestCost = totalCost;
-        }
-    }
-
-    const bool ambiguousCoarse = (coarseSecondBestCost - coarseBestCost) <= kCoarseAmbiguityCostThreshold;
-    if (ambiguousCoarse) {
-        sweepRange(0.0f, kServoMaxActuationDeg, kAngleStepDeg, true);
-    } else {
-        const float refineHalfWindow = coarseStep;
-        const float refineStart = coarseBestAngle - refineHalfWindow;
-        const float refineEnd = coarseBestAngle + refineHalfWindow;
-        sweepRange(refineStart, refineEnd, kAngleStepDeg, false);
-    }
-
-    if (std::fabs(bestAngleDeg - commandDeg) <= kAngleCommandDeadbandDeg) {
-        return commandDeg;
-    }
-    return ClampFloat(bestAngleDeg, 0.0f, kServoMaxActuationDeg);
-}
-
-static void WriteServoAngleDeg(float angleDeg) {
-    const int writeDeg = static_cast<int>(std::lround(ClampFloat(angleDeg, 0.0f, kServoMaxActuationDeg)));
-    if (writeDeg == g_lastServoWriteDeg) {
+static void LogBarometerDiagnostics(uint32_t nowMs) {
+    if ((nowMs - g_lastBarometerLogMs) < kDebugHeartbeatIntervalMs) {
         return;
     }
-    g_servo.write(writeDeg);
-    g_lastServoWriteDeg = writeDeg;
+    g_lastBarometerLogMs = nowMs;
+
+    const BarometerDiagnostics bmp = Bmp585SensorGetDiagnostics();
+    const BarometerDiagnostics ms = Ms5611SensorGetDiagnostics();
+
+    if (!bmp.initialized && !ms.initialized) {
+        return;
+    }
+
+    LOG_PRINT("[baro] BMP585=");
+    if (bmp.hasSample) {
+        LOG_PRINT(bmp.altitudeFeet, 2);
+        LOG_PRINT("ft");
+    } else {
+        LOG_PRINT("n/a");
+    }
+    LOG_PRINT(" MS5611=");
+    if (ms.hasSample) {
+        LOG_PRINT(ms.altitudeFeet, 2);
+        LOG_PRINT("ft");
+    } else {
+        LOG_PRINT("n/a");
+    }
+
+    if (bmp.hasSample && ms.hasSample) {
+        const float deltaFeet = ms.altitudeFeet - bmp.altitudeFeet;
+        LOG_PRINT(" delta=");
+        LOG_PRINT(deltaFeet, 2);
+        LOG_PRINT("ft");
+        LOG_PRINT(" agree=");
+        LOG_PRINT(std::fabs(deltaFeet) <= kBarometerAgreementThresholdFeet ? "yes" : "NO");
+    }
+
+    LOG_PRINT(" bmpReadUs=");
+    LOG_PRINT(bmp.averageReadDurationUs);
+    LOG_PRINT(" msReadUs=");
+    LOG_PRINT(ms.averageReadDurationUs);
+    LOG_PRINT(" bmpUpdUs=");
+    LOG_PRINT(bmp.averageUpdatePeriodUs);
+    LOG_PRINT(" msUpdUs=");
+    LOG_PRINT(ms.averageUpdatePeriodUs);
+    LOG_PRINT(" faster=");
+
+    if (bmp.hasSample && ms.hasSample && bmp.averageUpdatePeriodUs > 0 && ms.averageUpdatePeriodUs > 0) {
+        if (bmp.averageUpdatePeriodUs < ms.averageUpdatePeriodUs) {
+            LOG_PRINT("BMP585(update)");
+        } else if (ms.averageUpdatePeriodUs < bmp.averageUpdatePeriodUs) {
+            LOG_PRINT("MS5611(update)");
+        } else {
+            LOG_PRINT("tie(update)");
+        }
+    } else if (bmp.hasSample && ms.hasSample && bmp.averageReadDurationUs > 0 && ms.averageReadDurationUs > 0) {
+        if (bmp.averageReadDurationUs < ms.averageReadDurationUs) {
+            LOG_PRINT("BMP585(read)");
+        } else if (ms.averageReadDurationUs < bmp.averageReadDurationUs) {
+            LOG_PRINT("MS5611(read)");
+        } else {
+            LOG_PRINT("tie(read)");
+        }
+    } else {
+        LOG_PRINT("pending");
+    }
+
+    LOG_PRINTLN("");
+    Serial.flush();
 }
 
 void setup() {
-    pinMode(kStatusLedPin, OUTPUT);
-    digitalWrite(kStatusLedPin, LOW);
-
-    g_servo.attach(kServoPin);
-    g_servo.write(kServoRetractAngle);
+    // pinMode(kStatusLedPin, OUTPUT);
+    // digitalWrite(kStatusLedPin, LOW);
 
     LOG_BEGIN(115200);
-#if ENABLE_SERIAL_LOGGING
-    while (!Serial && millis() < 2000) {
-    }
-#endif
 
+    LogSetupCheckpoint("boot");
+    LogSetupCheckpoint("attaching flap servos");
+    g_flapActuator.Begin();
+    LogSetupCheckpoint("flap servos initialized");
+
+    LogSetupCheckpoint("starting data logger init");
     InitializeWithRecovery(SystemError::DataLoggerInitialization,
                            &DataLoggerBegin,
                            "Sensor logging is disabled.");
+    LogSetupCheckpoint("data logger init complete");
 
+    LogSetupCheckpoint("checking CSV replay");
     CsvReplayInit();
-
+    LogSetupCheckpoint(g_csvReplay.enabled ? "CSV replay active" : "CSV replay disabled");
 
     if (!g_csvReplay.enabled) {
+        LogSetupCheckpoint("starting BNO085 init");
         InitializeWithRecovery(SystemError::BnoInitialization,
-                               &Bno055SensorBegin,
-                               "Failed to initialize BNO055 sensor.");
+                               &Bno085SensorBegin,
+                               "Failed to initialize BNO085 sensor.");
+        LogSetupCheckpoint("BNO085 init complete");
 
-        InitializeWithRecovery(SystemError::IcmInitialization,
-                               &Icm20948SensorBegin,
-                               "Failed to initialize ICM-20948 sensor.");
+        // ICM-20948 disabled for now.
+        // LogSetupCheckpoint("starting ICM-20948 init");
+        // InitializeWithRecovery(SystemError::IcmInitialization,
+        //                        &Icm20948SensorBegin,
+        //                        "Failed to initialize ICM-20948 sensor.");
+        // LogSetupCheckpoint("ICM-20948 init complete");
 
+        LogSetupCheckpoint("starting BMP585 init");
         InitializeWithRecovery(SystemError::BmpInitialization,
-                               &Bmp581SensorBegin,
-                               "Failed to initialize BMP581 sensor.");
+                               &Bmp585SensorBegin,
+                               "Failed to initialize BMP585 sensor.");
+        LogSetupCheckpoint("BMP585 init complete");
+
+        // Secondary barometer disabled for now.
+        // LogSetupCheckpoint("starting MS5611 init");
+        // InitializeWithRecovery(SystemError::Ms5611Initialization,
+        //                        &Ms5611SensorBegin,
+        //                        "Failed to initialize MS5611 sensor.");
+        // LogSetupCheckpoint("MS5611 init complete");
     }
 
+    LogSetupCheckpoint("loading CFD table");
     if (!CfdTableLoadFromSd("cfd.csv", &g_cfdTable)) {
+        LogSetupCheckpoint("cfd.csv missing, trying lib/cfd.csv");
         CfdTableLoadFromSd("lib/cfd.csv", &g_cfdTable);
     }
+    LogSetupCheckpoint(g_cfdTable.loaded ? "CFD table loaded" : "CFD table unavailable");
 
+    LogSetupCheckpoint("configuring flight computer");
     const EnvironmentModel::Config environmentConfig;
     ApogeeVehicleParameters vehicleParameters;
     vehicleParameters.centerOfPressureOffsetMeters = settings::vehicle::kCenterOfPressureOffsetMeters;
@@ -629,30 +631,36 @@ void setup() {
                          environmentConfig,
                          vehicleParameters,
                          g_cfdTable.loaded ? &g_cfdTable.table : nullptr);
+    LogSetupCheckpoint("flight computer configured");
 
-    g_actuationEnvironment.Configure(environmentConfig);
-    g_actuationPredictor.SetEnvironment(g_actuationEnvironment);
-    g_actuationPredictor.SetVehicleParameters(vehicleParameters);
-    g_actuationPredictor.SetForceTable(g_cfdTable.loaded ? &g_cfdTable.table : nullptr);
-    g_actuationPredictor.SetMaxIntegrationSteps(kActuationPredictorMaxSteps);
-
-    LOG_PRINTLN("Flight computer initialized.");
-
+    LogSetupCheckpoint("starting network telemetry");
     NetworkTelemetryBegin();
+    LogSetupCheckpoint("network telemetry ready");
+
+    LogSetupCheckpoint("starting status LEDs");
     StatusLedsBegin();
+    LogSetupCheckpoint("status LEDs ready");
 
     g_lastLoggedStatus = flightComputer.Status();
     g_hasLoggedStatus = false;
     g_servoCommandDeg = 0.0f;
     g_servoEffectiveDeg = 0.0f;
-    g_lastControlTime = 0.0f;
-    g_hasLastZenith = false;
-    g_lastControlUpdateMs = millis();
-    g_lastServoWriteDeg = kServoRetractAngle;
+    g_wasAboveDeploymentThreshold = false;
+    g_hasAutoDeployed = false;
+    g_aboveDeploymentThresholdCount = 0;
+    g_lastNoDataLogMs = 0;
+    g_lastNoLoggerLogMs = 0;
+    g_lastBarometerLogMs = 0;
+    g_lastStateLogMs = 0;
+    LogSetupCheckpoint("playing startup buzzer");
+    PlayStartupMarch();
+    LogSetupCheckpoint("setup complete");
 }
 
 void loop() {
     const uint32_t nowMs = millis();
+    NetworkTelemetryPollControl();
+
     if (g_servoCycleTestMode) {
         ServiceStatusLeds(nowMs, false);
         delay(1000);
@@ -660,6 +668,10 @@ void loop() {
     }
 
     if (!DataLoggerIsInitialized()) {
+        if ((nowMs - g_lastNoLoggerLogMs) >= kDebugHeartbeatIntervalMs) {
+            LogSetupCheckpoint("data logger unavailable in loop");
+            g_lastNoLoggerLogMs = nowMs;
+        }
         ServiceStatusLeds(nowMs, false);
         InitializeWithRecovery(SystemError::DataLoggerInitialization,
                                &DataLoggerBegin,
@@ -669,10 +681,17 @@ void loop() {
 
     SensorData data;
     if (!AcquireSensorData(data)) {
+        if ((nowMs - g_lastNoDataLogMs) >= kDebugHeartbeatIntervalMs) {
+            LogSetupCheckpoint("waiting for sensor data");
+            g_lastNoDataLogMs = nowMs;
+        }
         ServiceStatusLeds(nowMs, false);
         delay(1);
         return;
     }
+
+    // Disable periodic barometer diagnostics in the flight loop for now.
+    // LogBarometerDiagnostics(nowMs);
 
     if (!g_hasPadAltitude && data.altitudeFeet != 0.0f) {
         g_padAltitudeFeet = data.altitudeFeet;
@@ -699,33 +718,30 @@ void loop() {
         DataLoggerLogTelemetry(data, flightComputer.Status(), hasFilteredState ? &state : nullptr);
     }
 
+    const bool aboveDeploymentThreshold = altitudeAglFeet >= kDeploymentTriggerAltitudeFeet;
+    if (aboveDeploymentThreshold) {
+        if (g_aboveDeploymentThresholdCount < 255) {
+            ++g_aboveDeploymentThresholdCount;
+        }
+    } else {
+        g_aboveDeploymentThresholdCount = 0;
+    }
+    const bool confirmedAboveDeploymentThreshold = g_aboveDeploymentThresholdCount >= kDeploymentConfirmSamples;
+
     if (hasFilteredState) {
         const FlightStatus status = flightComputer.Status();
-        float dtState = state.time - g_lastControlTime;
-        if (dtState < 0.0f || dtState > 1.0f) {
-            dtState = settings::flight::kDefaultDtSeconds;
-        }
-        const float angularVelocityRadPerSec = EstimateAngularVelocity(state, dtState);
-        const float lagBlend = ComputeLagBlend(dtState, kServoLatencySeconds);
-        g_servoEffectiveDeg += (g_servoCommandDeg - g_servoEffectiveDeg) * lagBlend;
-        g_servoEffectiveDeg = ClampFloat(g_servoEffectiveDeg, 0.0f, kServoMaxActuationDeg);
-
-        const bool aboveMinExtendAltitude = altitudeAglFeet >= kServoMinExtendAltitudeFeet;
-        if (manualOverrideActive) {
-            g_servoCommandDeg = manualOverrideDeg;
-        } else if (status == FlightStatus::Coast && aboveMinExtendAltitude) {
-            if ((nowMs - g_lastControlUpdateMs) >= kControlUpdateIntervalMs) {
-                g_servoCommandDeg = SelectActuationCommandDeg(state,
-                                                              angularVelocityRadPerSec,
-                                                              g_servoCommandDeg,
-                                                              g_servoEffectiveDeg);
-                g_lastControlUpdateMs = nowMs;
-            }
-        } else {
-            g_servoCommandDeg = 0.0f;
+        const bool autoDeployTrigger =
+            !g_hasAutoDeployed && confirmedAboveDeploymentThreshold && !g_wasAboveDeploymentThreshold;
+        const bool manualForceExtend = manualOverrideActive;
+        if (autoDeployTrigger) {
+            g_hasAutoDeployed = true;
+            LOG_PRINT("Flap deployment triggered at AGL ft: ");
+            LOG_PRINTLN(altitudeAglFeet, 2);
         }
 
-        WriteServoAngleDeg(g_servoCommandDeg);
+        g_flapActuator.Update(nowMs, autoDeployTrigger, manualForceExtend);
+        g_servoCommandDeg = g_flapActuator.CommandFraction() * kServoMaxActuationDeg;
+        g_servoEffectiveDeg = g_flapActuator.EffectiveFraction() * kServoMaxActuationDeg;
 
         if (!g_hasLoggedStatus || status != g_lastLoggedStatus) {
             DataLoggerLogEvent(FlightEventType::StageChange,
@@ -737,16 +753,21 @@ void loop() {
             g_lastLoggedStatus = status;
             g_hasLoggedStatus = true;
         }
-        g_lastControlTime = state.time;
-        g_lastZenith = state.zenith;
-        g_hasLastZenith = true;
     } else if (manualOverrideActive) {
-        g_servoCommandDeg = manualOverrideDeg;
-        g_servoEffectiveDeg = manualOverrideDeg;
-        WriteServoAngleDeg(g_servoCommandDeg);
+        const bool manualForceExtend = true;
+        g_flapActuator.Update(nowMs, false, manualForceExtend);
+        g_servoCommandDeg = g_flapActuator.CommandFraction() * kServoMaxActuationDeg;
+        g_servoEffectiveDeg = g_flapActuator.EffectiveFraction() * kServoMaxActuationDeg;
+    } else {
+        g_flapActuator.Update(nowMs, false, false);
+        g_servoCommandDeg = g_flapActuator.CommandFraction() * kServoMaxActuationDeg;
+        g_servoEffectiveDeg = g_flapActuator.EffectiveFraction() * kServoMaxActuationDeg;
     }
 
-    if (hasFilteredState) {
+    g_wasAboveDeploymentThreshold = confirmedAboveDeploymentThreshold;
+
+    if (hasFilteredState && (nowMs - g_lastStateLogMs) >= kStateLogIntervalMs) {
+        g_lastStateLogMs = nowMs;
         LOG_PRINT("t=");
         LOG_PRINT(state.time, 3);
         LOG_PRINT(" alt=");

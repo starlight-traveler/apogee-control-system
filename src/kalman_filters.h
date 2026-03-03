@@ -103,7 +103,7 @@ class KalmanFilterAccel {
         if (!std::isfinite(accelMeasurement)) {
             return;
         }
-        constexpr double kMaxAccelResidual = 80.0;
+        constexpr double kMaxAccelResidual = 250.0;
         const double residual =
             std::clamp(accelMeasurement - state_[2], -kMaxAccelResidual, kMaxAccelResidual);
         double innovation = covariance_[2][2] + measurementVariance_;
@@ -296,8 +296,8 @@ class KalmanFilterAccelAlt {
             return;
         }
         // Limit single-sample innovation so outliers don't create sharp velocity spikes.
-        constexpr double kMaxAccelResidual = 80.0;
-        constexpr double kMaxAltitudeResidual = 60.0;
+        constexpr double kMaxAccelResidual = 250.0;
+        constexpr double kMaxAltitudeResidual = 250.0;
         const double residualAccel =
             std::clamp(accelMeasurement - state_[2], -kMaxAccelResidual, kMaxAccelResidual);
         const double residualAlt =

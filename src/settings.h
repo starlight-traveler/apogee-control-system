@@ -34,8 +34,10 @@ constexpr uint32_t kDataLoggerFlushIntervalUs = DATA_LOGGER_FLUSH_INTERVAL_US;
 // Physical pin assignments and actuator positions.
 // ---------------------------------------------------------------------------
 namespace hardware {
-constexpr uint8_t kStatusLedPin = LED_BUILTIN;
-constexpr uint8_t kServoPin = 18;
+constexpr uint8_t kStatusLedPin = -1;
+constexpr uint8_t kBuzzerPin = 8;
+constexpr uint8_t kTopServoPin = 9;
+constexpr uint8_t kBottomServoPin = 10;
 constexpr int kServoExtendAngle = 60;
 constexpr int kServoRetractAngle = 0;
 }
@@ -51,9 +53,9 @@ constexpr bool kUseAccessPointMode = true;
 constexpr const char *kSsid = "Hi_Madelyn";
 constexpr const char *kPassword = "11112222";
 // WiFiNINA `setPins()` arguments for the AirLift coprocessor.
-constexpr int8_t kAirliftSsPin = 10;
-constexpr int8_t kAirliftAckPin = 5;
-constexpr int8_t kAirliftResetPin = 4;
+constexpr int8_t kAirliftSsPin = 34;
+constexpr int8_t kAirliftAckPin = 31;
+constexpr int8_t kAirliftResetPin = 32;
 constexpr int8_t kAirliftGpio0Pin = -1;
 // Stream packet cadence. 20 ms = 50 Hz.
 constexpr uint32_t kTelemetryIntervalMs = 250;
@@ -75,8 +77,21 @@ constexpr uint8_t kTelemetryRemoteIp3 = 2;
 // Deployment gating thresholds for the ACS servo logic.
 // ---------------------------------------------------------------------------
 namespace actuation {
-// Minimum altitude above pad reference (feet AGL) before coast-phase extension.
-constexpr float kServoMinExtendAltitudeFeet = 1000.0f;
+// Trigger the flap deployment sequence once altitude exceeds this AGL threshold.
+constexpr float kDeploymentTriggerAltitudeFeet = 3000.0f;
+// Keep flaps extended for this long once triggered.
+constexpr uint32_t kDeploymentDurationMs = 5000;
+// Initial PWM positions used before deployment is commanded.
+constexpr int kTopServoInitialPwmUs = 1090;
+constexpr int kBottomServoInitialPwmUs = 1967;
+// Full extension PWM positions.
+constexpr int kTopServoExtendPwmUs = 1700;
+constexpr int kBottomServoExtendPwmUs = 1355;
+// Full retraction PWM positions after the timed deployment window ends.
+constexpr int kTopServoRetractPwmUs = 1090;
+constexpr int kBottomServoRetractPwmUs = 1967;
+// Legacy single-servo optimizer threshold retained for compatibility.
+constexpr float kServoMinExtendAltitudeFeet = kDeploymentTriggerAltitudeFeet;
 // Physical full-deployment angle (degrees). 0 deg is fully retracted.
 constexpr float kServoMaxActuationDeg = 60.0f;
 // First-order servo/flap response time constant (seconds).
@@ -178,13 +193,13 @@ constexpr size_t kCsvLineBufferSize = 768;
 // ---------------------------------------------------------------------------
 namespace environment {
 // Ground temperature used as altitude=0 reference in Fahrenheit.
-constexpr float kGroundTemperatureF = 44.0f;
+constexpr float kGroundTemperatureF = 32.0f;
 // Measured surface wind speed in miles per hour.
-constexpr float kWindSpeedMph = 6.0f;
+constexpr float kWindSpeedMph = 8.0f;
 // Meteorological wind direction in degrees.
-constexpr float kWindDirectionDeg = 200.0f;
+constexpr float kWindDirectionDeg = 63.0f;
 // Launch rail azimuth direction in degrees.
-constexpr float kLaunchDirectionDeg = 200.0f;
+constexpr float kLaunchDirectionDeg = 63.0f;
 // Terrain roughness length (meters) for log wind profile.
 constexpr float kRoughnessLengthMeters = 0.075f;
 // Height where gradient wind is modeled (meters).
@@ -200,11 +215,11 @@ constexpr float kMeasurementHeightMeters = 10.0f;
 namespace vehicle {
 // Aerodynamic moment arm CP-CG during coast/burnout [m].
 // CP from tip: 1.7537 m, CG from tip: 1.31 m.
-constexpr double kCenterOfPressureOffsetMeters = 0.4437;
+constexpr double kCenterOfPressureOffsetMeters = 0.4389;
 // Longitudinal moment of inertia during coast [kg*m^2].
 constexpr double kMomentOfInertiaKgM2 = 8.28;
 // Rocket dry mass / burnout mass [kg].
-constexpr double kDryMassKg = 18.24;
+constexpr double kDryMassKg = 18.09975;
 }
 
 // ---------------------------------------------------------------------------
@@ -228,12 +243,12 @@ constexpr uint8_t kBurnoutConfirmSamples = 10;
 constexpr float kDescentVelocityThresholdMps = 0.0f;
 constexpr float kDescentAccelerationThresholdMps2 = 0.0f;
 
-// Smoother defaults to reduce velocity chatter in logged/telemetry states.
-constexpr double kSigmaAccelXY = 1.2;
-constexpr double kSigmaAccelZ = 1.5;
-constexpr double kSigmaAltimeter = 3.0;
-constexpr double kProcessNoiseXY = 0.20;
-constexpr double kProcessNoiseZ = 0.35;
+// Fast-tracking defaults: prioritize responsiveness over smoothness.
+constexpr double kSigmaAccelXY = 0.8;
+constexpr double kSigmaAccelZ = 0.7;
+constexpr double kSigmaAltimeter = 1.0;
+constexpr double kProcessNoiseXY = 0.6;
+constexpr double kProcessNoiseZ = 1.2;
 constexpr double kApogeeTargetMeters = 1700;
 
 constexpr int kApogeePredictorMaxSteps = APOGEE_PREDICTOR_MAX_STEPS;
@@ -244,9 +259,24 @@ constexpr int kApogeePredictorMaxSteps = APOGEE_PREDICTOR_MAX_STEPS;
 // Sensor-specific configuration and runtime sanity checks.
 // ---------------------------------------------------------------------------
 namespace sensors {
-namespace bmp581 {
+namespace bno085 {
+// BNO055 I2C address.
+constexpr uint8_t kI2cAddress = 0x28;
+// Optional BNO055 reset pin. Set to -1 if reset is not wired.
+constexpr int8_t kResetPin = -1;
+// Poll interval for consuming queued sensor events.
+constexpr uint32_t kSampleIntervalUs = 10000;
+// Number of full startup attempts before giving up to the caller.
+constexpr uint8_t kInitializationAttempts = 5;
+// Delay between failed startup attempts.
+constexpr uint32_t kRetryDelayMs = 80;
+// If no complete sample arrives for this long, force a full reinit.
+constexpr uint32_t kDataTimeoutUs = 250000;
+}
+
+namespace bmp585 {
 // Pressure reference used by barometric altitude conversion.
-constexpr float kSeaLevelPressureHpa = 1018.8f;
+constexpr float kSeaLevelPressureHpa = 1032.2f;
 // Reject altitude jumps that imply faster vertical motion than this rate.
 constexpr float kMaxAltitudeRateFeetPerSecond = 2500.0f;
 // Minimum single-sample jump (feet) required before classifying as a spike.
@@ -255,9 +285,22 @@ constexpr float kMinSpikeJumpFeet = 500.0f;
 constexpr float kMaxValidAltitudeFeet = 120000.0f;
 }
 
+namespace ms5611 {
+// SPI chip-select pin for the MS5611 breakout.
+constexpr uint8_t kChipSelectPin = 36;
+// Pressure reference used by barometric altitude conversion.
+constexpr float kSeaLevelPressureHpa = 1018.8f;
+// Minimum spacing between blocking reads.
+constexpr uint32_t kMinReadSpacingUs = 1000;
+// Absolute altitude magnitude limit for invalid sample rejection.
+constexpr float kMaxValidAltitudeFeet = 120000.0f;
+// Maximum disagreement before flagging the barometers as mismatched.
+constexpr float kAgreementThresholdFeet = 150.0f;
+}
+
 namespace icm20948 {
 // ICM-20948 SPI chip-select pin.
-constexpr uint8_t kChipSelectPin = 37;
+constexpr uint8_t kChipSelectPin = 25;
 // Local magnetic declination used for compass yaw correction.
 constexpr float kMagDeclinationDeg = -14.84f;
 // Mahony filter proportional and integral gains.

@@ -5,7 +5,7 @@
 #include <math.h>
 #include <unity.h>
 
-#include "bno055_orientation.h"
+#include "bno085_orientation.h"
 #include "constants.h"
 
 void setUp() {}
@@ -15,7 +15,7 @@ static void TestVectorTransformationPreservesXAxis() {
     float outX = 0.0f;
     float outY = 0.0f;
     float outZ = 0.0f;
-    bno055_orientation::TransformVector(1.0f, 0.0f, 0.0f, outX, outY, outZ);
+    bno085_orientation::TransformVector(1.0f, 0.0f, 0.0f, outX, outY, outZ);
     TEST_ASSERT_FLOAT_WITHIN(1e-6f, 1.0f, outX);
     TEST_ASSERT_FLOAT_WITHIN(1e-6f, 0.0f, outY);
     TEST_ASSERT_FLOAT_WITHIN(1e-6f, 0.0f, outZ);
@@ -25,7 +25,7 @@ static void TestVectorTransformationFlipsGravity() {
     float outX = 0.0f;
     float outY = 0.0f;
     float outZ = 0.0f;
-    bno055_orientation::TransformVector(0.0f, 0.0f, constants::kGravity, outX, outY, outZ);
+    bno085_orientation::TransformVector(0.0f, 0.0f, constants::kGravity, outX, outY, outZ);
     TEST_ASSERT_FLOAT_WITHIN(1e-6f, 0.0f, outX);
     TEST_ASSERT_FLOAT_WITHIN(1e-6f, 0.0f, outY);
     TEST_ASSERT_FLOAT_WITHIN(1e-6f, constants::kGravity, outZ);
@@ -33,7 +33,7 @@ static void TestVectorTransformationFlipsGravity() {
 
 static void TestQuaternionIdentityBecomesOffset() {
     float out[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-    bno055_orientation::AdjustQuaternion(1.0f, 0.0f, 0.0f, 0.0f, out);
+    bno085_orientation::AdjustQuaternion(1.0f, 0.0f, 0.0f, 0.0f, out);
     TEST_ASSERT_FLOAT_WITHIN(1e-6f, 1.0f, out[0]);
     TEST_ASSERT_FLOAT_WITHIN(1e-6f, 0.0f, out[1]);
     TEST_ASSERT_FLOAT_WITHIN(1e-6f, 0.0f, out[2]);
@@ -46,7 +46,7 @@ static void TestQuaternionPremultiplication() {
     const float rawY = 0.70710677f;
     const float rawZ = 0.0f;
     float out[4];
-    bno055_orientation::AdjustQuaternion(rawW, rawX, rawY, rawZ, out);
+    bno085_orientation::AdjustQuaternion(rawW, rawX, rawY, rawZ, out);
 
     TEST_ASSERT_FLOAT_WITHIN(1e-5f, rawW, out[0]);
     TEST_ASSERT_FLOAT_WITHIN(1e-5f, rawX, out[1]);

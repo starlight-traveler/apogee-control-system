@@ -10,6 +10,8 @@ constexpr uint32_t kHeartbeatMagic = 0x31424854u;  // "THB1"
 constexpr uint16_t kHeartbeatVersion = 1;
 constexpr uint32_t kActuationCommandMagic = 0x31434154u;  // "TAC1"
 constexpr uint16_t kActuationCommandVersion = 1;
+constexpr uint32_t kTelemetryControlMagic = 0x31544354u;  // "TCT1"
+constexpr uint16_t kTelemetryControlVersion = 1;
 
 constexpr uint8_t kFlagHasFilteredState = 1u << 0;
 constexpr uint8_t kFlagHasPadAltitude = 1u << 1;
@@ -81,5 +83,18 @@ struct ActuationCommandV1 {
 
 static_assert(sizeof(ActuationCommandV1) == 16,
               "ActuationCommandV1 size changed; update sender/receiver together.");
+
+#pragma pack(push, 1)
+struct TelemetryControlV1 {
+    uint32_t magic = kTelemetryControlMagic;
+    uint16_t version = kTelemetryControlVersion;
+    uint16_t size = sizeof(TelemetryControlV1);
+    uint8_t telemetryEnabled = 1u;
+    uint8_t reserved[3] = {0, 0, 0};
+};
+#pragma pack(pop)
+
+static_assert(sizeof(TelemetryControlV1) == 12,
+              "TelemetryControlV1 size changed; update sender/receiver together.");
 
 }  // namespace telemetry

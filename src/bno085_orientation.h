@@ -2,7 +2,7 @@
 
 #include <math.h>
 
-namespace bno055_orientation {
+namespace bno085_orientation {
 
 // Rotation matrix that maps vectors reported in the IMU's frame into the
 // rocket body frame. The sensor is mounted with +Z pointing up toward the
@@ -50,4 +50,4 @@ inline void AdjustQuaternion(float w, float x, float y, float z, float *out) {
     }
 }
 
-}  // namespace bno055_orientation
+}  // namespace bno085_orientation

@@ -82,7 +82,7 @@ for idx in range(num_points):
         quaternion_old = flight_log[idx - 1, 13:17]  # last quaternion
 
     if status == "burn" or status == "coast":
-        # At high accelerations, the BNO055's orientation determination is unreliable.
+        # At high accelerations, the BNO085's orientation determination is unreliable.
         # For this reason, manual sensor fusion is used.
         # NOTE: Gyro drift starts to kick in pretty heavily after around 15-20 seconds.
         # Calculate quaternions manually using gyro (fusion)

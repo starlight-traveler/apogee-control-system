@@ -81,10 +81,12 @@ void FlightComputer::Begin(double sigmaAccelXY,
 }
 
 bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
-
-    if ((data.accelBNO[0] == 0.0 && data.accelBNO[1] == 0.0 && data.accelBNO[2] == 0.0) ||
-        (data.accelICM[0] == 0.0 && data.accelICM[1] == 0.0 && data.accelICM[2] == 0.0)) {
-        return false; // No valid accelerometer data; skip this update
+    const bool hasBnoAccel =
+        !(data.accelBNO[0] == 0.0f && data.accelBNO[1] == 0.0f && data.accelBNO[2] == 0.0f);
+    const bool hasIcmAccel =
+        !(data.accelICM[0] == 0.0f && data.accelICM[1] == 0.0f && data.accelICM[2] == 0.0f);
+    if (!hasBnoAccel && !hasIcmAccel) {
+        return false;  // No valid accelerometer data; skip this update.
     }
     
     double dt = static_cast<double>(settings::flight::kDefaultDtSeconds);
@@ -100,7 +102,8 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
     const double altitudeMeters = static_cast<double>(data.altitudeFeet) * constants::kFeetToMeters;
 
     float accelBody[3];
-    if (status_ == FlightStatus::Ground || status_ == FlightStatus::Burn) {
+    const bool preferIcm = (status_ == FlightStatus::Ground || status_ == FlightStatus::Burn) && hasIcmAccel;
+    if (preferIcm || !hasBnoAccel) {
         accelBody[0] = data.accelICM[0];
         accelBody[1] = data.accelICM[1];
         accelBody[2] = data.accelICM[2];
@@ -233,9 +236,10 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
 
     // Smooth only published outputs to reduce telemetry/log oscillation.
     // Detection/state transitions above remain on raw Kalman values.
-    constexpr double kVelocityTauSeconds = 0.22;
-    constexpr double kAccelerationTauSeconds = 0.30;
-    constexpr double kMaxOutputAccelMps2 = 45.0;
+    // Minimal-lag mode: effectively bypass output smoothing.
+    constexpr double kVelocityTauSeconds = 0.0;
+    constexpr double kAccelerationTauSeconds = 0.0;
+    constexpr double kMaxOutputAccelMps2 = 1.0e9;
     const double alphaVel = ComputeSmoothingAlpha(dt, kVelocityTauSeconds);
     const double alphaAcc = ComputeSmoothingAlpha(dt, kAccelerationTauSeconds);
     if (!outputFilterInitialized_) {

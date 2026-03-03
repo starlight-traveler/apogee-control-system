@@ -14,6 +14,7 @@ struct TelemetrySnapshot {
 };
 
 void NetworkTelemetryBegin();
+void NetworkTelemetryPollControl();
 void NetworkTelemetryService(const TelemetrySnapshot &snapshot);
 bool NetworkTelemetryConnected();
 bool NetworkTelemetrySubscriberActive();

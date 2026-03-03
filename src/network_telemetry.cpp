@@ -25,6 +25,14 @@ IPAddress g_subscriberIp;
 uint16_t g_subscriberPort = settings::network::kTelemetryUdpRemotePort;
 bool g_manualActuationOverride = false;
 float g_manualActuationAngleDeg = 0.0f;
+bool g_telemetryStreamingEnabled = true;
+
+IPAddress ConfiguredRemoteIp() {
+    return IPAddress(settings::network::kTelemetryRemoteIp0,
+                     settings::network::kTelemetryRemoteIp1,
+                     settings::network::kTelemetryRemoteIp2,
+                     settings::network::kTelemetryRemoteIp3);
+}
 
 bool StartUdp() {
     if (g_udpStarted) {
@@ -172,6 +180,23 @@ void PollSubscriberPackets(uint32_t nowMs) {
                 g_subscriberIp = g_udp.remoteIP();
                 g_subscriberPort = g_udp.remotePort();
             }
+        } else if (packetBytes == static_cast<int>(sizeof(telemetry::TelemetryControlV1))) {
+            telemetry::TelemetryControlV1 control{};
+            const int n = g_udp.read(reinterpret_cast<uint8_t *>(&control), sizeof(control));
+            if (n == static_cast<int>(sizeof(control)) &&
+                control.magic == telemetry::kTelemetryControlMagic &&
+                control.version == telemetry::kTelemetryControlVersion &&
+                control.size == sizeof(telemetry::TelemetryControlV1)) {
+                g_telemetryStreamingEnabled = control.telemetryEnabled != 0u;
+                g_hasSubscriber = true;
+                g_lastSubscriberMs = nowMs;
+                g_subscriberIp = g_udp.remoteIP();
+                g_subscriberPort = g_udp.remotePort();
+                if (!g_telemetryStreamingEnabled) {
+                    g_manualActuationOverride = false;
+                    g_manualActuationAngleDeg = 0.0f;
+                }
+            }
         } else {
             while (packetBytes-- > 0) {
                 g_udp.read();
@@ -222,15 +247,23 @@ void NetworkTelemetryBegin() {
     LOG_PRINTLN(settings::network::kTelemetryUdpRemotePort);
 }
 
-void NetworkTelemetryService(const TelemetrySnapshot &snapshot) {
+void NetworkTelemetryPollControl() {
     if (!settings::network::kEnableTelemetry || !g_wifiReady || !g_udpStarted) {
         return;
     }
 
-    const uint32_t now = millis();
-    PollSubscriberPackets(now);
+    PollSubscriberPackets(millis());
+}
 
-    if (!SubscriberActive(now)) {
+void NetworkTelemetryService(const TelemetrySnapshot &snapshot) {
+    if (!settings::network::kEnableTelemetry || !g_wifiReady || !g_udpStarted || !g_telemetryStreamingEnabled) {
+        return;
+    }
+
+    const uint32_t now = millis();
+    const bool subscriberActive = SubscriberActive(now);
+
+    if (!g_telemetryStreamingEnabled) {
         return;
     }
 
@@ -246,7 +279,10 @@ void NetworkTelemetryService(const TelemetrySnapshot &snapshot) {
     telemetry::PacketV1 packet{};
     FillPacket(snapshot, packet);
 
-    if (!g_hasSubscriber || !g_udp.beginPacket(g_subscriberIp, g_subscriberPort)) {
+    const IPAddress targetIp = subscriberActive ? g_subscriberIp : ConfiguredRemoteIp();
+    const uint16_t targetPort = subscriberActive ? g_subscriberPort : settings::network::kTelemetryUdpRemotePort;
+
+    if (!g_udp.beginPacket(targetIp, targetPort)) {
         return;
     }
     g_udp.write(reinterpret_cast<const uint8_t *>(&packet), sizeof(packet));

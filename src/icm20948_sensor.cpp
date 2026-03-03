@@ -190,8 +190,8 @@ bool Icm20948SensorBegin() {
         return true;
     }
 
-    SPI.begin();
-    g_icm.begin(settings::sensors::icm20948::kChipSelectPin, SPI);
+    SPI1.begin();
+    g_icm.begin(25, SPI1);
     if (g_icm.status != ICM_20948_Stat_Ok) {
         return false;
     }
