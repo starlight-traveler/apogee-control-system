@@ -18,6 +18,13 @@ struct SensorData {
     float gyro[3] = {0.0f, 0.0f, 0.0f};
     float icmQuaternion[4] = {1.0f, 0.0f, 0.0f, 0.0f};
     float icmYprDeg[3] = {0.0f, 0.0f, 0.0f};
+    float altimeterSigmaScale = 1.0f;
+    float altimeterGateSigma = 3.5f;
+    float autoCommandDeg = 0.0f;
+    float optimizerBestPredictedApogeeM = 0.0f;
+    float optimizerBestCost = 0.0f;
+    float optimizerTimeToApogeeS = 0.0f;
+    float actuationIsSettling = 0.0f;
     bool hasQuaternion = false;
     bool hasIcmQuaternion = false;
     bool hasIcmYpr = false;

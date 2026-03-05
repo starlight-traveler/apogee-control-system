@@ -1,6 +1,8 @@
 #include "synced_flap_actuation.h"
 
 #include <Servo.h>
+#include <algorithm>
+#include <cmath>
 
 #include "settings.h"
 
@@ -8,13 +10,12 @@ namespace {
 
 constexpr uint8_t kTopServoPin = settings::hardware::kTopServoPin;
 constexpr uint8_t kBottomServoPin = settings::hardware::kBottomServoPin;
-constexpr uint32_t kDeploymentDurationMs = settings::actuation::kDeploymentDurationMs;
-constexpr int kTopServoInitialPwmUs = settings::actuation::kTopServoInitialPwmUs;
-constexpr int kBottomServoInitialPwmUs = settings::actuation::kBottomServoInitialPwmUs;
-constexpr int kTopServoExtendPwmUs = settings::actuation::kTopServoExtendPwmUs;
-constexpr int kBottomServoExtendPwmUs = settings::actuation::kBottomServoExtendPwmUs;
-constexpr int kTopServoRetractPwmUs = settings::actuation::kTopServoRetractPwmUs;
-constexpr int kBottomServoRetractPwmUs = settings::actuation::kBottomServoRetractPwmUs;
+constexpr float kServoMaxActuationDeg = settings::actuation::kServoMaxActuationDeg;
+constexpr float kServoLatencySeconds = settings::actuation::kServoLatencySeconds;
+constexpr float kCommandDeadbandDeg = settings::actuation::kAngleCommandDeadbandDeg;
+constexpr uint32_t kServoMinStepIntervalMs = settings::actuation::kServoMinStepIntervalMs;
+constexpr uint32_t kServoSettlingDurationMs = settings::actuation::kServoSettlingDurationMs;
+constexpr float kServoSettlingAngleEpsilonDeg = settings::actuation::kServoSettlingAngleEpsilonDeg;
 
 Servo g_topServo;
 Servo g_bottomServo;
@@ -25,74 +26,120 @@ void SyncedFlapActuator::Begin() {
     g_topServo.attach(kTopServoPin);
     g_bottomServo.attach(kBottomServoPin);
     attached_ = true;
-    triggered_ = false;
-    extendUntilMs_ = 0;
-    currentPosition_ = Position::Unknown;
-    ApplyPosition(Position::Initial);
+    hasLastUpdateMs_ = false;
+    settling_ = false;
+    pendingActuationEvent_ = false;
+    pendingSettlingTimerFiredEvent_ = false;
+    lastUpdateMs_ = 0;
+    lastPwmChangeMs_ = 0;
+    settlingDeadlineMs_ = 0;
+    settlingTimerFired_ = false;
+    commandAngleDeg_ = 0.0f;
+    effectiveAngleDeg_ = 0.0f;
+    currentTopPwmUs_ = -1;
+    currentBottomPwmUs_ = -1;
+
+    const auto point = LookupNearestPoint(0.0f);
+    ApplyPwm(0, point.topPwmUs, point.bottomPwmUs);
 }
 
-void SyncedFlapActuator::Update(uint32_t nowMs, bool autoDeployTrigger, bool manualForceExtend) {
+void SyncedFlapActuator::Update(uint32_t nowMs, float commandedAngleDeg) {
     if (!attached_) {
         return;
     }
 
-    if (autoDeployTrigger) {
-        triggered_ = true;
-        extendUntilMs_ = nowMs + kDeploymentDurationMs;
+    const float clampedCommand = std::clamp(commandedAngleDeg, 0.0f, kServoMaxActuationDeg);
+    if (std::fabs(clampedCommand - commandAngleDeg_) > kCommandDeadbandDeg) {
+        commandAngleDeg_ = clampedCommand;
     }
 
-    if (manualForceExtend) {
-        ApplyPosition(Position::Extend);
-        return;
+    float dtSeconds = 0.0f;
+    if (hasLastUpdateMs_) {
+        dtSeconds = static_cast<float>(nowMs - lastUpdateMs_) * 1.0e-3f;
+        if (dtSeconds < 0.0f || dtSeconds > 1.0f) {
+            dtSeconds = 0.0f;
+        }
+    }
+    lastUpdateMs_ = nowMs;
+    hasLastUpdateMs_ = true;
+
+    const float alpha = ComputeSmoothingAlpha(dtSeconds, kServoLatencySeconds);
+    effectiveAngleDeg_ += alpha * (commandAngleDeg_ - effectiveAngleDeg_);
+    effectiveAngleDeg_ = std::clamp(effectiveAngleDeg_, 0.0f, kServoMaxActuationDeg);
+
+    const auto point = LookupNearestPoint(effectiveAngleDeg_);
+    const bool pwmChanged = (point.topPwmUs != currentTopPwmUs_) || (point.bottomPwmUs != currentBottomPwmUs_);
+    const bool dwellElapsed = (nowMs - lastPwmChangeMs_) >= kServoMinStepIntervalMs;
+    if (pwmChanged && (lastPwmChangeMs_ == 0 || dwellElapsed)) {
+        ApplyPwm(nowMs, point.topPwmUs, point.bottomPwmUs);
     }
 
-    if (triggered_ && !DeadlineReached(nowMs, extendUntilMs_)) {
-        ApplyPosition(Position::Extend);
-        return;
+    const bool timerExpired = (settlingDeadlineMs_ != 0u) && (static_cast<int32_t>(nowMs - settlingDeadlineMs_) >= 0);
+    if (timerExpired && !settlingTimerFired_) {
+        pendingSettlingTimerFiredEvent_ = true;
+        settlingTimerFired_ = true;
     }
 
-    if (triggered_) {
-        triggered_ = false;
-        ApplyPosition(Position::Initial);
-        return;
-    }
-
-    ApplyPosition(Position::Initial);
+    const bool withinAngleTolerance = std::fabs(commandAngleDeg_ - effectiveAngleDeg_) <= kServoSettlingAngleEpsilonDeg;
+    settling_ = !withinAngleTolerance || !timerExpired;
 }
 
-float SyncedFlapActuator::CommandFraction() const {
-    return IsExtended() ? 1.0f : 0.0f;
-}
-
-float SyncedFlapActuator::EffectiveFraction() const {
-    return IsExtended() ? 1.0f : 0.0f;
-}
-
-void SyncedFlapActuator::ApplyPosition(Position position) {
-    if (!attached_ || position == currentPosition_) {
+void SyncedFlapActuator::ApplyPwm(uint32_t nowMs, int topPwmUs, int bottomPwmUs) {
+    if (!attached_) {
         return;
     }
-
-    switch (position) {
-        case Position::Unknown:
-            return;
-        case Position::Initial:
-            g_topServo.writeMicroseconds(kTopServoInitialPwmUs);
-            g_bottomServo.writeMicroseconds(kBottomServoInitialPwmUs);
-            break;
-        case Position::Extend:
-            g_topServo.writeMicroseconds(kTopServoExtendPwmUs);
-            g_bottomServo.writeMicroseconds(kBottomServoExtendPwmUs);
-            break;
-        case Position::Retract:
-            g_topServo.writeMicroseconds(kTopServoRetractPwmUs);
-            g_bottomServo.writeMicroseconds(kBottomServoRetractPwmUs);
-            break;
+    if (topPwmUs != currentTopPwmUs_) {
+        g_topServo.writeMicroseconds(topPwmUs);
+        currentTopPwmUs_ = topPwmUs;
     }
-
-    currentPosition_ = position;
+    if (bottomPwmUs != currentBottomPwmUs_) {
+        g_bottomServo.writeMicroseconds(bottomPwmUs);
+        currentBottomPwmUs_ = bottomPwmUs;
+    }
+    pendingActuationEvent_ = true;
+    pendingSettlingTimerFiredEvent_ = false;
+    settlingTimerFired_ = false;
+    lastPwmChangeMs_ = nowMs;
+    settlingDeadlineMs_ = nowMs + kServoSettlingDurationMs;
 }
 
-bool SyncedFlapActuator::DeadlineReached(uint32_t nowMs, uint32_t deadlineMs) {
-    return static_cast<int32_t>(nowMs - deadlineMs) >= 0;
+bool SyncedFlapActuator::ConsumeActuationEvent() {
+    if (!pendingActuationEvent_) {
+        return false;
+    }
+    pendingActuationEvent_ = false;
+    return true;
+}
+
+bool SyncedFlapActuator::ConsumeSettlingTimerFiredEvent() {
+    if (!pendingSettlingTimerFiredEvent_) {
+        return false;
+    }
+    pendingSettlingTimerFiredEvent_ = false;
+    return true;
+}
+
+settings::actuation::ServoCalibrationPoint SyncedFlapActuator::LookupNearestPoint(float angleDeg) {
+    const float clampedAngle = std::clamp(angleDeg, 0.0f, kServoMaxActuationDeg);
+    const auto &table = settings::actuation::kServoCalibrationTable;
+    constexpr size_t kCount = settings::actuation::kServoCalibrationPointCount;
+
+    size_t bestIndex = 0;
+    float bestDistance = std::fabs(clampedAngle - table[0].angleDeg);
+    for (size_t i = 1; i < kCount; ++i) {
+        const float distance = std::fabs(clampedAngle - table[i].angleDeg);
+        if (distance < bestDistance) {
+            bestDistance = distance;
+            bestIndex = i;
+        }
+    }
+    return table[bestIndex];
+}
+
+float SyncedFlapActuator::ComputeSmoothingAlpha(float dtSeconds, float tauSeconds) {
+    if (dtSeconds <= 0.0f || tauSeconds <= 0.0f) {
+        return 1.0f;
+    }
+    const float alpha = dtSeconds / (tauSeconds + dtSeconds);
+    return std::clamp(alpha, 0.0f, 1.0f);
 }

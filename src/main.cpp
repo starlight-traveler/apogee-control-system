@@ -1,12 +1,15 @@
 #include <Arduino.h>
+#include <algorithm>
 #include <cmath>
 #include <ctype.h>
+#include <limits>
 #include <stdlib.h>
 #include <string.h>
 
 #include "bno085_sensor.h"
 #include "bmp585_sensor.h"
 #include "cfd_table.h"
+#include "constants.h"
 #include "data_logger.h"
 #include "flight_computer.h"
 #include "icm20948_sensor.h"
@@ -23,14 +26,10 @@ constexpr uint8_t kStatusLedPin = settings::hardware::kStatusLedPin;
 constexpr uint8_t kBuzzerPin = settings::hardware::kBuzzerPin;
 constexpr uint32_t kErrorBlinkIntervalMs = settings::flight::kErrorBlinkIntervalMs;
 constexpr uint32_t kRecoveryBlinkIntervalMs = settings::flight::kRecoveryBlinkIntervalMs;
-constexpr float kDeploymentTriggerAltitudeFeet = settings::actuation::kDeploymentTriggerAltitudeFeet;
 constexpr float kServoMaxActuationDeg = settings::actuation::kServoMaxActuationDeg;
 constexpr bool kEnableCsvReplay = settings::replay::kEnableCsvReplay;
 constexpr const char *kCsvReplayPath = settings::replay::kCsvReplayPath;
 constexpr size_t kCsvLineBufferSize = settings::replay::kCsvLineBufferSize;
-constexpr uint32_t kDebugHeartbeatIntervalMs = 1000;
-constexpr uint32_t kStateLogIntervalMs = 250;
-constexpr uint8_t kDeploymentConfirmSamples = 30;
 constexpr float kBarometerAgreementThresholdFeet = settings::sensors::ms5611::kAgreementThresholdFeet;
 
 enum class SystemError : uint8_t {
@@ -458,6 +457,8 @@ static bool AcquireSensorData(SensorData &data) {
 static FlightComputer flightComputer;
 static CfdTableStorage g_cfdTable;
 static SyncedFlapActuator g_flapActuator;
+static EnvironmentModel g_actuationEnvironment;
+static ApogeePredictor g_actuationPredictor;
 static FlightStatus g_lastLoggedStatus = FlightStatus::Ground;
 static bool g_hasLoggedStatus = false;
 static bool g_hasPadAltitude = false;
@@ -465,13 +466,171 @@ static float g_padAltitudeFeet = 0.0f;
 static bool g_servoCycleTestMode = false;
 static float g_servoCommandDeg = 0.0f;
 static float g_servoEffectiveDeg = 0.0f;
-static bool g_wasAboveDeploymentThreshold = false;
-static bool g_hasAutoDeployed = false;
-static uint8_t g_aboveDeploymentThresholdCount = 0;
 static uint32_t g_lastNoDataLogMs = 0;
 static uint32_t g_lastNoLoggerLogMs = 0;
 static uint32_t g_lastBarometerLogMs = 0;
 static uint32_t g_lastStateLogMs = 0;
+static uint32_t g_altimeterTransientUntilMs = 0;
+static bool g_actuationPredictorReady = false;
+static bool g_actuationHasLastZenithSample = false;
+static float g_actuationLastZenithRad = 0.0f;
+static float g_actuationLastStateTime = 0.0f;
+static bool g_actuationHasLastControlUpdate = false;
+static uint32_t g_actuationLastControlUpdateMs = 0;
+static float g_actuationLastCommandDeg = 0.0f;
+
+struct AutoActuationTelemetry {
+    float autoCommandDeg = std::numeric_limits<float>::quiet_NaN();
+    float bestPredictedApogeeM = std::numeric_limits<float>::quiet_NaN();
+    float bestCost = std::numeric_limits<float>::quiet_NaN();
+    float timeToApogeeS = std::numeric_limits<float>::quiet_NaN();
+};
+
+static double EstimateHorizontalVelocityMps(const FilteredState &state) {
+    const double verticalVelocity = static_cast<double>(state.velocity[2]);
+    const double cosZenith = std::cos(static_cast<double>(state.zenith));
+    const double clampedCosZenith = std::clamp(cosZenith, 0.1, 1.0);
+    const double speedAlongAxis = verticalVelocity / clampedCosZenith;
+    const double speedSquared = speedAlongAxis * speedAlongAxis;
+    const double verticalSquared = verticalVelocity * verticalVelocity;
+    const double horizontalSquared = speedSquared - verticalSquared;
+    return (horizontalSquared > 0.0) ? std::sqrt(horizontalSquared) : 0.0;
+}
+
+static float ComputeAutoActuationCommandDeg(uint32_t nowMs,
+                                            const FilteredState &state,
+                                            FlightStatus status,
+                                            float currentEffectiveAngleDeg,
+                                            AutoActuationTelemetry *telemetry) {
+    if (telemetry != nullptr) {
+        telemetry->autoCommandDeg = std::numeric_limits<float>::quiet_NaN();
+        telemetry->bestPredictedApogeeM = std::numeric_limits<float>::quiet_NaN();
+        telemetry->bestCost = std::numeric_limits<float>::quiet_NaN();
+        telemetry->timeToApogeeS = std::numeric_limits<float>::quiet_NaN();
+    }
+
+    double angularRate = 0.0;
+    if (g_actuationHasLastZenithSample) {
+        const double dt = static_cast<double>(state.time) - static_cast<double>(g_actuationLastStateTime);
+        if (dt > 1.0e-4) {
+            angularRate =
+                (static_cast<double>(state.zenith) - static_cast<double>(g_actuationLastZenithRad)) / dt;
+        }
+    }
+    g_actuationHasLastZenithSample = true;
+    g_actuationLastZenithRad = state.zenith;
+    g_actuationLastStateTime = state.time;
+
+    const bool canControl =
+        g_actuationPredictorReady && (status == FlightStatus::Burn || status == FlightStatus::Coast) &&
+        state.velocity[2] > 0.0f;
+    const float timeToApogeeS = std::max(0.0f, state.velocity[2] / static_cast<float>(constants::kGravity));
+    if (telemetry != nullptr) {
+        telemetry->timeToApogeeS = timeToApogeeS;
+    }
+    if (!canControl) {
+        g_actuationLastCommandDeg = 0.0f;
+        if (telemetry != nullptr) {
+            telemetry->autoCommandDeg = 0.0f;
+        }
+        return 0.0f;
+    }
+
+    if (g_actuationHasLastControlUpdate &&
+        (nowMs - g_actuationLastControlUpdateMs) < settings::actuation::kControlUpdateIntervalMs) {
+        return g_actuationLastCommandDeg;
+    }
+    g_actuationHasLastControlUpdate = true;
+    g_actuationLastControlUpdateMs = nowMs;
+
+    ApogeeState predictorState;
+    predictorState.altitudeMeters = static_cast<double>(state.position[2]);
+    predictorState.horizontalDistanceMeters = 0.0;
+    predictorState.verticalVelocity = static_cast<double>(state.velocity[2]);
+    predictorState.horizontalVelocity = EstimateHorizontalVelocityMps(state);
+    predictorState.zenith = static_cast<double>(state.zenith);
+    predictorState.angularVelocity = angularRate;
+
+    const double targetApogeeMeters = settings::flight::kApogeeTargetMeters;
+    const double deadbandMeters = static_cast<double>(settings::actuation::kApogeeErrorDeadbandMeters);
+    const double undershootPenalty = static_cast<double>(settings::actuation::kUndershootPenalty);
+    const double ratePenalty = static_cast<double>(settings::actuation::kRatePenalty);
+    const double effortPenalty = static_cast<double>(settings::actuation::kEffortPenalty);
+    const double maxAngle = static_cast<double>(kServoMaxActuationDeg);
+    double maxAllowedAngle = maxAngle;
+
+    if (status == FlightStatus::Coast) {
+        const double hardDisableVz = static_cast<double>(settings::actuation::kCoastHardDisableVelocityMps);
+        const double hardDisableTime = static_cast<double>(settings::actuation::kCoastHardDisableTimeToApogeeS);
+        const double softDisableStart =
+            static_cast<double>(settings::actuation::kCoastSoftDisableStartTimeToApogeeS);
+        const double timeToApogee = std::max(0.0, static_cast<double>(state.velocity[2]) / constants::kGravity);
+
+        if (state.velocity[2] <= hardDisableVz || timeToApogee <= hardDisableTime) {
+            g_actuationLastCommandDeg = 0.0f;
+            return 0.0f;
+        }
+
+        if (softDisableStart > hardDisableTime && timeToApogee < softDisableStart) {
+            const double taper =
+                std::clamp((timeToApogee - hardDisableTime) / (softDisableStart - hardDisableTime), 0.0, 1.0);
+            maxAllowedAngle = maxAngle * taper;
+        }
+    }
+
+    float bestAngleDeg = g_actuationLastCommandDeg;
+    double bestCost = INFINITY;
+    float bestPredictedApogeeM = std::numeric_limits<float>::quiet_NaN();
+
+    for (const auto &point : settings::actuation::kServoCalibrationTable) {
+        if (static_cast<double>(point.angleDeg) > (maxAllowedAngle + 1.0e-6)) {
+            continue;
+        }
+        predictorState.acsAngleDeg = static_cast<double>(point.angleDeg);
+        const double predictedApogee = g_actuationPredictor.PredictApogee(predictorState);
+        if (!std::isfinite(predictedApogee)) {
+            continue;
+        }
+
+        const double apogeeError = predictedApogee - targetApogeeMeters;
+        const double errorOutsideDeadband = std::max(0.0, std::fabs(apogeeError) - deadbandMeters);
+        double errorCost = errorOutsideDeadband * errorOutsideDeadband;
+        if (apogeeError < -deadbandMeters) {
+            errorCost *= undershootPenalty;
+        }
+
+        const double deltaAngle = static_cast<double>(point.angleDeg) - static_cast<double>(currentEffectiveAngleDeg);
+        const double rateCost = ratePenalty * deltaAngle * deltaAngle;
+        const double angleNorm = static_cast<double>(point.angleDeg) / std::max(1.0, maxAngle);
+        const double effortCost = effortPenalty * angleNorm * angleNorm * 100.0;
+        const double totalCost = errorCost + rateCost + effortCost;
+
+        if (totalCost < bestCost) {
+            bestCost = totalCost;
+            bestAngleDeg = point.angleDeg;
+            bestPredictedApogeeM = static_cast<float>(predictedApogee);
+        }
+    }
+
+    if (!std::isfinite(bestCost)) {
+        if (telemetry != nullptr) {
+            telemetry->autoCommandDeg = g_actuationLastCommandDeg;
+        }
+        return g_actuationLastCommandDeg;
+    }
+
+    if (std::fabs(bestAngleDeg - g_actuationLastCommandDeg) < settings::actuation::kAngleCommandDeadbandDeg) {
+        bestAngleDeg = g_actuationLastCommandDeg;
+    }
+
+    g_actuationLastCommandDeg = ClampFloat(bestAngleDeg, 0.0f, kServoMaxActuationDeg);
+    if (telemetry != nullptr) {
+        telemetry->autoCommandDeg = g_actuationLastCommandDeg;
+        telemetry->bestPredictedApogeeM = bestPredictedApogeeM;
+        telemetry->bestCost = static_cast<float>(bestCost);
+    }
+    return g_actuationLastCommandDeg;
+}
 
 static void ServiceStatusLeds(uint32_t nowMs, bool manualOverrideActive) {
     StatusLedsSetFault(!DataLoggerIsInitialized());
@@ -482,7 +641,7 @@ static void ServiceStatusLeds(uint32_t nowMs, bool manualOverrideActive) {
 }
 
 static void LogBarometerDiagnostics(uint32_t nowMs) {
-    if ((nowMs - g_lastBarometerLogMs) < kDebugHeartbeatIntervalMs) {
+    if ((nowMs - g_lastBarometerLogMs) < settings::flight::kDebugHeartbeatIntervalMs) {
         return;
     }
     g_lastBarometerLogMs = nowMs;
@@ -615,6 +774,13 @@ void setup() {
     vehicleParameters.momentOfInertia = settings::vehicle::kMomentOfInertiaKgM2;
     vehicleParameters.dryMass = settings::vehicle::kDryMassKg;
 
+    g_actuationEnvironment.Configure(environmentConfig);
+    g_actuationPredictor.SetEnvironment(g_actuationEnvironment);
+    g_actuationPredictor.SetVehicleParameters(vehicleParameters);
+    g_actuationPredictor.SetForceTable(g_cfdTable.loaded ? &g_cfdTable.table : nullptr);
+    g_actuationPredictor.SetMaxIntegrationSteps(settings::actuation::kActuationPredictorMaxSteps);
+    g_actuationPredictorReady = g_cfdTable.loaded;
+
     const double sigmaAccelXY = settings::flight::kSigmaAccelXY;
     const double sigmaAccelZ = settings::flight::kSigmaAccelZ;
     const double sigmaAltimeter = settings::flight::kSigmaAltimeter;
@@ -645,13 +811,17 @@ void setup() {
     g_hasLoggedStatus = false;
     g_servoCommandDeg = 0.0f;
     g_servoEffectiveDeg = 0.0f;
-    g_wasAboveDeploymentThreshold = false;
-    g_hasAutoDeployed = false;
-    g_aboveDeploymentThresholdCount = 0;
     g_lastNoDataLogMs = 0;
     g_lastNoLoggerLogMs = 0;
     g_lastBarometerLogMs = 0;
     g_lastStateLogMs = 0;
+    g_altimeterTransientUntilMs = 0;
+    g_actuationHasLastZenithSample = false;
+    g_actuationLastZenithRad = 0.0f;
+    g_actuationLastStateTime = 0.0f;
+    g_actuationHasLastControlUpdate = false;
+    g_actuationLastControlUpdateMs = 0;
+    g_actuationLastCommandDeg = 0.0f;
     LogSetupCheckpoint("playing startup buzzer");
     PlayStartupMarch();
     LogSetupCheckpoint("setup complete");
@@ -668,7 +838,7 @@ void loop() {
     }
 
     if (!DataLoggerIsInitialized()) {
-        if ((nowMs - g_lastNoLoggerLogMs) >= kDebugHeartbeatIntervalMs) {
+        if ((nowMs - g_lastNoLoggerLogMs) >= settings::flight::kDebugHeartbeatIntervalMs) {
             LogSetupCheckpoint("data logger unavailable in loop");
             g_lastNoLoggerLogMs = nowMs;
         }
@@ -681,7 +851,7 @@ void loop() {
 
     SensorData data;
     if (!AcquireSensorData(data)) {
-        if ((nowMs - g_lastNoDataLogMs) >= kDebugHeartbeatIntervalMs) {
+        if ((nowMs - g_lastNoDataLogMs) >= settings::flight::kDebugHeartbeatIntervalMs) {
             LogSetupCheckpoint("waiting for sensor data");
             g_lastNoDataLogMs = nowMs;
         }
@@ -708,41 +878,46 @@ void loop() {
         }
     }
 
+    const bool flapTransientActive = g_flapActuator.IsSettling() || (nowMs < g_altimeterTransientUntilMs);
+    data.altimeterGateSigma = flapTransientActive ? settings::actuation::kBaroInnovationGateSigmaTransient
+                                                  : settings::actuation::kBaroInnovationGateSigmaNominal;
+    data.altimeterSigmaScale =
+        flapTransientActive ? settings::actuation::kBaroDeweightSigmaScale : 1.0f;
+
     FilteredState state;
     const bool hasFilteredState = flightComputer.Update(data, state);
     float manualOverrideDeg = 0.0f;
     const bool manualOverrideActive = NetworkTelemetryManualActuationOverride(manualOverrideDeg);
     manualOverrideDeg = ClampFloat(manualOverrideDeg, 0.0f, kServoMaxActuationDeg);
 
+    AutoActuationTelemetry autoTelemetry;
+    float autoCommandDeg = 0.0f;
+    if (hasFilteredState) {
+        autoCommandDeg =
+            ComputeAutoActuationCommandDeg(nowMs, state, flightComputer.Status(), g_servoEffectiveDeg, &autoTelemetry);
+    }
+    float commandedActuationDeg = 0.0f;
+    if (manualOverrideActive) {
+        commandedActuationDeg = manualOverrideDeg;
+    } else if (hasFilteredState) {
+        commandedActuationDeg = autoCommandDeg;
+    }
+    g_flapActuator.Update(nowMs, commandedActuationDeg);
+    g_servoCommandDeg = g_flapActuator.CommandAngleDeg();
+    g_servoEffectiveDeg = g_flapActuator.EffectiveAngleDeg();
+
+    data.autoCommandDeg = autoTelemetry.autoCommandDeg;
+    data.optimizerBestPredictedApogeeM = autoTelemetry.bestPredictedApogeeM;
+    data.optimizerBestCost = autoTelemetry.bestCost;
+    data.optimizerTimeToApogeeS = autoTelemetry.timeToApogeeS;
+    data.actuationIsSettling = g_flapActuator.IsSettling() ? 1.0f : 0.0f;
+
     if (!g_csvReplay.enabled) {
         DataLoggerLogTelemetry(data, flightComputer.Status(), hasFilteredState ? &state : nullptr);
     }
 
-    const bool aboveDeploymentThreshold = altitudeAglFeet >= kDeploymentTriggerAltitudeFeet;
-    if (aboveDeploymentThreshold) {
-        if (g_aboveDeploymentThresholdCount < 255) {
-            ++g_aboveDeploymentThresholdCount;
-        }
-    } else {
-        g_aboveDeploymentThresholdCount = 0;
-    }
-    const bool confirmedAboveDeploymentThreshold = g_aboveDeploymentThresholdCount >= kDeploymentConfirmSamples;
-
     if (hasFilteredState) {
         const FlightStatus status = flightComputer.Status();
-        const bool autoDeployTrigger =
-            !g_hasAutoDeployed && confirmedAboveDeploymentThreshold && !g_wasAboveDeploymentThreshold;
-        const bool manualForceExtend = manualOverrideActive;
-        if (autoDeployTrigger) {
-            g_hasAutoDeployed = true;
-            LOG_PRINT("Flap deployment triggered at AGL ft: ");
-            LOG_PRINTLN(altitudeAglFeet, 2);
-        }
-
-        g_flapActuator.Update(nowMs, autoDeployTrigger, manualForceExtend);
-        g_servoCommandDeg = g_flapActuator.CommandFraction() * kServoMaxActuationDeg;
-        g_servoEffectiveDeg = g_flapActuator.EffectiveFraction() * kServoMaxActuationDeg;
-
         if (!g_hasLoggedStatus || status != g_lastLoggedStatus) {
             DataLoggerLogEvent(FlightEventType::StageChange,
                                status,
@@ -753,20 +928,34 @@ void loop() {
             g_lastLoggedStatus = status;
             g_hasLoggedStatus = true;
         }
-    } else if (manualOverrideActive) {
-        const bool manualForceExtend = true;
-        g_flapActuator.Update(nowMs, false, manualForceExtend);
-        g_servoCommandDeg = g_flapActuator.CommandFraction() * kServoMaxActuationDeg;
-        g_servoEffectiveDeg = g_flapActuator.EffectiveFraction() * kServoMaxActuationDeg;
-    } else {
-        g_flapActuator.Update(nowMs, false, false);
-        g_servoCommandDeg = g_flapActuator.CommandFraction() * kServoMaxActuationDeg;
-        g_servoEffectiveDeg = g_flapActuator.EffectiveFraction() * kServoMaxActuationDeg;
     }
 
-    g_wasAboveDeploymentThreshold = confirmedAboveDeploymentThreshold;
+    const float eventTimestamp = hasFilteredState ? state.time : data.timestamp;
+    const float eventAltitudeMeters = hasFilteredState ? state.position[2] : 0.0f;
+    const float eventVerticalVelocity = hasFilteredState ? state.velocity[2] : 0.0f;
+    const float eventApogeeEstimate = hasFilteredState ? state.apogeeEstimate : 0.0f;
+    if (g_flapActuator.ConsumeActuationEvent()) {
+        DataLoggerLogEvent(FlightEventType::FlapActuated,
+                           flightComputer.Status(),
+                           eventTimestamp,
+                           eventAltitudeMeters,
+                           eventVerticalVelocity,
+                           eventApogeeEstimate);
+    }
+    if (g_flapActuator.ConsumeSettlingTimerFiredEvent()) {
+        DataLoggerLogEvent(FlightEventType::FlapSettlingTimerFired,
+                           flightComputer.Status(),
+                           eventTimestamp,
+                           eventAltitudeMeters,
+                           eventVerticalVelocity,
+                           eventApogeeEstimate);
+    }
 
-    if (hasFilteredState && (nowMs - g_lastStateLogMs) >= kStateLogIntervalMs) {
+    if (g_flapActuator.IsSettling()) {
+        g_altimeterTransientUntilMs = nowMs + settings::actuation::kBaroDeweightDurationMs;
+    }
+
+    if (hasFilteredState && (nowMs - g_lastStateLogMs) >= settings::flight::kStateLogIntervalMs) {
         g_lastStateLogMs = nowMs;
         LOG_PRINT("t=");
         LOG_PRINT(state.time, 3);

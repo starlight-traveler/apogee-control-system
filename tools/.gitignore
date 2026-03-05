@@ -1,0 +1,14 @@
+__pycache__/
+build/
+.gui_settings.json
+.tui_settings.json
+cpp/build/
+
+# Generated decode outputs and ad-hoc analysis artifacts
+SENS*_events.json
+file_*.csv
+file_standalone_raw.txt
+standalone_output_*.csv
+standalone_run_*.csv
+acs_*.png
+graph_*.png

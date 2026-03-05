@@ -2,24 +2,35 @@
 
 #include <Arduino.h>
 
+#include "settings.h"
+
 class SyncedFlapActuator {
   public:
     void Begin();
-    void Update(uint32_t nowMs, bool autoDeployTrigger, bool manualForceExtend);
+    void Update(uint32_t nowMs, float commandedAngleDeg);
 
-    bool HasTriggered() const { return triggered_; }
-    bool IsExtended() const { return currentPosition_ == Position::Extend; }
-    float CommandFraction() const;
-    float EffectiveFraction() const;
+    float CommandAngleDeg() const { return commandAngleDeg_; }
+    float EffectiveAngleDeg() const { return effectiveAngleDeg_; }
+    bool IsSettling() const { return settling_; }
+    bool ConsumeActuationEvent();
+    bool ConsumeSettlingTimerFiredEvent();
 
   private:
-    enum class Position : uint8_t { Unknown, Initial, Extend, Retract };
-
-    void ApplyPosition(Position position);
-    static bool DeadlineReached(uint32_t nowMs, uint32_t deadlineMs);
+    void ApplyPwm(uint32_t nowMs, int topPwmUs, int bottomPwmUs);
+    static settings::actuation::ServoCalibrationPoint LookupNearestPoint(float angleDeg);
+    static float ComputeSmoothingAlpha(float dtSeconds, float tauSeconds);
 
     bool attached_ = false;
-    bool triggered_ = false;
-    uint32_t extendUntilMs_ = 0;
-    Position currentPosition_ = Position::Unknown;
+    bool hasLastUpdateMs_ = false;
+    bool settling_ = false;
+    bool pendingActuationEvent_ = false;
+    bool pendingSettlingTimerFiredEvent_ = false;
+    uint32_t lastUpdateMs_ = 0;
+    uint32_t lastPwmChangeMs_ = 0;
+    uint32_t settlingDeadlineMs_ = 0;
+    bool settlingTimerFired_ = false;
+    float commandAngleDeg_ = 0.0f;
+    float effectiveAngleDeg_ = 0.0f;
+    int currentTopPwmUs_ = -1;
+    int currentBottomPwmUs_ = -1;
 };

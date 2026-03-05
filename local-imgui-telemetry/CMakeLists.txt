@@ -8,6 +8,7 @@ include(FetchContent)
 
 option(ACS_SETUP_VOICE_ENV "Bootstrap local Python venv for voice control during build" OFF)
 option(ACS_SETUP_VOICE_MODEL "Download/unpack Vosk model during build" OFF)
+option(ACS_BUILD_TEENSY_UDP_GUI "Build live UDP telemetry GUI (POSIX socket code)" ON)
 set(ACS_VOICE_VENV_DIR "${CMAKE_CURRENT_SOURCE_DIR}/.venv" CACHE PATH "Local Python venv path for voice control")
 set(ACS_VOSK_MODEL_NAME "vosk-model-en-us-0.22" CACHE STRING "Vosk model folder name")
 set(ACS_VOSK_MODEL_URL "https://alphacephei.com/vosk/models/vosk-model-en-us-0.22.zip" CACHE STRING "Vosk model zip URL")
@@ -54,16 +55,40 @@ else()
   set(IMGUI_TARGET imgui_vendor)
 endif()
 
-add_executable(teensy_imgui_telemetry main.cpp)
-target_include_directories(teensy_imgui_telemetry PRIVATE ${CMAKE_SOURCE_DIR}/../include)
+if(WIN32)
+  # Current teensy live GUI uses POSIX socket headers in main.cpp.
+  if(ACS_BUILD_TEENSY_UDP_GUI)
+    message(WARNING "ACS_BUILD_TEENSY_UDP_GUI is ON, but main.cpp currently targets POSIX sockets. Turning it OFF on Windows.")
+    set(ACS_BUILD_TEENSY_UDP_GUI OFF CACHE BOOL "Build live UDP telemetry GUI (POSIX socket code)" FORCE)
+  endif()
+endif()
 
-target_link_libraries(teensy_imgui_telemetry PRIVATE OpenGL::GL glfw ${IMGUI_TARGET})
+if(ACS_BUILD_TEENSY_UDP_GUI)
+  add_executable(teensy_imgui_telemetry main.cpp)
+  target_include_directories(teensy_imgui_telemetry PRIVATE ${CMAKE_SOURCE_DIR}/../include)
+  target_link_libraries(teensy_imgui_telemetry PRIVATE OpenGL::GL glfw ${IMGUI_TARGET})
+endif()
 
-add_custom_command(TARGET teensy_imgui_telemetry POST_BUILD
-  COMMAND ${CMAKE_COMMAND} -E copy_if_different
-    ${CMAKE_CURRENT_SOURCE_DIR}/voice_listener.py
-    $<TARGET_FILE_DIR:teensy_imgui_telemetry>/voice_listener.py
-)
+add_executable(acs_imgui_decoder ../tools/cpp/fast_decode_sensor_log.cpp)
+target_compile_definitions(acs_imgui_decoder PRIVATE ACS_ENABLE_IMGUI_DECODER=1)
+target_link_libraries(acs_imgui_decoder PRIVATE OpenGL::GL glfw ${IMGUI_TARGET})
+set_target_properties(acs_imgui_decoder PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+
+add_executable(acs_ndrt_rocketry_decoder ../tools/cpp/fast_decode_sensor_log.cpp)
+target_compile_definitions(acs_ndrt_rocketry_decoder PRIVATE ACS_ENABLE_IMGUI_DECODER=1)
+target_link_libraries(acs_ndrt_rocketry_decoder PRIVATE OpenGL::GL glfw ${IMGUI_TARGET})
+set_target_properties(acs_ndrt_rocketry_decoder PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+if(ACS_BUILD_TEENSY_UDP_GUI)
+  set_target_properties(teensy_imgui_telemetry PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+endif()
+
+if(ACS_BUILD_TEENSY_UDP_GUI)
+  add_custom_command(TARGET teensy_imgui_telemetry POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+      ${CMAKE_CURRENT_SOURCE_DIR}/voice_listener.py
+      $<TARGET_FILE_DIR:teensy_imgui_telemetry>/voice_listener.py
+  )
+endif()
 
 set(ACS_VOSK_MODEL_STAMP "${CMAKE_CURRENT_BINARY_DIR}/.acs_vosk_model_ready")
 add_custom_command(
@@ -78,13 +103,17 @@ add_custom_command(
   VERBATIM
 )
 add_custom_target(voice_model DEPENDS ${ACS_VOSK_MODEL_STAMP})
-if(ACS_SETUP_VOICE_MODEL)
+if(ACS_SETUP_VOICE_MODEL AND ACS_BUILD_TEENSY_UDP_GUI)
   add_dependencies(teensy_imgui_telemetry voice_model)
 endif()
 
 find_package(Python3 COMPONENTS Interpreter QUIET)
 if(Python3_Interpreter_FOUND)
-  set(ACS_VOICE_VENV_PYTHON "${ACS_VOICE_VENV_DIR}/bin/python")
+  if(WIN32)
+    set(ACS_VOICE_VENV_PYTHON "${ACS_VOICE_VENV_DIR}/Scripts/python.exe")
+  else()
+    set(ACS_VOICE_VENV_PYTHON "${ACS_VOICE_VENV_DIR}/bin/python")
+  endif()
   set(ACS_VOICE_VENV_STAMP "${ACS_VOICE_VENV_DIR}/.acs_voice_ready")
 
   add_custom_command(
@@ -101,7 +130,7 @@ if(Python3_Interpreter_FOUND)
   if(ACS_SETUP_VOICE_MODEL)
     add_dependencies(voice_env voice_model)
   endif()
-  if(ACS_SETUP_VOICE_ENV)
+  if(ACS_SETUP_VOICE_ENV AND ACS_BUILD_TEENSY_UDP_GUI)
     add_dependencies(teensy_imgui_telemetry voice_env)
   endif()
 else()
@@ -109,5 +138,9 @@ else()
 endif()
 
 if(UNIX AND NOT APPLE)
-  target_link_libraries(teensy_imgui_telemetry PRIVATE pthread)
+  if(TARGET teensy_imgui_telemetry)
+    target_link_libraries(teensy_imgui_telemetry PRIVATE pthread)
+  endif()
+  target_link_libraries(acs_imgui_decoder PRIVATE pthread)
+  target_link_libraries(acs_ndrt_rocketry_decoder PRIVATE pthread)
 endif()

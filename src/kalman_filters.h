@@ -291,8 +291,11 @@ class KalmanFilterAccelAlt {
         covariance_[2][2] = newP22;
     }
 
-    void Update(double accelMeasurement, double altitudeMeasurement) {
-        if (!std::isfinite(accelMeasurement) || !std::isfinite(altitudeMeasurement)) {
+    void Update(double accelMeasurement,
+                double altitudeMeasurement,
+                double altitudeSigmaScale = 1.0,
+                double altitudeGateSigma = 3.5) {
+        if (!std::isfinite(accelMeasurement)) {
             return;
         }
         // Limit single-sample innovation so outliers don't create sharp velocity spikes.
@@ -300,8 +303,6 @@ class KalmanFilterAccelAlt {
         constexpr double kMaxAltitudeResidual = 250.0;
         const double residualAccel =
             std::clamp(accelMeasurement - state_[2], -kMaxAccelResidual, kMaxAccelResidual);
-        const double residualAlt =
-            std::clamp(altitudeMeasurement - state_[0], -kMaxAltitudeResidual, kMaxAltitudeResidual);
 
         const double p00 = covariance_[0][0];
         const double p01 = covariance_[0][1];
@@ -313,10 +314,34 @@ class KalmanFilterAccelAlt {
         const double p21 = covariance_[2][1];
         const double p22 = covariance_[2][2];
 
-        const double s00 = p22 + accelVariance_;
+        const double accelVariance = accelVariance_;
+        double effectiveAltitudeVariance = altitudeVariance_ * std::max(1.0, altitudeSigmaScale);
+        if (!std::isfinite(effectiveAltitudeVariance) || effectiveAltitudeVariance <= 0.0) {
+            effectiveAltitudeVariance = altitudeVariance_;
+        }
+
+        bool useAltitudeMeasurement = std::isfinite(altitudeMeasurement);
+        double altitudeResidual = 0.0;
+        if (useAltitudeMeasurement) {
+            altitudeResidual = altitudeMeasurement - state_[0];
+            if (altitudeGateSigma > 0.0) {
+                const double altitudeInnovationSigma =
+                    std::sqrt(std::max(1.0e-12, p00 + effectiveAltitudeVariance));
+                if (std::fabs(altitudeResidual) > altitudeGateSigma * altitudeInnovationSigma) {
+                    useAltitudeMeasurement = false;
+                }
+            }
+        }
+        if (!useAltitudeMeasurement) {
+            effectiveAltitudeVariance = 1.0e12;
+            altitudeResidual = 0.0;
+        }
+        const double residualAlt = std::clamp(altitudeResidual, -kMaxAltitudeResidual, kMaxAltitudeResidual);
+
+        const double s00 = p22 + accelVariance;
         const double s01 = p20;
         const double s10 = p02;
-        const double s11 = p00 + altitudeVariance_;
+        const double s11 = p00 + effectiveAltitudeVariance;
         double det = s00 * s11 - s01 * s10;
         if (std::fabs(det) < 1.0e-12) {
             det = (det >= 0.0) ? 1.0e-12 : -1.0e-12;
@@ -368,8 +393,8 @@ class KalmanFilterAccelAlt {
         double newP21 = mp20 * m10 + mp21 * m11 + mp22 * m12;
         double newP22 = mp20 * m20 + mp21 * m21 + mp22 * m22;
 
-        const double accelVar = accelVariance_;
-        const double altVar = altitudeVariance_;
+        const double accelVar = accelVariance;
+        const double altVar = effectiveAltitudeVariance;
         newP00 += accelVar * k00 * k00 + altVar * k01 * k01;
         newP01 += accelVar * k00 * k10 + altVar * k01 * k11;
         newP02 += accelVar * k00 * k20 + altVar * k01 * k21;

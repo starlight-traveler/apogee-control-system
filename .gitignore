@@ -66,11 +66,25 @@ venv/
 # IDE/editor
 .vscode/
 .idea/
+.DS_Store
 
 # Local data/logs
 data/
 *.log
 standalone-c/sensor_data/
+*.idx
+
+# CMake/Ninja build trees
+build/
+cmake-build-*/
+**/CMakeFiles/
+**/CMakeCache.txt
+**/cmake_install.cmake
+**/compile_commands.json
+**/Makefile
+**/build.ninja
+**/.ninja_deps
+**/.ninja_log
 
 # Large local artifacts
 local-imgui-telemetry/build/
@@ -78,9 +92,39 @@ local-imgui-telemetry/models/
 local-imgui-telemetry/build/models/
 local-imgui-telemetry/build/vosk-model-en-us-0.22.zip
 local-imgui-telemetry/models/vosk-model-small-en-us-0.15.zip
+local-imgui-telemetry/.venv/
 standalone-c/matplotplusplus.zip
 standalone-c/matplotplusplus/source/matplot/util/world_map_10m.cpp
 standalone-c/shortened.csv
 tools/SENS073.BIN
 tools/file.csv
 standalone-c/fullscale_2.csv
+
+# Standalone analysis artifacts (large/generated)
+standalone-c/output*
+standalone-c/*.idx
+standalone-c/*.csv
+standalone-c/*_replay_*.svg
+
+# Tools generated artifacts
+tools/build/
+tools/cpp/build/
+tools/*.BIN
+tools/*.bin
+tools/*.csv
+tools/*_events.json
+tools/*.png
+tools/*.svg
+
+# Local replay/generated files
+standalone-c/*.BIN
+standalone-c/*.bin
+standalone-c/*.json
+
+# Release/package outputs
+*.AppImage
+*.dmg
+*.msi
+*.pkg
+*.zip
+*.tar.gz

@@ -145,7 +145,10 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
 
     kalmanX_.Update(inertialAcceleration.x);
     kalmanY_.Update(inertialAcceleration.y);
-    kalmanZ_.Update(static_cast<float>(inertialAcceleration.z), static_cast<float>(altitudeMeters));
+    kalmanZ_.Update(static_cast<float>(inertialAcceleration.z),
+                    static_cast<float>(altitudeMeters),
+                    static_cast<double>(data.altimeterSigmaScale),
+                    static_cast<double>(data.altimeterGateSigma));
 
     const double posZ = kalmanZ_.Position();
     const double velZ = kalmanZ_.Velocity();

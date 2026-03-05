@@ -24,11 +24,21 @@ constexpr uint32_t kFlushIntervalMicros = settings::build::kDataLoggerFlushInter
 
 constexpr const char *kLogPrefix = "SENS";
 constexpr const char *kLogExtension = "BIN";
+constexpr uint16_t kLogFileFormatVersion = 1;
+constexpr uint16_t kLogSchemaVersion = 3;
+constexpr uint8_t kLogMagic[8] = {'A', 'C', 'S', 'N', 'D', 'R', 'T', '1'};
 
-static_assert(sizeof(SensorData) == 92, "SensorData size mismatch.");
+#if defined(ACS_FIRMWARE_GIT_HASH)
+constexpr const char *kFirmwareGitHash = ACS_FIRMWARE_GIT_HASH;
+#else
+constexpr const char *kFirmwareGitHash = "unknown";
+#endif
+
+static_assert(sizeof(SensorData) == 120, "SensorData size mismatch.");
 static_assert(sizeof(FilteredState) == 60, "FilteredState size mismatch.");
-static_assert(sizeof(TelemetryLogRecord) == 156, "TelemetryLogRecord size mismatch.");
+static_assert(sizeof(TelemetryLogRecord) == 184, "TelemetryLogRecord size mismatch.");
 static_assert(sizeof(EventLogRecord) == 20, "EventLogRecord size mismatch.");
+static_assert(sizeof(LogFilePreamble) == 64, "LogFilePreamble size mismatch.");
 
 static_assert(std::is_trivially_copyable<SensorData>::value, "SensorData must be trivially copyable.");
 static_assert(std::is_trivially_copyable<FilteredState>::value, "FilteredState must be trivially copyable.");
@@ -94,6 +104,19 @@ bool NextLogFilename(char *buffer, size_t length) {
     return false;
 }
 
+bool WriteLogPreamble() {
+    LogFilePreamble preamble{};
+    memcpy(preamble.magic, kLogMagic, sizeof(kLogMagic));
+    preamble.formatVersion = kLogFileFormatVersion;
+    preamble.schemaVersion = kLogSchemaVersion;
+    strncpy(preamble.firmwareGitHash, kFirmwareGitHash, sizeof(preamble.firmwareGitHash) - 1);
+    const size_t bytesWritten = g_logFile.write(&preamble, sizeof(preamble));
+    if (bytesWritten != sizeof(preamble)) {
+        return false;
+    }
+    return g_logFile.sync();
+}
+
 }  // namespace
 
 bool DataLoggerBegin() {
@@ -115,6 +138,12 @@ bool DataLoggerBegin() {
     g_logFile = g_sd.open(filename, O_WRONLY | O_CREAT | O_TRUNC);
     if (!g_logFile) {
         LOG_PRINTLN("Failed to open log file.");
+        return false;
+    }
+
+    if (!WriteLogPreamble()) {
+        g_logFile.close();
+        LOG_PRINTLN("Failed to write log preamble.");
         return false;
     }
 

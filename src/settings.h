@@ -74,32 +74,34 @@ constexpr uint8_t kTelemetryRemoteIp3 = 2;
 
 // ---------------------------------------------------------------------------
 // Actuation Settings
-// Deployment gating thresholds for the ACS servo logic.
+// Flap actuation angle-to-PWM calibration table.
 // ---------------------------------------------------------------------------
 namespace actuation {
-// Trigger the flap deployment sequence once altitude exceeds this AGL threshold.
-constexpr float kDeploymentTriggerAltitudeFeet = 3000.0f;
-// Keep flaps extended for this long once triggered.
-constexpr uint32_t kDeploymentDurationMs = 5000;
-// Initial PWM positions used before deployment is commanded.
-constexpr int kTopServoInitialPwmUs = 1090;
-constexpr int kBottomServoInitialPwmUs = 1967;
-// Full extension PWM positions.
-constexpr int kTopServoExtendPwmUs = 1700;
-constexpr int kBottomServoExtendPwmUs = 1355;
-// Full retraction PWM positions after the timed deployment window ends.
-constexpr int kTopServoRetractPwmUs = 1090;
-constexpr int kBottomServoRetractPwmUs = 1967;
-// Legacy single-servo optimizer threshold retained for compatibility.
-constexpr float kServoMinExtendAltitudeFeet = kDeploymentTriggerAltitudeFeet;
 // Physical full-deployment angle (degrees). 0 deg is fully retracted.
 constexpr float kServoMaxActuationDeg = 60.0f;
+struct ServoCalibrationPoint {
+    float angleDeg;
+    int topPwmUs;
+    int bottomPwmUs;
+};
+constexpr size_t kServoCalibrationPointCount = 20;
+constexpr ServoCalibrationPoint kServoCalibrationTable[kServoCalibrationPointCount] = {
+    {0.0f, 1090, 1967},  {3.2f, 1122, 1935},  {6.3f, 1154, 1903},  {9.5f, 1186, 1871},
+    {12.6f, 1218, 1839}, {15.8f, 1250, 1807}, {18.9f, 1282, 1775}, {22.1f, 1315, 1742},
+    {25.3f, 1347, 1710}, {28.4f, 1379, 1678}, {31.6f, 1411, 1646}, {34.7f, 1443, 1614},
+    {37.9f, 1475, 1582}, {41.1f, 1507, 1550}, {44.2f, 1539, 1518}, {47.4f, 1571, 1486},
+    {50.5f, 1603, 1454}, {53.7f, 1636, 1421}, {56.8f, 1668, 1389}, {60.0f, 1700, 1355},
+};
 // First-order servo/flap response time constant (seconds).
 constexpr float kServoLatencySeconds = 0.20f;
+// Minimum time between commanded PWM table step changes.
+constexpr uint32_t kServoMinStepIntervalMs = 150;
+// Settling window after a PWM step is applied.
+constexpr uint32_t kServoSettlingDurationMs = 250;
+// Consider actuator settled when command and effective are within this error.
+constexpr float kServoSettlingAngleEpsilonDeg = 0.5f;
 // Controller update period for angle optimization.
 constexpr uint32_t kControlUpdateIntervalMs = 40;
-// Candidate angle spacing used by the optimizer search (degrees).
-constexpr float kAngleStepDeg = 2.0f;
 // Ignore tiny command changes to reduce chatter (degrees).
 constexpr float kAngleCommandDeadbandDeg = 1.0f;
 // Do not add drag when within this apogee error band (meters).
@@ -110,20 +112,21 @@ constexpr float kRatePenalty = 0.15f;
 constexpr float kEffortPenalty = 0.20f;
 // Extra cost multiplier when predicted apogee falls below target.
 constexpr float kUndershootPenalty = 2.0f;
+// During flap settling, inflate baro measurement sigma by this multiplier.
+constexpr float kBaroDeweightSigmaScale = 12.0f;
+// Keep baro in deweighted mode for at least this long after a flap transient.
+constexpr uint32_t kBaroDeweightDurationMs = 300;
+// Nominal/settling innovation gates for baro fusion.
+constexpr float kBaroInnovationGateSigmaNominal = 3.5f;
+constexpr float kBaroInnovationGateSigmaTransient = 2.5f;
+// Late-coast soft-disable window: taper max commanded angle down as time-to-apogee shrinks.
+constexpr float kCoastSoftDisableStartTimeToApogeeS = 2.5f;
+// Hard-disable window: command 0 deg at/inside this time-to-apogee threshold.
+constexpr float kCoastHardDisableTimeToApogeeS = 1.0f;
+// Hard-disable when vertical speed gets this low in coast.
+constexpr float kCoastHardDisableVelocityMps = 25.0f;
 // Integration step cap for the actuation-side predictor (kept at flight default for accuracy).
 constexpr int kActuationPredictorMaxSteps = APOGEE_PREDICTOR_MAX_STEPS;
-// Coarse search spacing for two-stage command optimization (degrees).
-constexpr float kCoarseAngleStepDeg = 8.0f;
-// If top coarse candidates are too close in cost, use full-resolution sweep.
-constexpr float kCoarseAmbiguityCostThreshold = 2.0f;
-// Max unique angle evaluations cached per control cycle.
-constexpr int kEvalCacheMaxEntries = 64;
-// Equality epsilon when matching candidate angles against cache.
-constexpr float kEvalCacheMatchEpsilonDeg = 0.001f;
-// Enable early-stop pruning in full-range sweeps.
-constexpr bool kEnableSweepPruning = true;
-// Number of consecutively worse bins before pruning the sweep.
-constexpr int kSweepPruneConsecutiveWorse = 6;
 }
 
 // ---------------------------------------------------------------------------
@@ -229,6 +232,8 @@ constexpr double kDryMassKg = 18.09975;
 namespace flight {
 constexpr uint32_t kErrorBlinkIntervalMs = 120;
 constexpr uint32_t kRecoveryBlinkIntervalMs = 60;
+constexpr uint32_t kDebugHeartbeatIntervalMs = 1000;
+constexpr uint32_t kStateLogIntervalMs = 250;
 
 constexpr float kDefaultDtSeconds = 0.03f;
 constexpr float kLiftoffAccelerationThresholdMps2 = 20.0f;
