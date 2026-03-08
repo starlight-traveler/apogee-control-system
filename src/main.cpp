@@ -15,6 +15,7 @@
 #include "icm20948_sensor.h"
 #include "ms5611_sensor.h"
 #include "network_telemetry.h"
+#include "predictor_seed.h"
 #include "serial_logging.h"
 #include "settings.h"
 #include "status_leds.h"
@@ -31,6 +32,10 @@ constexpr bool kEnableCsvReplay = settings::replay::kEnableCsvReplay;
 constexpr const char *kCsvReplayPath = settings::replay::kCsvReplayPath;
 constexpr size_t kCsvLineBufferSize = settings::replay::kCsvLineBufferSize;
 constexpr float kBarometerAgreementThresholdFeet = settings::sensors::ms5611::kAgreementThresholdFeet;
+constexpr uint32_t kRecoveryRetryInitialMs = settings::flight::kRecoveryRetryInitialMs;
+constexpr uint32_t kRecoveryRetryStepMs = settings::flight::kRecoveryRetryStepMs;
+constexpr uint32_t kRecoveryRetryMaxMs = settings::flight::kRecoveryRetryMaxMs;
+constexpr uint32_t kTimingLogIntervalMs = settings::flight::kTimingLogIntervalMs;
 
 enum class SystemError : uint8_t {
     BnoInitialization = 0,
@@ -79,25 +84,6 @@ uint8_t BlinkCountForError(SystemError error) {
     return 1;
 }
 
-void BlinkPattern(uint8_t count, uint32_t intervalMs) {
-    for (uint8_t i = 0; i < count; ++i) {
-        digitalWrite(kStatusLedPin, HIGH);
-        delay(intervalMs);
-        digitalWrite(kStatusLedPin, LOW);
-        delay(intervalMs);
-    }
-}
-
-void IndicateError(SystemError error) {
-    BlinkPattern(BlinkCountForError(error), kErrorBlinkIntervalMs);
-    delay(kErrorBlinkIntervalMs * 2);
-}
-
-void IndicateRecovery() {
-    BlinkPattern(3, kRecoveryBlinkIntervalMs);
-    delay(kRecoveryBlinkIntervalMs * 2);
-}
-
 void LogSetupCheckpoint(const char *message) {
     LOG_PRINT("[setup ");
     LOG_PRINT(millis());
@@ -124,54 +110,6 @@ void PlayStartupMarch() {
         delay(note.durationMs + 30);
     }
     noTone(kBuzzerPin);
-}
-
-bool InitializeWithRecovery(SystemError error, bool (*initializer)(), const char *failureMessage) {
-    bool hadFailure = false;
-    bool loggedFailure = false;
-    uint32_t retryDelayMs = 200;
-    uint32_t attempt = 1;
-    while (true) {
-        LOG_PRINT("[init attempt ");
-        LOG_PRINT(attempt);
-        LOG_PRINTLN("] starting");
-        if (initializer()) {
-            break;
-        }
-
-        hadFailure = true;
-        if (!loggedFailure && failureMessage != nullptr) {
-            LOG_PRINTLN(failureMessage);
-            loggedFailure = true;
-        }
-        LOG_PRINT("[init attempt ");
-        LOG_PRINT(attempt);
-        LOG_PRINTLN("] failed");
-        IndicateError(error);
-        LOG_PRINT("[init retry delay ms] ");
-        LOG_PRINTLN(retryDelayMs);
-        delay(retryDelayMs);
-        if (retryDelayMs < 2000) {
-            retryDelayMs += 200;
-            if (retryDelayMs > 2000) {
-                retryDelayMs = 2000;
-            }
-        }
-        ++attempt;
-    }
-
-    LOG_PRINT("[init] success after attempts=");
-    LOG_PRINTLN(attempt);
-
-    if (hadFailure) {
-        IndicateRecovery();
-    }
-
-    if (loggedFailure && failureMessage != nullptr) {
-        LOG_PRINTLN("Recovered successfully.");
-    }
-
-    return true;
 }
 
 float ClampFloat(float value, float minValue, float maxValue) {
@@ -478,23 +416,115 @@ static float g_actuationLastStateTime = 0.0f;
 static bool g_actuationHasLastControlUpdate = false;
 static uint32_t g_actuationLastControlUpdateMs = 0;
 static float g_actuationLastCommandDeg = 0.0f;
+static PredictorHorizontalVelocityTracker g_actuationPredictorHorizontalVelocity;
 
 struct AutoActuationTelemetry {
     float autoCommandDeg = std::numeric_limits<float>::quiet_NaN();
     float bestPredictedApogeeM = std::numeric_limits<float>::quiet_NaN();
     float bestCost = std::numeric_limits<float>::quiet_NaN();
     float timeToApogeeS = std::numeric_limits<float>::quiet_NaN();
+    float predictorSeedHorizontalSpeedMps = 0.0f;
+    float predictorSeedClampedZenithRad = 0.0f;
+    float predictorSeedClampedAngularRateRadPerSec = 0.0f;
+    float predictorSeedConfidenceFlags = 0.0f;
 };
 
-static double EstimateHorizontalVelocityMps(const FilteredState &state) {
-    const double verticalVelocity = static_cast<double>(state.velocity[2]);
-    const double cosZenith = std::cos(static_cast<double>(state.zenith));
-    const double clampedCosZenith = std::clamp(cosZenith, 0.1, 1.0);
-    const double speedAlongAxis = verticalVelocity / clampedCosZenith;
-    const double speedSquared = speedAlongAxis * speedAlongAxis;
-    const double verticalSquared = verticalVelocity * verticalVelocity;
-    const double horizontalSquared = speedSquared - verticalSquared;
-    return (horizontalSquared > 0.0) ? std::sqrt(horizontalSquared) : 0.0;
+struct RetryState {
+    uint32_t nextAttemptMs = 0;
+    uint32_t retryDelayMs = kRecoveryRetryInitialMs;
+    uint32_t attempts = 0;
+    bool failureLogged = false;
+};
+
+struct TimingStats {
+    uint32_t maxLoopUs = 0;
+    uint32_t maxSensorAcquireUs = 0;
+    uint32_t maxEstimatorUs = 0;
+    uint32_t maxActuationPredictorUs = 0;
+    uint32_t maxLoggerServiceUs = 0;
+};
+
+static RetryState g_dataLoggerRetry;
+static RetryState g_bnoRetry;
+static RetryState g_bmpRetry;
+static uint32_t g_lastTimingLogMs = 0;
+static TimingStats g_timingStats;
+
+static void UpdateMaxTiming(uint32_t sampleUs, uint32_t &targetUs) {
+    if (sampleUs > targetUs) {
+        targetUs = sampleUs;
+    }
+}
+
+static bool ServiceRetry(uint32_t nowMs,
+                         RetryState &retry,
+                         bool alreadyReady,
+                         bool (*initializer)(),
+                         const char *name) {
+    if (alreadyReady) {
+        return true;
+    }
+    if (nowMs < retry.nextAttemptMs) {
+        return false;
+    }
+
+    ++retry.attempts;
+    const bool ok = initializer();
+    if (ok) {
+        if (retry.failureLogged) {
+            LOG_PRINT("[recovery] ");
+            LOG_PRINT(name);
+            LOG_PRINT(" recovered after attempts=");
+            LOG_PRINTLN(retry.attempts);
+        }
+        retry = RetryState{};
+        return true;
+    }
+
+    LOG_PRINT("[recovery] ");
+    LOG_PRINT(name);
+    LOG_PRINT(" init failed attempt=");
+    LOG_PRINTLN(retry.attempts);
+    retry.failureLogged = true;
+    retry.nextAttemptMs = nowMs + retry.retryDelayMs;
+    retry.retryDelayMs = std::min(retry.retryDelayMs + kRecoveryRetryStepMs, kRecoveryRetryMaxMs);
+    return false;
+}
+
+static void LogTimingDiagnostics(uint32_t nowMs) {
+    if ((nowMs - g_lastTimingLogMs) < kTimingLogIntervalMs) {
+        return;
+    }
+    g_lastTimingLogMs = nowMs;
+
+    const DataLoggerDiagnostics logger = DataLoggerGetDiagnostics();
+    LOG_PRINT("[timing] loop_us=");
+    LOG_PRINT(g_timingStats.maxLoopUs);
+    LOG_PRINT(" sensor_us=");
+    LOG_PRINT(g_timingStats.maxSensorAcquireUs);
+    LOG_PRINT(" est_us=");
+    LOG_PRINT(g_timingStats.maxEstimatorUs);
+    LOG_PRINT(" act_us=");
+    LOG_PRINT(g_timingStats.maxActuationPredictorUs);
+    LOG_PRINT(" log_us=");
+    LOG_PRINT(g_timingStats.maxLoggerServiceUs);
+    LOG_PRINT(" sd_write_us=");
+    LOG_PRINT(logger.maxWriteDurationUs);
+    LOG_PRINT(" sd_sync_us=");
+    LOG_PRINT(logger.maxSyncDurationUs);
+    LOG_PRINT(" log_drop=");
+    LOG_PRINT(logger.droppedTelemetryRecords);
+    LOG_PRINT(" log_buf=");
+    LOG_PRINT(static_cast<unsigned long>(logger.bufferedBytes));
+    LOG_PRINT(" sensors=");
+    LOG_PRINT(Bno085SensorIsInitialized() ? "bno" : "-");
+    LOG_PRINT('/');
+    LOG_PRINT(Bmp585SensorIsInitialized() ? "bmp" : "-");
+    LOG_PRINT(" logger=");
+    LOG_PRINT(logger.initialized ? "ok" : "down");
+    LOG_PRINTLN("");
+
+    g_timingStats = TimingStats{};
 }
 
 static float ComputeAutoActuationCommandDeg(uint32_t nowMs,
@@ -507,28 +537,42 @@ static float ComputeAutoActuationCommandDeg(uint32_t nowMs,
         telemetry->bestPredictedApogeeM = std::numeric_limits<float>::quiet_NaN();
         telemetry->bestCost = std::numeric_limits<float>::quiet_NaN();
         telemetry->timeToApogeeS = std::numeric_limits<float>::quiet_NaN();
+        telemetry->predictorSeedHorizontalSpeedMps = 0.0f;
+        telemetry->predictorSeedClampedZenithRad = 0.0f;
+        telemetry->predictorSeedClampedAngularRateRadPerSec = 0.0f;
+        telemetry->predictorSeedConfidenceFlags = 0.0f;
     }
 
     double angularRate = 0.0;
+    double dtSeconds = 0.0;
     if (g_actuationHasLastZenithSample) {
-        const double dt = static_cast<double>(state.time) - static_cast<double>(g_actuationLastStateTime);
-        if (dt > 1.0e-4) {
+        dtSeconds = static_cast<double>(state.time) - static_cast<double>(g_actuationLastStateTime);
+        if (dtSeconds > 1.0e-4) {
             angularRate =
-                (static_cast<double>(state.zenith) - static_cast<double>(g_actuationLastZenithRad)) / dt;
+                (static_cast<double>(state.zenith) - static_cast<double>(g_actuationLastZenithRad)) / dtSeconds;
         }
     }
     g_actuationHasLastZenithSample = true;
     g_actuationLastZenithRad = state.zenith;
     g_actuationLastStateTime = state.time;
+    angularRate = ClampPredictorAngularRate(angularRate);
 
     const bool canControl =
         g_actuationPredictorReady && (status == FlightStatus::Burn || status == FlightStatus::Coast) &&
         state.velocity[2] > 0.0f;
+    uint32_t predictorSeedFlags = 0;
+    if (status == FlightStatus::Burn || status == FlightStatus::Coast) {
+        predictorSeedFlags |= kPredictorSeedFlagControlActive;
+    }
+    if (state.velocity[2] > 0.0f) {
+        predictorSeedFlags |= kPredictorSeedFlagPositiveVerticalVelocity;
+    }
     const float timeToApogeeS = std::max(0.0f, state.velocity[2] / static_cast<float>(constants::kGravity));
     if (telemetry != nullptr) {
         telemetry->timeToApogeeS = timeToApogeeS;
     }
     if (!canControl) {
+        ResetPredictorHorizontalVelocityTracker(g_actuationPredictorHorizontalVelocity);
         g_actuationLastCommandDeg = 0.0f;
         if (telemetry != nullptr) {
             telemetry->autoCommandDeg = 0.0f;
@@ -542,14 +586,42 @@ static float ComputeAutoActuationCommandDeg(uint32_t nowMs,
     }
     g_actuationHasLastControlUpdate = true;
     g_actuationLastControlUpdateMs = nowMs;
+    const double predictorHorizontalVelocity = UpdatePredictorHorizontalSpeed(
+        g_actuationPredictorHorizontalVelocity,
+        static_cast<double>(state.inertialAcceleration[0]),
+        static_cast<double>(state.inertialAcceleration[1]),
+        dtSeconds,
+        status == FlightStatus::Burn || status == FlightStatus::Coast,
+        static_cast<double>(state.velocity[2]),
+        static_cast<double>(state.zenith));
+    predictorSeedFlags |= kPredictorSeedFlagUsingHorizontalModel;
+    const double clampedZenith = ClampPredictorZenithRadians(static_cast<double>(state.zenith));
+    const double clampedAngularRate = ClampPredictorAngularRate(angularRate);
+    const double horizontalSpeedCap =
+        PredictorHorizontalSpeedCap(static_cast<double>(state.velocity[2]), static_cast<double>(state.zenith));
+    if (std::fabs(clampedZenith - static_cast<double>(state.zenith)) > 1.0e-9) {
+        predictorSeedFlags |= kPredictorSeedFlagZenithClamped;
+    }
+    if (std::fabs(clampedAngularRate - angularRate) > 1.0e-9) {
+        predictorSeedFlags |= kPredictorSeedFlagAngularRateClamped;
+    }
+    if (predictorHorizontalVelocity >= (horizontalSpeedCap - 1.0e-6)) {
+        predictorSeedFlags |= kPredictorSeedFlagHorizontalSpeedCapped;
+    }
+    if (telemetry != nullptr) {
+        telemetry->predictorSeedHorizontalSpeedMps = static_cast<float>(predictorHorizontalVelocity);
+        telemetry->predictorSeedClampedZenithRad = static_cast<float>(clampedZenith);
+        telemetry->predictorSeedClampedAngularRateRadPerSec = static_cast<float>(clampedAngularRate);
+        telemetry->predictorSeedConfidenceFlags = static_cast<float>(predictorSeedFlags);
+    }
 
     ApogeeState predictorState;
     predictorState.altitudeMeters = static_cast<double>(state.position[2]);
     predictorState.horizontalDistanceMeters = 0.0;
     predictorState.verticalVelocity = static_cast<double>(state.velocity[2]);
-    predictorState.horizontalVelocity = EstimateHorizontalVelocityMps(state);
-    predictorState.zenith = static_cast<double>(state.zenith);
-    predictorState.angularVelocity = angularRate;
+    predictorState.horizontalVelocity = predictorHorizontalVelocity;
+    predictorState.zenith = clampedZenith;
+    predictorState.angularVelocity = clampedAngularRate;
 
     const double targetApogeeMeters = settings::flight::kApogeeTargetMeters;
     const double deadbandMeters = static_cast<double>(settings::actuation::kApogeeErrorDeadbandMeters);
@@ -633,7 +705,9 @@ static float ComputeAutoActuationCommandDeg(uint32_t nowMs,
 }
 
 static void ServiceStatusLeds(uint32_t nowMs, bool manualOverrideActive) {
-    StatusLedsSetFault(!DataLoggerIsInitialized());
+    const bool faultActive =
+        !DataLoggerIsInitialized() || (!g_csvReplay.enabled && !Bno085SensorIsInitialized() && !Bmp585SensorIsInitialized());
+    StatusLedsSetFault(faultActive);
     StatusLedsSetFlightStatus(flightComputer.Status());
     StatusLedsSetComms(NetworkTelemetryConnected(), NetworkTelemetrySubscriberActive());
     StatusLedsSetManualOverride(manualOverrideActive);
@@ -723,21 +797,19 @@ void setup() {
     LogSetupCheckpoint("flap servos initialized");
 
     LogSetupCheckpoint("starting data logger init");
-    InitializeWithRecovery(SystemError::DataLoggerInitialization,
-                           &DataLoggerBegin,
-                           "Sensor logging is disabled.");
-    LogSetupCheckpoint("data logger init complete");
+    ServiceRetry(millis(), g_dataLoggerRetry, DataLoggerIsInitialized(), &DataLoggerBegin, "data_logger");
+    LogSetupCheckpoint(DataLoggerIsInitialized() ? "data logger init complete" : "data logger unavailable");
 
     LogSetupCheckpoint("checking CSV replay");
-    CsvReplayInit();
+    if (DataLoggerIsInitialized()) {
+        CsvReplayInit();
+    }
     LogSetupCheckpoint(g_csvReplay.enabled ? "CSV replay active" : "CSV replay disabled");
 
     if (!g_csvReplay.enabled) {
         LogSetupCheckpoint("starting BNO085 init");
-        InitializeWithRecovery(SystemError::BnoInitialization,
-                               &Bno085SensorBegin,
-                               "Failed to initialize BNO085 sensor.");
-        LogSetupCheckpoint("BNO085 init complete");
+        ServiceRetry(millis(), g_bnoRetry, Bno085SensorIsInitialized(), &Bno085SensorBegin, "bno085");
+        LogSetupCheckpoint(Bno085SensorIsInitialized() ? "BNO085 init complete" : "BNO085 unavailable");
 
         // ICM-20948 disabled for now.
         // LogSetupCheckpoint("starting ICM-20948 init");
@@ -747,10 +819,8 @@ void setup() {
         // LogSetupCheckpoint("ICM-20948 init complete");
 
         LogSetupCheckpoint("starting BMP585 init");
-        InitializeWithRecovery(SystemError::BmpInitialization,
-                               &Bmp585SensorBegin,
-                               "Failed to initialize BMP585 sensor.");
-        LogSetupCheckpoint("BMP585 init complete");
+        ServiceRetry(millis(), g_bmpRetry, Bmp585SensorIsInitialized(), &Bmp585SensorBegin, "bmp585");
+        LogSetupCheckpoint(Bmp585SensorIsInitialized() ? "BMP585 init complete" : "BMP585 unavailable");
 
         // Secondary barometer disabled for now.
         // LogSetupCheckpoint("starting MS5611 init");
@@ -822,14 +892,30 @@ void setup() {
     g_actuationHasLastControlUpdate = false;
     g_actuationLastControlUpdateMs = 0;
     g_actuationLastCommandDeg = 0.0f;
+    ResetPredictorHorizontalVelocityTracker(g_actuationPredictorHorizontalVelocity);
+    g_lastTimingLogMs = 0;
+    g_timingStats = TimingStats{};
     LogSetupCheckpoint("playing startup buzzer");
     PlayStartupMarch();
     LogSetupCheckpoint("setup complete");
 }
 
 void loop() {
+    const uint32_t loopStartUs = micros();
     const uint32_t nowMs = millis();
     NetworkTelemetryPollControl();
+
+    if (!g_csvReplay.enabled) {
+        ServiceRetry(nowMs, g_dataLoggerRetry, DataLoggerIsInitialized(), &DataLoggerBegin, "data_logger");
+        if (kEnableCsvReplay && DataLoggerIsInitialized() && !g_csvReplay.enabled && !g_csvReplay.completed) {
+            CsvReplayInit();
+        }
+    }
+
+    if (!g_csvReplay.enabled) {
+        ServiceRetry(nowMs, g_bnoRetry, Bno085SensorIsInitialized(), &Bno085SensorBegin, "bno085");
+        ServiceRetry(nowMs, g_bmpRetry, Bmp585SensorIsInitialized(), &Bmp585SensorBegin, "bmp585");
+    }
 
     if (g_servoCycleTestMode) {
         ServiceStatusLeds(nowMs, false);
@@ -843,20 +929,21 @@ void loop() {
             g_lastNoLoggerLogMs = nowMs;
         }
         ServiceStatusLeds(nowMs, false);
-        InitializeWithRecovery(SystemError::DataLoggerInitialization,
-                               &DataLoggerBegin,
-                               "Data logger unavailable. Retrying...");
-        return;
     }
 
     SensorData data;
-    if (!AcquireSensorData(data)) {
+    const uint32_t sensorAcquireStartUs = micros();
+    const bool hasSensorData = AcquireSensorData(data);
+    UpdateMaxTiming(micros() - sensorAcquireStartUs, g_timingStats.maxSensorAcquireUs);
+    if (!hasSensorData) {
         if ((nowMs - g_lastNoDataLogMs) >= settings::flight::kDebugHeartbeatIntervalMs) {
             LogSetupCheckpoint("waiting for sensor data");
             g_lastNoDataLogMs = nowMs;
         }
         ServiceStatusLeds(nowMs, false);
-        delay(1);
+        DataLoggerService();
+        UpdateMaxTiming(micros() - loopStartUs, g_timingStats.maxLoopUs);
+        LogTimingDiagnostics(nowMs);
         return;
     }
 
@@ -885,17 +972,21 @@ void loop() {
         flapTransientActive ? settings::actuation::kBaroDeweightSigmaScale : 1.0f;
 
     FilteredState state;
+    const uint32_t estimatorStartUs = micros();
     const bool hasFilteredState = flightComputer.Update(data, state);
+    UpdateMaxTiming(micros() - estimatorStartUs, g_timingStats.maxEstimatorUs);
     float manualOverrideDeg = 0.0f;
     const bool manualOverrideActive = NetworkTelemetryManualActuationOverride(manualOverrideDeg);
     manualOverrideDeg = ClampFloat(manualOverrideDeg, 0.0f, kServoMaxActuationDeg);
 
     AutoActuationTelemetry autoTelemetry;
     float autoCommandDeg = 0.0f;
+    const uint32_t actuationPredictorStartUs = micros();
     if (hasFilteredState) {
         autoCommandDeg =
             ComputeAutoActuationCommandDeg(nowMs, state, flightComputer.Status(), g_servoEffectiveDeg, &autoTelemetry);
     }
+    UpdateMaxTiming(micros() - actuationPredictorStartUs, g_timingStats.maxActuationPredictorUs);
     float commandedActuationDeg = 0.0f;
     if (manualOverrideActive) {
         commandedActuationDeg = manualOverrideDeg;
@@ -911,6 +1002,10 @@ void loop() {
     data.optimizerBestCost = autoTelemetry.bestCost;
     data.optimizerTimeToApogeeS = autoTelemetry.timeToApogeeS;
     data.actuationIsSettling = g_flapActuator.IsSettling() ? 1.0f : 0.0f;
+    data.predictorSeedHorizontalSpeedMps = autoTelemetry.predictorSeedHorizontalSpeedMps;
+    data.predictorSeedClampedZenithRad = autoTelemetry.predictorSeedClampedZenithRad;
+    data.predictorSeedClampedAngularRateRadPerSec = autoTelemetry.predictorSeedClampedAngularRateRadPerSec;
+    data.predictorSeedConfidenceFlags = autoTelemetry.predictorSeedConfidenceFlags;
 
     if (!g_csvReplay.enabled) {
         DataLoggerLogTelemetry(data, flightComputer.Status(), hasFilteredState ? &state : nullptr);
@@ -993,5 +1088,9 @@ void loop() {
     NetworkTelemetryService(telemetrySnapshot);
     ServiceStatusLeds(nowMs, manualOverrideActive);
 
+    const uint32_t loggerServiceStartUs = micros();
     DataLoggerService();
+    UpdateMaxTiming(micros() - loggerServiceStartUs, g_timingStats.maxLoggerServiceUs);
+    UpdateMaxTiming(micros() - loopStartUs, g_timingStats.maxLoopUs);
+    LogTimingDiagnostics(nowMs);
 }

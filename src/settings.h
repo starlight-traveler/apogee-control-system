@@ -13,6 +13,10 @@
 #define DATA_LOGGER_FLUSH_INTERVAL_US 50000
 #endif
 
+#ifndef DATA_LOGGER_SYNC_INTERVAL_US
+#define DATA_LOGGER_SYNC_INTERVAL_US 1000000
+#endif
+
 #ifndef APOGEE_PREDICTOR_MAX_STEPS
 #define APOGEE_PREDICTOR_MAX_STEPS 256
 #endif
@@ -27,6 +31,8 @@ namespace build {
 constexpr size_t kDataLoggerBufferSize = DATA_LOGGER_BUFFER_SIZE;
 // Minimum elapsed time between forced log buffer flushes (microseconds).
 constexpr uint32_t kDataLoggerFlushIntervalUs = DATA_LOGGER_FLUSH_INTERVAL_US;
+// Minimum elapsed time between SD metadata sync calls during nominal flight.
+constexpr uint32_t kDataLoggerSyncIntervalUs = DATA_LOGGER_SYNC_INTERVAL_US;
 }
 
 // ---------------------------------------------------------------------------
@@ -234,6 +240,10 @@ constexpr uint32_t kErrorBlinkIntervalMs = 120;
 constexpr uint32_t kRecoveryBlinkIntervalMs = 60;
 constexpr uint32_t kDebugHeartbeatIntervalMs = 1000;
 constexpr uint32_t kStateLogIntervalMs = 250;
+constexpr uint32_t kRecoveryRetryInitialMs = 200;
+constexpr uint32_t kRecoveryRetryStepMs = 200;
+constexpr uint32_t kRecoveryRetryMaxMs = 2000;
+constexpr uint32_t kTimingLogIntervalMs = 1000;
 
 constexpr float kDefaultDtSeconds = 0.03f;
 constexpr float kLiftoffAccelerationThresholdMps2 = 20.0f;
@@ -255,6 +265,16 @@ constexpr double kSigmaAltimeter = 1.0;
 constexpr double kProcessNoiseXY = 0.6;
 constexpr double kProcessNoiseZ = 1.2;
 constexpr double kApogeeTargetMeters = 1700;
+// Predictor-only horizontal speed seed tuning. These values intentionally keep
+// XY speed conservative because the estimator does not have a horizontal
+// position/velocity measurement update.
+constexpr float kPredictorHorizontalAccelLimitMps2 = 12.0f;
+constexpr float kPredictorHorizontalDecayTauSeconds = 1.75f;
+constexpr float kPredictorMaxSeedZenithDeg = 20.0f;
+constexpr float kPredictorMaxSeedAngularRateRadPerSec = 1.5f;
+constexpr float kPredictorMaxHorizontalSpeedMps = 65.0f;
+constexpr float kPredictorMinHorizontalSpeedCapMps = 6.0f;
+constexpr float kPredictorHorizontalSpeedMarginMps = 3.0f;
 
 constexpr int kApogeePredictorMaxSteps = APOGEE_PREDICTOR_MAX_STEPS;
 }

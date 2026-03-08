@@ -118,9 +118,9 @@ bool Bmp585SensorBegin() {
 
     SPI.begin();
 
-    while (!g_pressureSensor.begin(kChipSelectPin, &SPI)) {
+    if (!g_pressureSensor.begin(kChipSelectPin, &SPI)) {
         LOG_PRINTLN("Error: BMP585 not connected over SPI, check wiring and CS pin.");
-        delay(1000);
+        return false;
     }
 
     LOG_PRINTLN("BMP585 connected!");
@@ -188,6 +188,10 @@ bool Bmp585SensorAcquire(SensorData &out) {
     }
 
     return true;
+}
+
+bool Bmp585SensorIsInitialized() {
+    return g_initialized;
 }
 
 BarometerDiagnostics Bmp585SensorGetDiagnostics() {

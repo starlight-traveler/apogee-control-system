@@ -5,4 +5,5 @@
 
 bool Bmp585SensorBegin();
 bool Bmp585SensorAcquire(SensorData &out);
+bool Bmp585SensorIsInitialized();
 BarometerDiagnostics Bmp585SensorGetDiagnostics();

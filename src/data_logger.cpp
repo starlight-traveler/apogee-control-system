@@ -18,14 +18,18 @@ constexpr size_t kBufferSize = settings::build::kDataLoggerBufferSize;
 alignas(uint32_t) uint8_t g_buffer[kBufferSize];
 size_t g_bufferPosition = 0;
 uint32_t g_lastFlushMicros = 0;
+uint32_t g_lastSyncMicros = 0;
 bool g_loggerInitialized = false;
+bool g_syncPending = false;
+DataLoggerDiagnostics g_diagnostics;
 
 constexpr uint32_t kFlushIntervalMicros = settings::build::kDataLoggerFlushIntervalUs;
+constexpr uint32_t kSyncIntervalMicros = settings::build::kDataLoggerSyncIntervalUs;
 
 constexpr const char *kLogPrefix = "SENS";
 constexpr const char *kLogExtension = "BIN";
 constexpr uint16_t kLogFileFormatVersion = 1;
-constexpr uint16_t kLogSchemaVersion = 3;
+constexpr uint16_t kLogSchemaVersion = 4;
 constexpr uint8_t kLogMagic[8] = {'A', 'C', 'S', 'N', 'D', 'R', 'T', '1'};
 
 #if defined(ACS_FIRMWARE_GIT_HASH)
@@ -34,9 +38,9 @@ constexpr const char *kFirmwareGitHash = ACS_FIRMWARE_GIT_HASH;
 constexpr const char *kFirmwareGitHash = "unknown";
 #endif
 
-static_assert(sizeof(SensorData) == 120, "SensorData size mismatch.");
+static_assert(sizeof(SensorData) == 136, "SensorData size mismatch.");
 static_assert(sizeof(FilteredState) == 60, "FilteredState size mismatch.");
-static_assert(sizeof(TelemetryLogRecord) == 184, "TelemetryLogRecord size mismatch.");
+static_assert(sizeof(TelemetryLogRecord) == 200, "TelemetryLogRecord size mismatch.");
 static_assert(sizeof(EventLogRecord) == 20, "EventLogRecord size mismatch.");
 static_assert(sizeof(LogFilePreamble) == 64, "LogFilePreamble size mismatch.");
 
@@ -47,30 +51,68 @@ static_assert(std::is_trivially_copyable<TelemetryLogRecord>::value,
 static_assert(std::is_trivially_copyable<EventLogRecord>::value,
               "EventLogRecord must be trivially copyable.");
 
-bool FlushBuffer() {
-    if (!g_loggerInitialized || g_bufferPosition == 0) {
+void UpdateMax(uint32_t sample, uint32_t &maximum) {
+    if (sample > maximum) {
+        maximum = sample;
+    }
+}
+
+void FailLogger() {
+    g_logFile.close();
+    g_loggerInitialized = false;
+    g_syncPending = false;
+    g_bufferPosition = 0;
+    g_diagnostics.initialized = false;
+    g_diagnostics.syncPending = false;
+    g_diagnostics.bufferedBytes = 0;
+}
+
+bool SyncFile() {
+    if (!g_loggerInitialized || !g_syncPending) {
         return true;
     }
-
-    const size_t bytesWritten = g_logFile.write(g_buffer, g_bufferPosition);
-    if (bytesWritten != g_bufferPosition) {
-        g_logFile.close();
-        g_loggerInitialized = false;
-        return false;
-    }
-
+    const uint32_t startMicros = micros();
     if (!g_logFile.sync()) {
-        g_logFile.close();
-        g_loggerInitialized = false;
+        FailLogger();
         return false;
     }
-
-    g_bufferPosition = 0;
-    g_lastFlushMicros = micros();
+    const uint32_t durationUs = micros() - startMicros;
+    g_lastSyncMicros = micros();
+    g_syncPending = false;
+    g_diagnostics.lastSyncDurationUs = durationUs;
+    UpdateMax(durationUs, g_diagnostics.maxSyncDurationUs);
+    g_diagnostics.syncPending = false;
     return true;
 }
 
-bool AppendRecord(const void *record, size_t size) {
+bool FlushBuffer(bool requestSync) {
+    if (!g_loggerInitialized || g_bufferPosition == 0) {
+        if (requestSync) {
+            g_syncPending = true;
+            g_diagnostics.syncPending = true;
+        }
+        return true;
+    }
+
+    const uint32_t startMicros = micros();
+    const size_t bytesWritten = g_logFile.write(g_buffer, g_bufferPosition);
+    if (bytesWritten != g_bufferPosition) {
+        FailLogger();
+        return false;
+    }
+    const uint32_t durationUs = micros() - startMicros;
+    g_diagnostics.lastWriteDurationUs = durationUs;
+    UpdateMax(durationUs, g_diagnostics.maxWriteDurationUs);
+
+    g_bufferPosition = 0;
+    g_lastFlushMicros = micros();
+    g_syncPending = g_syncPending || requestSync;
+    g_diagnostics.syncPending = g_syncPending;
+    g_diagnostics.bufferedBytes = 0;
+    return true;
+}
+
+bool AppendRecord(const void *record, size_t size, bool highPriority) {
     if (!g_loggerInitialized) {
         return false;
     }
@@ -80,13 +122,19 @@ bool AppendRecord(const void *record, size_t size) {
     }
 
     if (g_bufferPosition + size > kBufferSize) {
-        if (!FlushBuffer()) {
+        if (!highPriority) {
+            ++g_diagnostics.droppedTelemetryRecords;
+            return true;
+        }
+        if (!FlushBuffer(false)) {
+            ++g_diagnostics.appendFailures;
             return false;
         }
     }
 
     memcpy(g_buffer + g_bufferPosition, record, size);
     g_bufferPosition += size;
+    g_diagnostics.bufferedBytes = g_bufferPosition;
     return true;
 }
 
@@ -114,7 +162,11 @@ bool WriteLogPreamble() {
     if (bytesWritten != sizeof(preamble)) {
         return false;
     }
-    return g_logFile.sync();
+    if (!g_logFile.sync()) {
+        return false;
+    }
+    g_lastSyncMicros = micros();
+    return true;
 }
 
 }  // namespace
@@ -149,8 +201,12 @@ bool DataLoggerBegin() {
 
     g_bufferPosition = 0;
     g_lastFlushMicros = micros();
+    g_lastSyncMicros = g_lastFlushMicros;
+    g_syncPending = false;
+    g_diagnostics = DataLoggerDiagnostics{};
 
     g_loggerInitialized = true;
+    g_diagnostics.initialized = true;
     LOG_PRINT("Logging sensor data to ");
     LOG_PRINTLN(filename);
     return true;
@@ -170,7 +226,7 @@ void DataLoggerLogTelemetry(const SensorData &sensor, FlightStatus status, const
         record.state = *state;
     }
 
-    if (!AppendRecord(&record, sizeof(record))) {
+    if (!AppendRecord(&record, sizeof(record), false)) {
         LOG_PRINTLN("Failed to append telemetry record to log.");
     }
 }
@@ -194,8 +250,25 @@ void DataLoggerLogEvent(FlightEventType type,
     record.verticalVelocity = verticalVelocity;
     record.apogeeEstimate = apogeeEstimate;
 
-    if (!AppendRecord(&record, sizeof(record))) {
+    if (!AppendRecord(&record, sizeof(record), true)) {
         LOG_PRINTLN("Failed to append event record to log.");
+        return;
+    }
+    if (!FlushBuffer(true)) {
+        LOG_PRINTLN("Failed to flush event record to log.");
+    }
+}
+
+void DataLoggerForceSync() {
+    if (!g_loggerInitialized) {
+        return;
+    }
+    if (g_bufferPosition > 0 && !FlushBuffer(true)) {
+        LOG_PRINTLN("Failed to flush sensor log buffer before sync.");
+        return;
+    }
+    if (!SyncFile()) {
+        LOG_PRINTLN("Failed to sync sensor log.");
     }
 }
 
@@ -205,21 +278,30 @@ void DataLoggerService() {
     }
 
     const uint32_t now = micros();
-    if (g_bufferPosition == 0) {
-        return;
+    if (g_bufferPosition > 0 &&
+        ((now - g_lastFlushMicros) >= kFlushIntervalMicros || g_bufferPosition >= kBufferSize)) {
+        if (!FlushBuffer(false)) {
+            LOG_PRINTLN("Failed to flush sensor log buffer.");
+            return;
+        }
     }
 
-    if ((now - g_lastFlushMicros < kFlushIntervalMicros) && g_bufferPosition < kBufferSize) {
-        return;
-    }
-
-    if (!FlushBuffer()) {
-        LOG_PRINTLN("Failed to flush sensor log buffer.");
+    if (g_syncPending && (now - g_lastSyncMicros) >= kSyncIntervalMicros) {
+        if (!SyncFile()) {
+            LOG_PRINTLN("Failed to sync sensor log.");
+        }
     }
 }
 
 bool DataLoggerIsInitialized() {
     return g_loggerInitialized;
+}
+
+DataLoggerDiagnostics DataLoggerGetDiagnostics() {
+    g_diagnostics.initialized = g_loggerInitialized;
+    g_diagnostics.syncPending = g_syncPending;
+    g_diagnostics.bufferedBytes = g_bufferPosition;
+    return g_diagnostics;
 }
 
 bool DataLoggerReadTextFile(const char *path, bool (*lineCallback)(const char *line, void *context), void *context) {

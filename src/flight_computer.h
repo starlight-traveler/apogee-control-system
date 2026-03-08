@@ -6,6 +6,7 @@
 #include "environment_model.h"
 #include "kalman_filters.h"
 #include "math_utils.h"
+#include "predictor_seed.h"
 
 // Data structures mirroring the layout of the Python flight.py script.
 
@@ -25,6 +26,10 @@ struct SensorData {
     float optimizerBestCost = 0.0f;
     float optimizerTimeToApogeeS = 0.0f;
     float actuationIsSettling = 0.0f;
+    float predictorSeedHorizontalSpeedMps = 0.0f;
+    float predictorSeedClampedZenithRad = 0.0f;
+    float predictorSeedClampedAngularRateRadPerSec = 0.0f;
+    float predictorSeedConfidenceFlags = 0.0f;
     bool hasQuaternion = false;
     bool hasIcmQuaternion = false;
     bool hasIcmYpr = false;
@@ -106,6 +111,7 @@ class FlightComputer {
     bool outputFilterInitialized_ = false;
     double smoothedVelocity_[3] = {0.0, 0.0, 0.0};
     double smoothedAcceleration_[3] = {0.0, 0.0, 0.0};
+    PredictorHorizontalVelocityTracker predictorHorizontalVelocity_;
 
 };
 

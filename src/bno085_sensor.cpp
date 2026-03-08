@@ -62,20 +62,16 @@ bool RecoverSensor(const char *reason) {
         LOG_PRINTLN(reason);
     }
 
-    for (uint8_t attempt = 0; attempt < kInitializationAttempts; ++attempt) {
-        if (StartSensorTransport()) {
-            g_initialized = true;
-            LOG_PRINT("BNO055 online after attempt ");
-            LOG_PRINTLN(static_cast<unsigned>(attempt + 1));
-            return true;
-        }
-
-        LOG_PRINT("BNO055 init retry ");
-        LOG_PRINT(static_cast<unsigned>(attempt + 1));
-        LOG_PRINT("/");
-        LOG_PRINTLN(static_cast<unsigned>(kInitializationAttempts));
-        delay(kRetryDelayMs * (attempt + 1));
+    if (StartSensorTransport()) {
+        g_initialized = true;
+        LOG_PRINTLN("BNO055 online");
+        return true;
     }
+    LOG_PRINT("BNO055 init failed; caller will retry (attempt budget=");
+    LOG_PRINT(static_cast<unsigned>(kInitializationAttempts));
+    LOG_PRINT(", retry delay ms=");
+    LOG_PRINT(kRetryDelayMs);
+    LOG_PRINTLN(")");
     return false;
 }
 
@@ -146,4 +142,8 @@ bool Bno085SensorAcquire(SensorData &out) {
 
     PopulateOutput(out, nowUs);
     return true;
+}
+
+bool Bno085SensorIsInitialized() {
+    return g_initialized;
 }

@@ -47,8 +47,8 @@ cmake --build tools/build --target run_gui
 
 ## Native C++ GUI
 
-For a native C++ GUI (Dear ImGui/OpenGL), use `local-imgui-telemetry` via the
-same tools CMake workspace:
+For a native C++ GUI (Dear ImGui/OpenGL), use `telemetry/imgui` via the same
+tools CMake workspace:
 
 ```bash
 cmake -S tools -B tools/build
@@ -65,6 +65,17 @@ For offline CSV/BIN analysis (range graphing, signal picker, event markers):
 ```bash
 cmake --build tools/build --target run_native_decoder_gui
 tools/build/bin/acs_ndrt_rocketry_decoder path/to/SENS010.BIN
+```
+
+## Hosted Replay
+
+The hosted replay executable now lives under `tools/replay` and is built from
+the same native tools workspace:
+
+```bash
+cmake -S tools -B tools/build -DACS_TOOLS_ENABLE_NATIVE_CPP_GUI=OFF
+cmake --build tools/build --target acs_replay -j
+tools/build/bin/acs_replay tools/replay/output.csv
 ```
 
 ## tui_dashboard.py

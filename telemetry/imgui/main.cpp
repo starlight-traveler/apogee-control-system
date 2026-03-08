@@ -37,7 +37,7 @@
 #include <imgui_impl_glfw.h>
 #include <imgui_impl_opengl3.h>
 
-#include "../include/telemetry_packet.h"
+#include "../../include/telemetry_packet.h"
 
 namespace {
 
@@ -50,6 +50,20 @@ struct SharedTelemetry {
     std::chrono::steady_clock::time_point lastRx = std::chrono::steady_clock::time_point::min();
 };
 
+struct ServoCalibrationPoint {
+    float angleDeg;
+    int topPwmUs;
+    int bottomPwmUs;
+};
+
+constexpr std::array<ServoCalibrationPoint, 20> kServoCalibrationTable = {{
+    {0.0f, 1090, 1967},  {3.2f, 1122, 1935},  {6.3f, 1154, 1903},  {9.5f, 1186, 1871},
+    {12.6f, 1218, 1839}, {15.8f, 1250, 1807}, {18.9f, 1282, 1775}, {22.1f, 1315, 1742},
+    {25.3f, 1347, 1710}, {28.4f, 1379, 1678}, {31.6f, 1411, 1646}, {34.7f, 1443, 1614},
+    {37.9f, 1475, 1582}, {41.1f, 1507, 1550}, {44.2f, 1539, 1518}, {47.4f, 1571, 1486},
+    {50.5f, 1603, 1454}, {53.7f, 1636, 1421}, {56.8f, 1668, 1389}, {60.0f, 1700, 1355},
+}};
+
 float ClampFloat(float value, float minValue, float maxValue) {
     if (value < minValue) {
         return minValue;
@@ -58,6 +72,20 @@ float ClampFloat(float value, float minValue, float maxValue) {
         return maxValue;
     }
     return value;
+}
+
+float SnapToServoLookupAngle(float angleDeg) {
+    const float clamped = ClampFloat(angleDeg, 0.0f, 60.0f);
+    float bestAngle = kServoCalibrationTable[0].angleDeg;
+    float bestDistance = std::fabs(clamped - bestAngle);
+    for (const ServoCalibrationPoint &point : kServoCalibrationTable) {
+        const float distance = std::fabs(clamped - point.angleDeg);
+        if (distance < bestDistance) {
+            bestDistance = distance;
+            bestAngle = point.angleDeg;
+        }
+    }
+    return bestAngle;
 }
 
 std::string TrimString(const std::string &value) {
@@ -482,8 +510,14 @@ class UdpReceiver {
 
     void SetActuationOverride(bool enabled, float angleDeg) {
         std::lock_guard<std::mutex> lock(commandMutex_);
+        const float snappedAngleDeg = enabled ? SnapToServoLookupAngle(angleDeg) : 0.0f;
+        const bool changed = (manualActuationOverride_ != enabled) ||
+                             (std::fabs(manualActuationAngleDeg_ - snappedAngleDeg) > 1.0e-3f);
         manualActuationOverride_ = enabled;
-        manualActuationAngleDeg_ = ClampFloat(angleDeg, 0.0f, 60.0f);
+        manualActuationAngleDeg_ = snappedAngleDeg;
+        if (changed) {
+            sendActuationImmediately_ = true;
+        }
     }
 
     void SetTelemetryStreamingEnabled(bool enabled) {
@@ -552,8 +586,16 @@ class UdpReceiver {
                        sizeof(teensyAddr_));
                 lastHeartbeatSent_ = now;
             }
+            bool sendActuationNow = false;
+            {
+                std::lock_guard<std::mutex> lock(commandMutex_);
+                sendActuationNow = sendActuationImmediately_;
+                if (sendActuationImmediately_) {
+                    sendActuationImmediately_ = false;
+                }
+            }
             if (heartbeatEnabled_ &&
-                (now - lastActuationCommandSent_) >= std::chrono::milliseconds(100)) {
+                (sendActuationNow || (now - lastActuationCommandSent_) >= std::chrono::milliseconds(100))) {
                 telemetry::ActuationCommandV1 command{};
                 {
                     std::lock_guard<std::mutex> lock(commandMutex_);
@@ -655,6 +697,7 @@ class UdpReceiver {
     mutable std::mutex commandMutex_;
     bool manualActuationOverride_ = false;
     float manualActuationAngleDeg_ = 0.0f;
+    bool sendActuationImmediately_ = false;
     bool telemetryStreamingEnabled_ = true;
     uint8_t disconnectPacketsRemaining_ = 0;
 };
@@ -926,7 +969,7 @@ int main(int argc, char **argv) {
                 manualActuationAngleDeg = 0.0f;
             } else {
                 manualActuationOverride = true;
-                manualActuationAngleDeg = ClampFloat(voiceCommand.angleDeg, 0.0f, 60.0f);
+                manualActuationAngleDeg = SnapToServoLookupAngle(voiceCommand.angleDeg);
             }
         }
 
@@ -1042,24 +1085,35 @@ int main(int argc, char **argv) {
             ImGui::TextDisabled("%s", telemetryStreamingEnabled ? "telemetry streaming enabled"
                                                                 : "telemetry disabled on Teensy until reboot");
             ImGui::Separator();
-            ImGui::Checkbox("Manual flap override", &manualActuationOverride);
-            ImGui::SliderFloat("Manual angle (deg)", &manualActuationAngleDeg, 0.0f, 60.0f, "%.1f");
+            const bool manualOverrideChanged = ImGui::Checkbox("Manual flap override", &manualActuationOverride);
+            float requestedManualAngleDeg = manualActuationAngleDeg;
+            const bool sliderChanged =
+                ImGui::SliderFloat("Manual angle (deg)", &requestedManualAngleDeg, 0.0f, 60.0f, "%.1f");
+            if (sliderChanged) {
+                manualActuationAngleDeg = SnapToServoLookupAngle(requestedManualAngleDeg);
+                manualActuationOverride = true;
+            } else {
+                manualActuationAngleDeg = SnapToServoLookupAngle(manualActuationAngleDeg);
+            }
             if (ImGui::Button("Deploy 30 deg")) {
                 manualActuationOverride = true;
-                manualActuationAngleDeg = 30.0f;
+                manualActuationAngleDeg = SnapToServoLookupAngle(30.0f);
             }
             ImGui::SameLine();
             if (ImGui::Button("Full 60 deg")) {
                 manualActuationOverride = true;
-                manualActuationAngleDeg = 60.0f;
+                manualActuationAngleDeg = SnapToServoLookupAngle(60.0f);
             }
             if (ImGui::Button("Return To Auto")) {
                 manualActuationOverride = false;
                 manualActuationAngleDeg = 0.0f;
             }
+            if (manualOverrideChanged && manualActuationOverride) {
+                manualActuationAngleDeg = SnapToServoLookupAngle(manualActuationAngleDeg);
+            }
             ImGui::ProgressBar(dashboard.servoGaugeAnimated, ImVec2(-1.0f, 8.0f), "");
             ImGui::Text("Commanded mode: %s", manualActuationOverride ? "manual override" : "auto");
-            ImGui::TextDisabled("Manual setpoint %.1f deg", manualActuationAngleDeg);
+            ImGui::TextDisabled("Manual setpoint %.1f deg (lookup snapped)", manualActuationAngleDeg);
 
             ImGui::Separator();
             bool voiceToggle = voiceListenEnabled;

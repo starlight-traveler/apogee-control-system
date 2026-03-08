@@ -35,8 +35,8 @@ so the embedded logic stays aligned.
   `src/data_logger.*` into CSV + JSON events.
 - Subscale datasets live under `data/subscale_*` for repeatable tests.
 
-## Standalone replay tool
+## Hosted replay tool
 
-`standalone-c/` hosts a desktop executable that reuses the embedded logic
+`tools/replay/` hosts a desktop executable that reuses the embedded logic
 and can graph filtered telemetry. It vendors Matplot++ in place, so keep
 that subtree intact.

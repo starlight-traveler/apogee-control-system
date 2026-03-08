@@ -23,6 +23,12 @@
 #include <unistd.h>
 
 #if defined(ACS_ENABLE_IMGUI_DECODER)
+#include "../../../src/apogee_model.h"
+#include "../../../src/flight_computer.h"
+#include "../../../src/predictor_seed.h"
+#endif
+
+#if defined(ACS_ENABLE_IMGUI_DECODER)
 #if defined(__APPLE__)
 #include <OpenGL/gl3.h>
 #else
@@ -40,7 +46,7 @@ namespace fs = std::filesystem;
 namespace {
 
 constexpr std::size_t kHeaderSize = 4;
-constexpr std::size_t kSensorSize = 120;
+constexpr std::size_t kSensorSize = 136;
 constexpr std::size_t kFilteredSize = 60;
 constexpr std::size_t kTelemetryPayloadSize = kSensorSize + kFilteredSize;
 constexpr std::size_t kEventPayloadSize = 16;
@@ -53,6 +59,26 @@ constexpr std::array<const char *, 3> kEventNames = {
     "stage_change", "flap_actuated", "flap_settling_timer_fired"};
 
 constexpr std::array<uint8_t, 8> kLogMagic = {'A', 'C', 'S', 'N', 'D', 'R', 'T', '1'};
+constexpr int kSensorFloatCount = 33;
+constexpr int kSensorBoolCount = 3;
+constexpr int kStateFloatCount = 15;
+
+enum class ColumnClass {
+    Sensor,
+    State,
+    Control,
+    Derived,
+    Event,
+    Replay,
+    Unknown
+};
+
+struct ColumnMeta {
+    const char *units = "";
+    ColumnClass klass = ColumnClass::Unknown;
+    float expectedMin = std::numeric_limits<float>::quiet_NaN();
+    float expectedMax = std::numeric_limits<float>::quiet_NaN();
+};
 
 struct LogPreamble {
     uint8_t magic[8];
@@ -62,58 +88,78 @@ struct LogPreamble {
     uint8_t reserved[12];
 };
 
-constexpr std::array<const char *, 49> kNumericTelemetryColumns = {
-    "flight_status_raw",
-    "has_filtered_state",
-    "sensor_timestamp",
-    "sensor_altitude_feet",
-    "sensor_accel_bno_x",
-    "sensor_accel_bno_y",
-    "sensor_accel_bno_z",
-    "sensor_accel_icm_x",
-    "sensor_accel_icm_y",
-    "sensor_accel_icm_z",
-    "sensor_quat_w",
-    "sensor_quat_x",
-    "sensor_quat_y",
-    "sensor_quat_z",
-    "sensor_gyro_x",
-    "sensor_gyro_y",
-    "sensor_gyro_z",
-    "sensor_icm_quat_w",
-    "sensor_icm_quat_x",
-    "sensor_icm_quat_y",
-    "sensor_icm_quat_z",
-    "sensor_icm_yaw_deg",
-    "sensor_icm_pitch_deg",
-    "sensor_icm_roll_deg",
-    "sensor_altimeter_sigma_scale",
-    "sensor_altimeter_gate_sigma",
-    "sensor_auto_cmd_deg",
-    "sensor_optimizer_best_predicted_apogee_m",
-    "sensor_optimizer_best_cost",
-    "sensor_optimizer_time_to_apogee_s",
-    "sensor_actuation_is_settling",
-    "sensor_has_quaternion",
-    "sensor_has_icm_quaternion",
-    "sensor_has_icm_ypr",
-    "state_time",
-    "state_position_x",
-    "state_position_y",
-    "state_position_z",
-    "state_velocity_x",
-    "state_velocity_y",
-    "state_velocity_z",
-    "state_acceleration_x",
-    "state_acceleration_y",
-    "state_acceleration_z",
-    "state_inertial_acceleration_x",
-    "state_inertial_acceleration_y",
-    "state_inertial_acceleration_z",
-    "state_zenith",
-    "state_apogee_estimate"};
+enum class TelemetryFieldSource {
+    StatusRaw,
+    HasFilteredState,
+    SensorFloat,
+    SensorBool,
+    StateFloat
+};
 
-constexpr int kLogSchemaVersion = 3;
+struct TelemetryFieldDescriptor {
+    const char *name;
+    TelemetryFieldSource source;
+    int index;
+    ColumnMeta meta;
+};
+
+constexpr std::array<TelemetryFieldDescriptor, 53> kTelemetryFields = {{
+    {"flight_status_raw", TelemetryFieldSource::StatusRaw, 0, {"enum", ColumnClass::State, 0.0f, 4.0f}},
+    {"has_filtered_state", TelemetryFieldSource::HasFilteredState, 0, {"bool", ColumnClass::State, 0.0f, 1.0f}},
+    {"sensor_timestamp", TelemetryFieldSource::SensorFloat, 0, {"s", ColumnClass::Sensor}},
+    {"sensor_altitude_feet", TelemetryFieldSource::SensorFloat, 1, {"ft", ColumnClass::Sensor}},
+    {"sensor_accel_bno_x", TelemetryFieldSource::SensorFloat, 2, {"m/s^2", ColumnClass::Sensor}},
+    {"sensor_accel_bno_y", TelemetryFieldSource::SensorFloat, 3, {"m/s^2", ColumnClass::Sensor}},
+    {"sensor_accel_bno_z", TelemetryFieldSource::SensorFloat, 4, {"m/s^2", ColumnClass::Sensor}},
+    {"sensor_accel_icm_x", TelemetryFieldSource::SensorFloat, 5, {"m/s^2", ColumnClass::Sensor}},
+    {"sensor_accel_icm_y", TelemetryFieldSource::SensorFloat, 6, {"m/s^2", ColumnClass::Sensor}},
+    {"sensor_accel_icm_z", TelemetryFieldSource::SensorFloat, 7, {"m/s^2", ColumnClass::Sensor}},
+    {"sensor_quat_w", TelemetryFieldSource::SensorFloat, 8, {"quat", ColumnClass::Sensor, -1.0f, 1.0f}},
+    {"sensor_quat_x", TelemetryFieldSource::SensorFloat, 9, {"quat", ColumnClass::Sensor, -1.0f, 1.0f}},
+    {"sensor_quat_y", TelemetryFieldSource::SensorFloat, 10, {"quat", ColumnClass::Sensor, -1.0f, 1.0f}},
+    {"sensor_quat_z", TelemetryFieldSource::SensorFloat, 11, {"quat", ColumnClass::Sensor, -1.0f, 1.0f}},
+    {"sensor_gyro_x", TelemetryFieldSource::SensorFloat, 12, {"rad/s", ColumnClass::Sensor}},
+    {"sensor_gyro_y", TelemetryFieldSource::SensorFloat, 13, {"rad/s", ColumnClass::Sensor}},
+    {"sensor_gyro_z", TelemetryFieldSource::SensorFloat, 14, {"rad/s", ColumnClass::Sensor}},
+    {"sensor_icm_quat_w", TelemetryFieldSource::SensorFloat, 15, {"quat", ColumnClass::Sensor, -1.0f, 1.0f}},
+    {"sensor_icm_quat_x", TelemetryFieldSource::SensorFloat, 16, {"quat", ColumnClass::Sensor, -1.0f, 1.0f}},
+    {"sensor_icm_quat_y", TelemetryFieldSource::SensorFloat, 17, {"quat", ColumnClass::Sensor, -1.0f, 1.0f}},
+    {"sensor_icm_quat_z", TelemetryFieldSource::SensorFloat, 18, {"quat", ColumnClass::Sensor, -1.0f, 1.0f}},
+    {"sensor_icm_yaw_deg", TelemetryFieldSource::SensorFloat, 19, {"deg", ColumnClass::Sensor}},
+    {"sensor_icm_pitch_deg", TelemetryFieldSource::SensorFloat, 20, {"deg", ColumnClass::Sensor}},
+    {"sensor_icm_roll_deg", TelemetryFieldSource::SensorFloat, 21, {"deg", ColumnClass::Sensor}},
+    {"sensor_altimeter_sigma_scale", TelemetryFieldSource::SensorFloat, 22, {"scale", ColumnClass::Sensor}},
+    {"sensor_altimeter_gate_sigma", TelemetryFieldSource::SensorFloat, 23, {"sigma", ColumnClass::Sensor}},
+    {"sensor_auto_cmd_deg", TelemetryFieldSource::SensorFloat, 24, {"deg", ColumnClass::Control}},
+    {"sensor_optimizer_best_predicted_apogee_m", TelemetryFieldSource::SensorFloat, 25, {"m", ColumnClass::Control}},
+    {"sensor_optimizer_best_cost", TelemetryFieldSource::SensorFloat, 26, {"cost", ColumnClass::Control}},
+    {"sensor_optimizer_time_to_apogee_s", TelemetryFieldSource::SensorFloat, 27, {"s", ColumnClass::Control}},
+    {"sensor_actuation_is_settling", TelemetryFieldSource::SensorFloat, 28, {"bool", ColumnClass::Control, 0.0f, 1.0f}},
+    {"sensor_predictor_seed_horizontal_speed_mps", TelemetryFieldSource::SensorFloat, 29, {"m/s", ColumnClass::Control}},
+    {"sensor_predictor_seed_clamped_zenith_rad", TelemetryFieldSource::SensorFloat, 30, {"rad", ColumnClass::Control}},
+    {"sensor_predictor_seed_clamped_angular_rate_rad_per_sec", TelemetryFieldSource::SensorFloat, 31, {"rad/s", ColumnClass::Control}},
+    {"sensor_predictor_seed_confidence_flags", TelemetryFieldSource::SensorFloat, 32, {"bits", ColumnClass::Control}},
+    {"sensor_has_quaternion", TelemetryFieldSource::SensorBool, 0, {"bool", ColumnClass::Sensor, 0.0f, 1.0f}},
+    {"sensor_has_icm_quaternion", TelemetryFieldSource::SensorBool, 1, {"bool", ColumnClass::Sensor, 0.0f, 1.0f}},
+    {"sensor_has_icm_ypr", TelemetryFieldSource::SensorBool, 2, {"bool", ColumnClass::Sensor, 0.0f, 1.0f}},
+    {"state_time", TelemetryFieldSource::StateFloat, 0, {"s", ColumnClass::State}},
+    {"state_position_x", TelemetryFieldSource::StateFloat, 1, {"m", ColumnClass::State}},
+    {"state_position_y", TelemetryFieldSource::StateFloat, 2, {"m", ColumnClass::State}},
+    {"state_position_z", TelemetryFieldSource::StateFloat, 3, {"m", ColumnClass::State}},
+    {"state_velocity_x", TelemetryFieldSource::StateFloat, 4, {"m/s", ColumnClass::State}},
+    {"state_velocity_y", TelemetryFieldSource::StateFloat, 5, {"m/s", ColumnClass::State}},
+    {"state_velocity_z", TelemetryFieldSource::StateFloat, 6, {"m/s", ColumnClass::State}},
+    {"state_acceleration_x", TelemetryFieldSource::StateFloat, 7, {"m/s^2", ColumnClass::State}},
+    {"state_acceleration_y", TelemetryFieldSource::StateFloat, 8, {"m/s^2", ColumnClass::State}},
+    {"state_acceleration_z", TelemetryFieldSource::StateFloat, 9, {"m/s^2", ColumnClass::State}},
+    {"state_inertial_acceleration_x", TelemetryFieldSource::StateFloat, 10, {"m/s^2", ColumnClass::State}},
+    {"state_inertial_acceleration_y", TelemetryFieldSource::StateFloat, 11, {"m/s^2", ColumnClass::State}},
+    {"state_inertial_acceleration_z", TelemetryFieldSource::StateFloat, 12, {"m/s^2", ColumnClass::State}},
+    {"state_zenith", TelemetryFieldSource::StateFloat, 13, {"rad", ColumnClass::State}},
+    {"state_apogee_estimate", TelemetryFieldSource::StateFloat, 14, {"m", ColumnClass::State}},
+}};
+
+constexpr int kLogSchemaVersion = 4;
 #if defined(ACS_FIRMWARE_GIT_HASH)
 constexpr const char *kExpectedFirmwareGitHash = ACS_FIRMWARE_GIT_HASH;
 #else
@@ -185,64 +231,68 @@ void AppendBoolWord(std::string &line, bool value) { line.append(value ? "True" 
 
 void AppendComma(std::string &line) { line.push_back(','); }
 
+bool ReadTelemetryFieldValue(const TelemetryRecordRef &rec, const TelemetryFieldDescriptor &field, float &outValue) {
+    const bool hasFiltered = (rec.flags & 0x01u) != 0u;
+    switch (field.source) {
+        case TelemetryFieldSource::StatusRaw:
+            outValue = static_cast<float>(rec.status);
+            return true;
+        case TelemetryFieldSource::HasFilteredState:
+            outValue = hasFiltered ? 1.0f : 0.0f;
+            return true;
+        case TelemetryFieldSource::SensorFloat:
+            if (field.index < 0 || field.index >= kSensorFloatCount) {
+                return false;
+            }
+            outValue = ReadLE<float>(rec.payload + static_cast<std::size_t>(field.index) * sizeof(float));
+            return true;
+        case TelemetryFieldSource::SensorBool: {
+            if (field.index < 0 || field.index >= kSensorBoolCount) {
+                return false;
+            }
+            const std::size_t boolOffset = static_cast<std::size_t>(kSensorFloatCount) * sizeof(float);
+            outValue = (rec.payload[boolOffset + static_cast<std::size_t>(field.index)] != 0u) ? 1.0f : 0.0f;
+            return true;
+        }
+        case TelemetryFieldSource::StateFloat:
+            if (!hasFiltered || field.index < 0 || field.index >= kStateFloatCount) {
+                return false;
+            }
+            outValue = ReadLE<float>(rec.payload + kSensorSize + static_cast<std::size_t>(field.index) * sizeof(float));
+            return true;
+    }
+    return false;
+}
+
 void BuildTelemetryLine(const TelemetryRecordRef &rec, std::string &line) {
     line.clear();
     line.reserve(900);
-    const uint8_t *p = rec.payload;
-
-    const bool hasFiltered = (rec.flags & 0x01u) != 0u;
 
     AppendCSVEscaped(line, FlightStatusName(rec.status));
-    AppendComma(line);
-    AppendInt(line, static_cast<int>(rec.status));
-    AppendComma(line);
-    AppendBoolWord(line, hasFiltered);
-
-    for (int i = 0; i < 29; ++i) {
+    for (const auto &field : kTelemetryFields) {
         AppendComma(line);
-        const float v = ReadLE<float>(p + static_cast<std::size_t>(i) * sizeof(float));
-        AppendFloat(line, v);
-    }
-    p += 29 * sizeof(float);
-
-    for (int i = 0; i < 3; ++i) {
-        AppendComma(line);
-        AppendBoolWord(line, p[i] != 0u);
-    }
-    p += 4;  // 3 bools + 1 pad
-
-    if (hasFiltered) {
-        for (int i = 0; i < 15; ++i) {
-            AppendComma(line);
-            const float v = ReadLE<float>(p + static_cast<std::size_t>(i) * sizeof(float));
-            AppendFloat(line, v);
+        float v = std::numeric_limits<float>::quiet_NaN();
+        if (!ReadTelemetryFieldValue(rec, field, v)) {
+            continue;
         }
-    } else {
-        for (int i = 0; i < 15; ++i) {
-            AppendComma(line);
+        if (field.source == TelemetryFieldSource::SensorBool ||
+            field.source == TelemetryFieldSource::HasFilteredState) {
+            AppendBoolWord(line, v > 0.5f);
+        } else {
+            AppendFloat(line, v);
         }
     }
     line.push_back('\n');
 }
 
 std::string TelemetryHeader() {
-    return "flight_status,flight_status_raw,has_filtered_state,"
-           "sensor_timestamp,sensor_altitude_feet,"
-           "sensor_accel_bno_x,sensor_accel_bno_y,sensor_accel_bno_z,"
-           "sensor_accel_icm_x,sensor_accel_icm_y,sensor_accel_icm_z,"
-           "sensor_quat_w,sensor_quat_x,sensor_quat_y,sensor_quat_z,"
-           "sensor_gyro_x,sensor_gyro_y,sensor_gyro_z,"
-           "sensor_icm_quat_w,sensor_icm_quat_x,sensor_icm_quat_y,sensor_icm_quat_z,"
-           "sensor_icm_yaw_deg,sensor_icm_pitch_deg,sensor_icm_roll_deg,"
-           "sensor_altimeter_sigma_scale,sensor_altimeter_gate_sigma,"
-           "sensor_auto_cmd_deg,sensor_optimizer_best_predicted_apogee_m,sensor_optimizer_best_cost,"
-           "sensor_optimizer_time_to_apogee_s,sensor_actuation_is_settling,"
-           "sensor_has_quaternion,sensor_has_icm_quaternion,sensor_has_icm_ypr,"
-           "state_time,state_position_x,state_position_y,state_position_z,"
-           "state_velocity_x,state_velocity_y,state_velocity_z,"
-           "state_acceleration_x,state_acceleration_y,state_acceleration_z,"
-           "state_inertial_acceleration_x,state_inertial_acceleration_y,state_inertial_acceleration_z,"
-           "state_zenith,state_apogee_estimate\n";
+    std::string header = "flight_status";
+    for (const auto &field : kTelemetryFields) {
+        header.push_back(',');
+        header += field.name;
+    }
+    header.push_back('\n');
+    return header;
 }
 
 std::string TelemetryMetadataPreamble() {
@@ -639,7 +689,7 @@ bool ComputeSmartActiveWindow(const std::vector<TelemetryRecordRef> &records,
     return outBegin < outEnd;
 }
 
-bool EndsWithCaseInsensitive(const std::string &value, const std::string &suffix) {
+[[maybe_unused]] bool EndsWithCaseInsensitive(const std::string &value, const std::string &suffix) {
     if (value.size() < suffix.size()) {
         return false;
     }
@@ -658,6 +708,21 @@ bool EndsWithCaseInsensitive(const std::string &value, const std::string &suffix
         }
     }
     return true;
+}
+
+double ComputeSeededAngularRate(float currentTimeSeconds,
+                                float currentZenithRadians,
+                                float previousTimeSeconds,
+                                float previousZenithRadians,
+                                bool hasPreviousZenith) {
+    if (!hasPreviousZenith) {
+        return 0.0;
+    }
+    const double dt = static_cast<double>(currentTimeSeconds) - static_cast<double>(previousTimeSeconds);
+    if (dt <= 0.0) {
+        return 0.0;
+    }
+    return (static_cast<double>(currentZenithRadians) - static_cast<double>(previousZenithRadians)) / dt;
 }
 
 #if defined(ACS_ENABLE_IMGUI_DECODER)
@@ -689,6 +754,48 @@ struct LoadedDataset {
     std::unordered_map<std::string, std::string> metadata;
     std::vector<std::string> schemaWarnings;
     std::vector<std::pair<float, std::size_t>> timeIndex;
+};
+
+struct ReplaySettings {
+    char cfdPath[256] = "lib/cfd.csv";
+    bool useCfd = true;
+    float refreshIntervalSeconds = 0.1f;
+    int maxPredictorSteps = settings::actuation::kActuationPredictorMaxSteps;
+    bool showLoggedStateApogee = true;
+    bool showLoggedOptimizerApogee = true;
+    bool showReplaySaferApogee = true;
+    bool showReplayBallisticApogee = true;
+    bool showReplayErrorVsActual = true;
+    bool showReplayErrorVsState = false;
+    bool showReplayErrorVsOptimizer = false;
+    bool showSeedHorizontalSpeed = true;
+    bool showSeedZenith = true;
+    bool showSeedAngularRate = true;
+    bool showRawInspector = true;
+    bool normalizeSeedPlots = false;
+    bool normalizeErrorPlots = false;
+};
+
+struct ReplayAnalysis {
+    TelemetryTable table;
+    std::string statusText;
+    std::vector<std::string> warnings;
+    bool ready = false;
+    float actualApogeeMeters = std::numeric_limits<float>::quiet_NaN();
+    float replayApogeeMinMeters = std::numeric_limits<float>::quiet_NaN();
+    float replayApogeeMaxMeters = std::numeric_limits<float>::quiet_NaN();
+    float replayApogeeMeanMeters = std::numeric_limits<float>::quiet_NaN();
+    float replayBallisticMeanMeters = std::numeric_limits<float>::quiet_NaN();
+};
+
+struct NativeCfdTableStorage {
+    ApogeeForceTable table;
+    std::vector<double> acs;
+    std::vector<double> atk;
+    std::vector<double> mach;
+    std::vector<double> axial;
+    std::vector<double> normal;
+    bool loaded = false;
 };
 
 struct CsvCellSpan {
@@ -1070,38 +1177,20 @@ TelemetryTable BuildTelemetryTableFromBin(const std::vector<TelemetryRecordRef> 
     TelemetryTable table;
     const std::size_t rows = records.size();
 
-    table.series.resize(kNumericTelemetryColumns.size());
-    for (std::size_t i = 0; i < kNumericTelemetryColumns.size(); ++i) {
-        table.series[i].name = kNumericTelemetryColumns[i];
+    table.series.resize(kTelemetryFields.size());
+    for (std::size_t i = 0; i < kTelemetryFields.size(); ++i) {
+        table.series[i].name = kTelemetryFields[i].name;
         table.series[i].values.assign(rows, std::numeric_limits<float>::quiet_NaN());
     }
     table.timeSeconds.assign(rows, 0.0f);
 
     for (std::size_t row = 0; row < rows; ++row) {
         const TelemetryRecordRef &rec = records[row];
-        const bool hasFiltered = (rec.flags & 0x01u) != 0u;
-
-        std::size_t col = 0;
-        table.series[col++].values[row] = static_cast<float>(rec.status);
-        table.series[col++].values[row] = hasFiltered ? 1.0f : 0.0f;
-
-        const uint8_t *p = rec.payload;
-        for (int i = 0; i < 29; ++i) {
-            table.series[col++].values[row] = ReadLE<float>(p + static_cast<std::size_t>(i) * sizeof(float));
-        }
-        p += 29 * sizeof(float);
-
-        for (int i = 0; i < 3; ++i) {
-            table.series[col++].values[row] = (p[i] != 0u) ? 1.0f : 0.0f;
-        }
-        p += 4;
-
-        if (hasFiltered) {
-            for (int i = 0; i < 15; ++i) {
-                table.series[col++].values[row] = ReadLE<float>(p + static_cast<std::size_t>(i) * sizeof(float));
+        for (std::size_t col = 0; col < kTelemetryFields.size(); ++col) {
+            float value = std::numeric_limits<float>::quiet_NaN();
+            if (ReadTelemetryFieldValue(rec, kTelemetryFields[col], value)) {
+                table.series[col].values[row] = value;
             }
-        } else {
-            col += 15;
         }
 
         table.timeSeconds[row] = table.series[2].values[row];
@@ -1222,6 +1311,34 @@ void AddDerivedChannels(TelemetryTable &table) {
             }
         }
         AppendDerivedSeries(table, "derived_prediction_error_raw", std::move(error));
+    }
+
+    if (const auto flagsIdx = FindSeriesIndex(table, "sensor_predictor_seed_confidence_flags"); flagsIdx.has_value()) {
+        std::vector<float> controlActive(n, std::numeric_limits<float>::quiet_NaN());
+        std::vector<float> positiveVz(n, std::numeric_limits<float>::quiet_NaN());
+        std::vector<float> usingHorizontalModel(n, std::numeric_limits<float>::quiet_NaN());
+        std::vector<float> speedCapped(n, std::numeric_limits<float>::quiet_NaN());
+        std::vector<float> zenithClamped(n, std::numeric_limits<float>::quiet_NaN());
+        std::vector<float> rateClamped(n, std::numeric_limits<float>::quiet_NaN());
+        for (std::size_t i = 0; i < n; ++i) {
+            const float rawFlags = table.series[*flagsIdx].values[i];
+            if (!std::isfinite(rawFlags)) {
+                continue;
+            }
+            const uint32_t flags = static_cast<uint32_t>(std::lround(rawFlags));
+            controlActive[i] = (flags & kPredictorSeedFlagControlActive) ? 1.0f : 0.0f;
+            positiveVz[i] = (flags & kPredictorSeedFlagPositiveVerticalVelocity) ? 1.0f : 0.0f;
+            usingHorizontalModel[i] = (flags & kPredictorSeedFlagUsingHorizontalModel) ? 1.0f : 0.0f;
+            speedCapped[i] = (flags & kPredictorSeedFlagHorizontalSpeedCapped) ? 1.0f : 0.0f;
+            zenithClamped[i] = (flags & kPredictorSeedFlagZenithClamped) ? 1.0f : 0.0f;
+            rateClamped[i] = (flags & kPredictorSeedFlagAngularRateClamped) ? 1.0f : 0.0f;
+        }
+        AppendDerivedSeries(table, "derived_predictor_conf_control_active", std::move(controlActive));
+        AppendDerivedSeries(table, "derived_predictor_conf_positive_vertical_velocity", std::move(positiveVz));
+        AppendDerivedSeries(table, "derived_predictor_conf_using_horizontal_model", std::move(usingHorizontalModel));
+        AppendDerivedSeries(table, "derived_predictor_conf_horizontal_speed_capped", std::move(speedCapped));
+        AppendDerivedSeries(table, "derived_predictor_conf_zenith_clamped", std::move(zenithClamped));
+        AppendDerivedSeries(table, "derived_predictor_conf_angular_rate_clamped", std::move(rateClamped));
     }
 }
 
@@ -1540,45 +1657,39 @@ void SelectDefaultSeries(TelemetryTable &table) {
     }
 }
 
-enum class ColumnClass {
-    Sensor,
-    State,
-    Control,
-    Derived,
-    Event,
-    Unknown
-};
-
-struct ColumnMeta {
-    const char *units = "";
-    ColumnClass klass = ColumnClass::Unknown;
-    float expectedMin = std::numeric_limits<float>::quiet_NaN();
-    float expectedMax = std::numeric_limits<float>::quiet_NaN();
-};
-
 ColumnMeta ColumnMetadata(const std::string &name) {
+    for (const auto &field : kTelemetryFields) {
+        if (name == field.name) {
+            return field.meta;
+        }
+    }
     if (name.rfind("derived_", 0) == 0) {
         if (name == "derived_speed_m_s") return {"m/s", ColumnClass::Derived, 0.0f, 1500.0f};
         if (name == "derived_mach") return {"Mach", ColumnClass::Derived, 0.0f, 5.0f};
         if (name == "derived_dynamic_pressure_pa") return {"Pa", ColumnClass::Derived, 0.0f, 300000.0f};
         if (name == "derived_accel_mag_m_s2") return {"m/s^2", ColumnClass::Derived, 0.0f, 500.0f};
         if (name == "derived_jerk_mag_m_s3") return {"m/s^3", ColumnClass::Derived, -10000.0f, 10000.0f};
+        if (name == "derived_predictor_conf_control_active") return {"bool", ColumnClass::Derived, 0.0f, 1.0f};
+        if (name == "derived_predictor_conf_positive_vertical_velocity") return {"bool", ColumnClass::Derived, 0.0f, 1.0f};
+        if (name == "derived_predictor_conf_using_horizontal_model") return {"bool", ColumnClass::Derived, 0.0f, 1.0f};
+        if (name == "derived_predictor_conf_horizontal_speed_capped") return {"bool", ColumnClass::Derived, 0.0f, 1.0f};
+        if (name == "derived_predictor_conf_zenith_clamped") return {"bool", ColumnClass::Derived, 0.0f, 1.0f};
+        if (name == "derived_predictor_conf_angular_rate_clamped") return {"bool", ColumnClass::Derived, 0.0f, 1.0f};
+        if (name == "derived_replay_altitude_m") return {"m", ColumnClass::Replay};
+        if (name == "derived_replay_logged_state_apogee_m") return {"m", ColumnClass::Replay};
+        if (name == "derived_replay_logged_optimizer_apogee_m") return {"m", ColumnClass::Replay};
+        if (name == "derived_replay_apogee_safer_m") return {"m", ColumnClass::Replay};
+        if (name == "derived_replay_apogee_ballistic_m") return {"m", ColumnClass::Replay};
+        if (name == "derived_replay_error_vs_actual_m") return {"m", ColumnClass::Replay};
+        if (name == "derived_replay_error_vs_logged_state_m") return {"m", ColumnClass::Replay};
+        if (name == "derived_replay_error_vs_logged_optimizer_m") return {"m", ColumnClass::Replay};
+        if (name == "derived_replay_seed_horizontal_speed_mps") return {"m/s", ColumnClass::Replay};
+        if (name == "derived_replay_seed_zenith_deg") return {"deg", ColumnClass::Replay};
+        if (name == "derived_replay_seed_angular_rate_deg_s") return {"deg/s", ColumnClass::Replay};
         return {"raw", ColumnClass::Derived, std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::quiet_NaN()};
-    }
-    if (name.rfind("sensor_", 0) == 0) {
-        return {"sensor", ColumnClass::Sensor, std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::quiet_NaN()};
-    }
-    if (name.rfind("state_", 0) == 0) {
-        return {"state", ColumnClass::State, std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::quiet_NaN()};
-    }
-    if (name.find("cmd") != std::string::npos || name.find("optimizer") != std::string::npos) {
-        return {"control", ColumnClass::Control, std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::quiet_NaN()};
     }
     if (name.find("event") != std::string::npos) {
         return {"event", ColumnClass::Event, std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::quiet_NaN()};
-    }
-    if (name == "flight_status_raw") {
-        return {"enum", ColumnClass::State, 0.0f, 4.0f};
     }
     return {"raw", ColumnClass::Unknown, std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::quiet_NaN()};
 }
@@ -1595,6 +1706,8 @@ const char *ColumnClassName(ColumnClass klass) {
             return "Derived";
         case ColumnClass::Event:
             return "Event";
+        case ColumnClass::Replay:
+            return "Replay";
         default:
             return "Other";
     }
@@ -1641,6 +1754,22 @@ std::size_t LowerBoundTime(const std::vector<float> &timeValues, float needle) {
 std::size_t UpperBoundTime(const std::vector<float> &timeValues, float needle) {
     auto it = std::upper_bound(timeValues.begin(), timeValues.end(), needle);
     return static_cast<std::size_t>(it - timeValues.begin());
+}
+
+std::size_t NearestTimeIndex(const std::vector<float> &timeValues, float needle) {
+    if (timeValues.empty()) {
+        return 0;
+    }
+    const std::size_t lower = LowerBoundTime(timeValues, needle);
+    if (lower == 0) {
+        return 0;
+    }
+    if (lower >= timeValues.size()) {
+        return timeValues.size() - 1;
+    }
+    const float prev = timeValues[lower - 1];
+    const float next = timeValues[lower];
+    return (std::fabs(needle - prev) <= std::fabs(next - needle)) ? (lower - 1) : lower;
 }
 
 void DrawSeriesChart(const TelemetryTable &table,
@@ -1851,7 +1980,10 @@ void DrawOverlayChart(const TelemetryTable &table,
                       bool drawReferenceLine,
                       float referenceValue,
                       bool normalizeSeries,
-                      float chartHeight) {
+                      float chartHeight,
+                      bool *outHasHovered = nullptr,
+                      std::size_t *outHoveredRow = nullptr,
+                      float *outHoveredTime = nullptr) {
     ImVec2 plotSize(ImGui::GetContentRegionAvail().x, chartHeight);
     if (plotSize.x < 32.0f) {
         plotSize.x = 32.0f;
@@ -1860,6 +1992,7 @@ void DrawOverlayChart(const TelemetryTable &table,
         plotSize.y = 100.0f;
     }
 
+    ImGui::PushID(selectedSeries.empty() ? nullptr : static_cast<const void *>(selectedSeries.front()));
     ImGui::InvisibleButton("overlay_plot", plotSize);
     const ImVec2 canvasMin = ImGui::GetItemRectMin();
     const ImVec2 canvasMax = ImGui::GetItemRectMax();
@@ -1987,6 +2120,40 @@ void DrawOverlayChart(const TelemetryTable &table,
             draw->AddPolyline(points.data(), static_cast<int>(points.size()), ColorForSeries(series->name), 0, 1.6f);
         }
     }
+
+    const bool isHovered = ImGui::IsItemHovered();
+    if (outHasHovered != nullptr) {
+        *outHasHovered = isHovered;
+    }
+    if (isHovered) {
+        const ImVec2 mouse = ImGui::GetIO().MousePos;
+        const float clampedX = std::clamp(mouse.x, innerMin.x, innerMax.x);
+        const float hoverT = selectedTMin + ((clampedX - innerMin.x) / std::max(1.0f, innerMax.x - innerMin.x)) * spanT;
+        const std::size_t hoverRow = NearestTimeIndex(table.timeSeconds, hoverT);
+        const float x = innerMin.x + ((table.timeSeconds[hoverRow] - selectedTMin) / spanT) * (innerMax.x - innerMin.x);
+        draw->AddLine(ImVec2(x, innerMin.y), ImVec2(x, innerMax.y), IM_COL32(255, 255, 255, 110), 1.0f);
+        if (outHoveredRow != nullptr) {
+            *outHoveredRow = hoverRow;
+        }
+        if (outHoveredTime != nullptr) {
+            *outHoveredTime = table.timeSeconds[hoverRow];
+        }
+
+        ImGui::BeginTooltip();
+        ImGui::Text("row=%zu  t=%.4f s", hoverRow, static_cast<double>(table.timeSeconds[hoverRow]));
+        for (const NumericSeries *series : selectedSeries) {
+            if (hoverRow >= series->values.size()) {
+                continue;
+            }
+            const float value = series->values[hoverRow];
+            if (!std::isfinite(value)) {
+                continue;
+            }
+            ImGui::Text("%s: %.5g", series->name.c_str(), static_cast<double>(value));
+        }
+        ImGui::EndTooltip();
+    }
+    ImGui::PopID();
 }
 
 const NumericSeries *FindSeriesByName(const TelemetryTable &table, const char *name) {
@@ -1996,6 +2163,337 @@ const NumericSeries *FindSeriesByName(const TelemetryTable &table, const char *n
         }
     }
     return nullptr;
+}
+
+void AppendEmptySeries(TelemetryTable &table, const std::string &name, std::size_t rows) {
+    NumericSeries series;
+    series.name = name;
+    series.values.assign(rows, std::numeric_limits<float>::quiet_NaN());
+    table.series.push_back(std::move(series));
+}
+
+std::optional<float> SeriesValueAt(const NumericSeries *series, std::size_t row) {
+    if (series == nullptr || row >= series->values.size()) {
+        return std::nullopt;
+    }
+    const float value = series->values[row];
+    if (!std::isfinite(value)) {
+        return std::nullopt;
+    }
+    return value;
+}
+
+std::string FormatOptionalFloat(std::optional<float> value, const char *units = nullptr) {
+    if (!value.has_value() || !std::isfinite(*value)) {
+        return "--";
+    }
+    char buffer[96];
+    if (units != nullptr && units[0] != '\0') {
+        std::snprintf(buffer, sizeof(buffer), "%.6g %s", static_cast<double>(*value), units);
+    } else {
+        std::snprintf(buffer, sizeof(buffer), "%.6g", static_cast<double>(*value));
+    }
+    return std::string(buffer);
+}
+
+bool ParseFiveColumnCsvLine(const std::string &line, std::array<double, 5> &values) {
+    const char *ptr = line.c_str();
+    for (int i = 0; i < 5; ++i) {
+        char *end = nullptr;
+        values[static_cast<std::size_t>(i)] = std::strtod(ptr, &end);
+        if (end == ptr) {
+            return false;
+        }
+        ptr = end;
+        while (*ptr == ',' || *ptr == ' ' || *ptr == '\t') {
+            ++ptr;
+        }
+    }
+    return true;
+}
+
+bool LoadNativeCfdTable(const fs::path &path, NativeCfdTableStorage &storage, std::string &error) {
+    std::ifstream in(path);
+    if (!in) {
+        error = "Failed to open CFD table: " + path.string();
+        storage.loaded = false;
+        return false;
+    }
+
+    storage = NativeCfdTableStorage{};
+    std::vector<std::array<double, 5>> rows;
+    rows.reserve(6000);
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.empty()) {
+            continue;
+        }
+        std::array<double, 5> values{};
+        if (!ParseFiveColumnCsvLine(line, values)) {
+            continue;
+        }
+        rows.push_back(values);
+        storage.acs.push_back(values[0]);
+        storage.atk.push_back(values[1]);
+        storage.mach.push_back(values[2]);
+    }
+    if (rows.empty()) {
+        error = "CFD table has no numeric rows: " + path.string();
+        return false;
+    }
+
+    auto sortUnique = [](std::vector<double> &values) {
+        std::sort(values.begin(), values.end());
+        values.erase(std::unique(values.begin(), values.end()), values.end());
+    };
+    sortUnique(storage.acs);
+    sortUnique(storage.atk);
+    sortUnique(storage.mach);
+
+    const int acsCount = static_cast<int>(storage.acs.size());
+    const int atkCount = static_cast<int>(storage.atk.size());
+    const int machCount = static_cast<int>(storage.mach.size());
+    if (acsCount < 2 || atkCount < 2 || machCount < 2) {
+        error = "CFD table grid is too small: " + path.string();
+        return false;
+    }
+
+    storage.axial.assign(static_cast<std::size_t>(acsCount * atkCount * machCount), std::numeric_limits<double>::quiet_NaN());
+    storage.normal.assign(static_cast<std::size_t>(acsCount * atkCount * machCount), std::numeric_limits<double>::quiet_NaN());
+
+    auto findIndex = [](const std::vector<double> &axis, double value) -> int {
+        const auto it = std::lower_bound(axis.begin(), axis.end(), value);
+        if (it == axis.end() || *it != value) {
+            return -1;
+        }
+        return static_cast<int>(it - axis.begin());
+    };
+
+    for (const auto &row : rows) {
+        const int i = findIndex(storage.acs, row[0]);
+        const int j = findIndex(storage.atk, row[1]);
+        const int k = findIndex(storage.mach, row[2]);
+        if (i < 0 || j < 0 || k < 0) {
+            continue;
+        }
+        const std::size_t index = static_cast<std::size_t>((i * atkCount + j) * machCount + k);
+        storage.axial[index] = row[3];
+        storage.normal[index] = row[4];
+    }
+
+    storage.table.acsAnglesDeg = storage.acs.data();
+    storage.table.atkAnglesDeg = storage.atk.data();
+    storage.table.machNumbers = storage.mach.data();
+    storage.table.axialForces = storage.axial.data();
+    storage.table.normalForces = storage.normal.data();
+    storage.table.acsCount = acsCount;
+    storage.table.atkCount = atkCount;
+    storage.table.machCount = machCount;
+    storage.loaded = true;
+    return true;
+}
+
+bool ComputeReplayAnalysis(const LoadedDataset &dataset, const ReplaySettings &settings, ReplayAnalysis &analysis, std::string &error) {
+    analysis = ReplayAnalysis{};
+    const TelemetryTable &source = dataset.table;
+    const std::size_t rows = source.RowCount();
+    if (rows == 0) {
+        error = "No telemetry rows loaded for replay.";
+        return false;
+    }
+
+    const NumericSeries *hasFiltered = FindSeriesByName(source, "has_filtered_state");
+    const NumericSeries *statusSeries = FindSeriesByName(source, "flight_status_raw");
+    const NumericSeries *altitudeSeries = FindSeriesByName(source, "state_position_z");
+    const NumericSeries *velocitySeries = FindSeriesByName(source, "state_velocity_z");
+    const NumericSeries *zenithSeries = FindSeriesByName(source, "state_zenith");
+    if (altitudeSeries == nullptr || velocitySeries == nullptr || zenithSeries == nullptr) {
+        error = "Replay requires state_position_z, state_velocity_z, and state_zenith.";
+        return false;
+    }
+
+    const NumericSeries *velXSeries = FindSeriesByName(source, "state_velocity_x");
+    const NumericSeries *velYSeries = FindSeriesByName(source, "state_velocity_y");
+    const NumericSeries *inertialXSeries = FindSeriesByName(source, "state_inertial_acceleration_x");
+    const NumericSeries *inertialYSeries = FindSeriesByName(source, "state_inertial_acceleration_y");
+    const NumericSeries *loggedStateApogee = FindSeriesByName(source, "state_apogee_estimate");
+    const NumericSeries *loggedOptimizerApogee = FindSeriesByName(source, "sensor_optimizer_best_predicted_apogee_m");
+
+    analysis.table.timeSeconds = source.timeSeconds;
+    analysis.table.timeSorted = source.timeSorted;
+    AppendEmptySeries(analysis.table, "derived_replay_altitude_m", rows);
+    AppendEmptySeries(analysis.table, "derived_replay_logged_state_apogee_m", rows);
+    AppendEmptySeries(analysis.table, "derived_replay_logged_optimizer_apogee_m", rows);
+    AppendEmptySeries(analysis.table, "derived_replay_apogee_safer_m", rows);
+    AppendEmptySeries(analysis.table, "derived_replay_apogee_ballistic_m", rows);
+    AppendEmptySeries(analysis.table, "derived_replay_error_vs_actual_m", rows);
+    AppendEmptySeries(analysis.table, "derived_replay_error_vs_logged_state_m", rows);
+    AppendEmptySeries(analysis.table, "derived_replay_error_vs_logged_optimizer_m", rows);
+    AppendEmptySeries(analysis.table, "derived_replay_seed_horizontal_speed_mps", rows);
+    AppendEmptySeries(analysis.table, "derived_replay_seed_zenith_deg", rows);
+    AppendEmptySeries(analysis.table, "derived_replay_seed_angular_rate_deg_s", rows);
+
+    EnvironmentModel environment;
+    ApogeeVehicleParameters vehicleParameters;
+    vehicleParameters.centerOfPressureOffsetMeters = settings::vehicle::kCenterOfPressureOffsetMeters;
+    vehicleParameters.momentOfInertia = settings::vehicle::kMomentOfInertiaKgM2;
+    vehicleParameters.dryMass = settings::vehicle::kDryMassKg;
+    ApogeePredictor predictor(environment, vehicleParameters);
+    predictor.SetMaxIntegrationSteps(std::max(1, settings.maxPredictorSteps));
+
+    NativeCfdTableStorage cfdStorage;
+    if (settings.useCfd) {
+        std::string cfdError;
+        if (LoadNativeCfdTable(fs::path(settings.cfdPath), cfdStorage, cfdError)) {
+            predictor.SetForceTable(&cfdStorage.table);
+            analysis.statusText = "Replay using CFD: " + std::string(settings.cfdPath);
+        } else {
+            analysis.warnings.push_back(cfdError + " | falling back to ballistic predictor");
+        }
+    } else {
+        analysis.statusText = "Replay using ballistic predictor only";
+    }
+
+    PredictorHorizontalVelocityTracker tracker;
+    bool hasPreviousZenith = false;
+    float previousTime = 0.0f;
+    float previousZenith = 0.0f;
+    double lastPredictionMeters = std::numeric_limits<double>::quiet_NaN();
+    float lastPredictionTime = 0.0f;
+    bool hasLastPrediction = false;
+    double saferPredictionSum = 0.0;
+    double ballisticPredictionSum = 0.0;
+    std::size_t saferPredictionCount = 0;
+    std::size_t ballisticPredictionCount = 0;
+
+    for (std::size_t row = 0; row < rows; ++row) {
+        const float timeValue = source.timeSeconds[row];
+        const auto altitude = SeriesValueAt(altitudeSeries, row);
+        const auto verticalVelocity = SeriesValueAt(velocitySeries, row);
+        const auto zenith = SeriesValueAt(zenithSeries, row);
+        if (!std::isfinite(timeValue) || !altitude.has_value() || !verticalVelocity.has_value() || !zenith.has_value()) {
+            continue;
+        }
+        if (hasFiltered != nullptr) {
+            const auto filtered = SeriesValueAt(hasFiltered, row);
+            if (filtered.has_value() && *filtered < 0.5f) {
+                continue;
+            }
+        }
+
+        analysis.actualApogeeMeters = std::isfinite(analysis.actualApogeeMeters)
+                                          ? std::max(analysis.actualApogeeMeters, *altitude)
+                                          : *altitude;
+
+        FlightStatus status = FlightStatus::Ground;
+        if (statusSeries != nullptr) {
+            if (const auto rawStatus = SeriesValueAt(statusSeries, row); rawStatus.has_value()) {
+                const int rounded = static_cast<int>(std::lround(*rawStatus));
+                if (rounded >= 0 && rounded <= static_cast<int>(FlightStatus::Descent)) {
+                    status = static_cast<FlightStatus>(rounded);
+                }
+            }
+        }
+
+        const float dt = hasPreviousZenith ? (timeValue - previousTime) : 0.0f;
+        const double angularRate = ComputeSeededAngularRate(timeValue, *zenith, previousTime, previousZenith, hasPreviousZenith);
+        const bool allowIntegration = (status == FlightStatus::Burn || status == FlightStatus::Coast);
+        const double horizontalSpeed =
+            UpdatePredictorHorizontalSpeed(tracker,
+                                           SeriesValueAt(inertialXSeries, row).value_or(0.0f),
+                                           SeriesValueAt(inertialYSeries, row).value_or(0.0f),
+                                           dt,
+                                           allowIntegration,
+                                           *verticalVelocity,
+                                           *zenith);
+        const double clampedZenith = ClampPredictorZenithRadians(*zenith);
+        const double clampedAngularRate = ClampPredictorAngularRate(angularRate);
+        const double horizontalVelocity = std::isfinite(horizontalSpeed)
+                                              ? horizontalSpeed
+                                              : std::hypot(SeriesValueAt(velXSeries, row).value_or(0.0f),
+                                                           SeriesValueAt(velYSeries, row).value_or(0.0f));
+
+        const double ballisticApogee =
+            (*verticalVelocity > 0.0f) ? (*altitude + (*verticalVelocity * *verticalVelocity) / (2.0 * constants::kGravity)) : *altitude;
+
+        double replayApogee = hasLastPrediction ? lastPredictionMeters : ballisticApogee;
+        const bool shouldPredict = (*verticalVelocity > 0.0f) && allowIntegration;
+        if (shouldPredict && (!hasLastPrediction || (timeValue - lastPredictionTime) >= settings.refreshIntervalSeconds)) {
+            ApogeeState predictorState;
+            predictorState.altitudeMeters = *altitude;
+            predictorState.horizontalDistanceMeters = 0.0;
+            predictorState.verticalVelocity = *verticalVelocity;
+            predictorState.horizontalVelocity = horizontalVelocity;
+            predictorState.zenith = clampedZenith;
+            predictorState.angularVelocity = clampedAngularRate;
+            predictorState.acsAngleDeg = 0.0;
+            replayApogee = predictor.PredictApogee(predictorState);
+            lastPredictionMeters = replayApogee;
+            lastPredictionTime = timeValue;
+            hasLastPrediction = true;
+        }
+
+        analysis.table.series[0].values[row] = *altitude;
+        analysis.table.series[1].values[row] = SeriesValueAt(loggedStateApogee, row).value_or(std::numeric_limits<float>::quiet_NaN());
+        analysis.table.series[2].values[row] = SeriesValueAt(loggedOptimizerApogee, row).value_or(std::numeric_limits<float>::quiet_NaN());
+        analysis.table.series[3].values[row] = static_cast<float>(replayApogee);
+        analysis.table.series[4].values[row] = static_cast<float>(ballisticApogee);
+        analysis.table.series[8].values[row] = static_cast<float>(horizontalVelocity);
+        analysis.table.series[9].values[row] = static_cast<float>(clampedZenith * 57.29577951308232);
+        analysis.table.series[10].values[row] = static_cast<float>(clampedAngularRate * 57.29577951308232);
+
+        if (std::isfinite(replayApogee)) {
+            analysis.replayApogeeMinMeters = std::isfinite(analysis.replayApogeeMinMeters)
+                                                 ? std::min(analysis.replayApogeeMinMeters, static_cast<float>(replayApogee))
+                                                 : static_cast<float>(replayApogee);
+            analysis.replayApogeeMaxMeters = std::isfinite(analysis.replayApogeeMaxMeters)
+                                                 ? std::max(analysis.replayApogeeMaxMeters, static_cast<float>(replayApogee))
+                                                 : static_cast<float>(replayApogee);
+            saferPredictionSum += replayApogee;
+            saferPredictionCount++;
+        }
+        if (std::isfinite(ballisticApogee)) {
+            ballisticPredictionSum += ballisticApogee;
+            ballisticPredictionCount++;
+        }
+
+        previousTime = timeValue;
+        previousZenith = *zenith;
+        hasPreviousZenith = true;
+    }
+
+    if (std::isfinite(analysis.actualApogeeMeters)) {
+        NumericSeries &errorActual = analysis.table.series[5];
+        NumericSeries &errorState = analysis.table.series[6];
+        NumericSeries &errorOptimizer = analysis.table.series[7];
+        const NumericSeries &saferSeries = analysis.table.series[3];
+        for (std::size_t row = 0; row < rows; ++row) {
+            const float replayApogee = saferSeries.values[row];
+            if (!std::isfinite(replayApogee)) {
+                continue;
+            }
+            errorActual.values[row] = replayApogee - analysis.actualApogeeMeters;
+            if (const auto stateApogee = SeriesValueAt(loggedStateApogee, row); stateApogee.has_value()) {
+                errorState.values[row] = replayApogee - *stateApogee;
+            }
+            if (const auto optimizerApogee = SeriesValueAt(loggedOptimizerApogee, row); optimizerApogee.has_value()) {
+                errorOptimizer.values[row] = replayApogee - *optimizerApogee;
+            }
+        }
+    }
+
+    if (saferPredictionCount > 0) {
+        analysis.replayApogeeMeanMeters = static_cast<float>(saferPredictionSum / static_cast<double>(saferPredictionCount));
+    }
+    if (ballisticPredictionCount > 0) {
+        analysis.replayBallisticMeanMeters = static_cast<float>(ballisticPredictionSum / static_cast<double>(ballisticPredictionCount));
+    }
+
+    if (analysis.statusText.empty()) {
+        analysis.statusText = "Replay computed";
+    }
+    analysis.ready = true;
+    return true;
 }
 
 struct SummaryMetrics {
@@ -2653,6 +3151,11 @@ int RunGuiMain(int argc, char **argv) {
     SummaryMetrics summary;
     HealthDiagnostics diagnostics;
     std::vector<DetectedEventRow> detectedEvents;
+    ReplaySettings replaySettings;
+    ReplayAnalysis replayAnalysis;
+    std::size_t replayHoveredRow = 0;
+    float replayHoveredTime = 0.0f;
+    bool replayHasHoveredPoint = false;
 
     auto loadDataset = [&]() {
         errorText.clear();
@@ -2675,6 +3178,14 @@ int RunGuiMain(int argc, char **argv) {
         SelectDefaultSeries(dataset.table);
         AnalyzeDataset(dataset, summary, detectedEvents);
         diagnostics = ComputeHealthDiagnostics(dataset.table);
+        std::string replayError;
+        if (!ComputeReplayAnalysis(dataset, replaySettings, replayAnalysis, replayError)) {
+            replayAnalysis = ReplayAnalysis{};
+            replayAnalysis.warnings.push_back(replayError);
+        }
+        replayHoveredRow = 0;
+        replayHoveredTime = 0.0f;
+        replayHasHoveredPoint = false;
         rawStartLine = 0;
         rawJumpToLine = 1;
         rawJumpToTime = 0.0f;
@@ -2717,7 +3228,7 @@ int RunGuiMain(int argc, char **argv) {
                                  ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoBringToFrontOnFocus;
         ImGui::Begin("ACS NDRT Rocketry Decoder", nullptr, flags);
 
-        ImGui::TextUnformatted("ACS NDRT Rocketry Telemetry Decoder (ImGui)");
+        ImGui::TextUnformatted("ACS NDRT Rocketry Telemetry Decoder");
         ImGui::SameLine();
         ImGui::TextDisabled("threads=%u", threads);
 
@@ -2846,8 +3357,8 @@ int RunGuiMain(int argc, char **argv) {
 
         const std::string filterLower = ToLower(seriesFilter);
         ImGui::BeginChild("series_list", ImVec2(0.0f, 230.0f), true);
-        const std::array<ColumnClass, 5> classOrder = {
-            ColumnClass::Sensor, ColumnClass::State, ColumnClass::Control, ColumnClass::Derived, ColumnClass::Unknown};
+        const std::array<ColumnClass, 6> classOrder = {
+            ColumnClass::Sensor, ColumnClass::State, ColumnClass::Control, ColumnClass::Derived, ColumnClass::Replay, ColumnClass::Unknown};
         for (ColumnClass klass : classOrder) {
             std::string sectionName = std::string(ColumnClassName(klass)) + " Columns";
             if (!ImGui::CollapsingHeader(sectionName.c_str(), ImGuiTreeNodeFlags_DefaultOpen)) {
@@ -3050,7 +3561,10 @@ int RunGuiMain(int argc, char **argv) {
                              drawReferenceLine,
                              referenceValue,
                              normalizeOverlay,
-                             chartHeight);
+                             chartHeight,
+                             nullptr,
+                             nullptr,
+                             nullptr);
             ImGui::Dummy(ImVec2(0.0f, 8.0f));
             ImGui::BeginChild("overlay_legend", ImVec2(0.0f, 90.0f), true);
             for (const NumericSeries *series : selectedSeries) {
@@ -3078,6 +3592,241 @@ int RunGuiMain(int argc, char **argv) {
         }
         ImGui::EndChild();
         ImGui::EndTabItem();
+        }
+
+        if (ImGui::BeginTabItem("Replay")) {
+            ImGui::BeginChild("replay_controls", ImVec2(380.0f, 0.0f), true);
+            ImGui::Text("In-process ACS replay from the loaded telemetry table");
+            ImGui::Checkbox("Use CFD Table", &replaySettings.useCfd);
+            ImGui::InputText("CFD Path", replaySettings.cfdPath, sizeof(replaySettings.cfdPath));
+            ImGui::SliderFloat("Refresh Interval (s)", &replaySettings.refreshIntervalSeconds, 0.02f, 0.5f, "%.2f");
+            ImGui::SliderInt("Predictor Max Steps", &replaySettings.maxPredictorSteps, 32, 512);
+            ImGui::SeparatorText("Series");
+            ImGui::Checkbox("Logged State Apogee", &replaySettings.showLoggedStateApogee);
+            ImGui::Checkbox("Logged Optimizer Apogee", &replaySettings.showLoggedOptimizerApogee);
+            ImGui::Checkbox("Replay Safer Apogee", &replaySettings.showReplaySaferApogee);
+            ImGui::Checkbox("Replay Ballistic", &replaySettings.showReplayBallisticApogee);
+            ImGui::Checkbox("Error vs Actual", &replaySettings.showReplayErrorVsActual);
+            ImGui::Checkbox("Error vs Logged State", &replaySettings.showReplayErrorVsState);
+            ImGui::Checkbox("Error vs Logged Optimizer", &replaySettings.showReplayErrorVsOptimizer);
+            ImGui::Checkbox("Seed Horizontal Speed", &replaySettings.showSeedHorizontalSpeed);
+            ImGui::Checkbox("Seed Zenith", &replaySettings.showSeedZenith);
+            ImGui::Checkbox("Seed Angular Rate", &replaySettings.showSeedAngularRate);
+            ImGui::SeparatorText("Display");
+            ImGui::Checkbox("Normalize Seed Plots", &replaySettings.normalizeSeedPlots);
+            ImGui::Checkbox("Normalize Error Plot", &replaySettings.normalizeErrorPlots);
+            ImGui::Checkbox("Show Raw Inspector", &replaySettings.showRawInspector);
+            if (ImGui::Button("Recompute Replay")) {
+                std::string replayError;
+                if (!ComputeReplayAnalysis(dataset, replaySettings, replayAnalysis, replayError)) {
+                    replayAnalysis = ReplayAnalysis{};
+                    replayAnalysis.warnings.push_back(replayError);
+                }
+                replayHoveredRow = 0;
+                replayHoveredTime = 0.0f;
+                replayHasHoveredPoint = false;
+            }
+            if (!replayAnalysis.statusText.empty()) {
+                ImGui::TextDisabled("%s", replayAnalysis.statusText.c_str());
+            }
+            if (std::isfinite(replayAnalysis.actualApogeeMeters)) {
+                ImGui::Text("Actual Max Altitude: %.2f m", static_cast<double>(replayAnalysis.actualApogeeMeters));
+            }
+            if (std::isfinite(replayAnalysis.replayApogeeMeanMeters)) {
+                ImGui::Text("Replay Mean Apogee: %.2f m", static_cast<double>(replayAnalysis.replayApogeeMeanMeters));
+            }
+            if (std::isfinite(replayAnalysis.replayBallisticMeanMeters)) {
+                ImGui::Text("Ballistic Mean Apogee: %.2f m", static_cast<double>(replayAnalysis.replayBallisticMeanMeters));
+            }
+            if (std::isfinite(replayAnalysis.replayApogeeMinMeters) && std::isfinite(replayAnalysis.replayApogeeMaxMeters)) {
+                ImGui::Text("Replay Range: %.2f .. %.2f m",
+                            static_cast<double>(replayAnalysis.replayApogeeMinMeters),
+                            static_cast<double>(replayAnalysis.replayApogeeMaxMeters));
+            }
+            if (replayHasHoveredPoint) {
+                ImGui::SeparatorText("Hover");
+                ImGui::Text("Row: %zu", replayHoveredRow);
+                ImGui::Text("Time: %.4f s", static_cast<double>(replayHoveredTime));
+            }
+            if (!replayAnalysis.warnings.empty()) {
+                ImGui::SeparatorText("Replay Warnings");
+                for (const std::string &warning : replayAnalysis.warnings) {
+                    ImGui::TextColored(ImVec4(0.98f, 0.62f, 0.36f, 1.0f), "%s", warning.c_str());
+                }
+            }
+            ImGui::EndChild();
+
+            ImGui::SameLine();
+            ImGui::BeginChild("replay_plots", ImVec2(0.0f, 0.0f), true);
+            if (!replayAnalysis.ready || replayAnalysis.table.RowCount() == 0) {
+                ImGui::TextDisabled("Replay results are not available.");
+            } else {
+                std::vector<const NumericSeries *> apogeeSeries;
+                std::vector<const NumericSeries *> errorSeries;
+                std::vector<const NumericSeries *> seedSeries;
+                if (const NumericSeries *series = FindSeriesByName(replayAnalysis.table, "derived_replay_altitude_m"); series != nullptr) {
+                    apogeeSeries.push_back(series);
+                }
+                if (replaySettings.showLoggedStateApogee) {
+                    if (const NumericSeries *series = FindSeriesByName(replayAnalysis.table, "derived_replay_logged_state_apogee_m"); series != nullptr) {
+                        apogeeSeries.push_back(series);
+                    }
+                }
+                if (replaySettings.showLoggedOptimizerApogee) {
+                    if (const NumericSeries *series = FindSeriesByName(replayAnalysis.table, "derived_replay_logged_optimizer_apogee_m"); series != nullptr) {
+                        apogeeSeries.push_back(series);
+                    }
+                }
+                if (replaySettings.showReplaySaferApogee) {
+                    if (const NumericSeries *series = FindSeriesByName(replayAnalysis.table, "derived_replay_apogee_safer_m"); series != nullptr) {
+                        apogeeSeries.push_back(series);
+                    }
+                }
+                if (replaySettings.showReplayBallisticApogee) {
+                    if (const NumericSeries *series = FindSeriesByName(replayAnalysis.table, "derived_replay_apogee_ballistic_m"); series != nullptr) {
+                        apogeeSeries.push_back(series);
+                    }
+                }
+                if (replaySettings.showReplayErrorVsActual) {
+                    if (const NumericSeries *series = FindSeriesByName(replayAnalysis.table, "derived_replay_error_vs_actual_m"); series != nullptr) {
+                        errorSeries.push_back(series);
+                    }
+                }
+                if (replaySettings.showReplayErrorVsState) {
+                    if (const NumericSeries *series = FindSeriesByName(replayAnalysis.table, "derived_replay_error_vs_logged_state_m"); series != nullptr) {
+                        errorSeries.push_back(series);
+                    }
+                }
+                if (replaySettings.showReplayErrorVsOptimizer) {
+                    if (const NumericSeries *series = FindSeriesByName(replayAnalysis.table, "derived_replay_error_vs_logged_optimizer_m"); series != nullptr) {
+                        errorSeries.push_back(series);
+                    }
+                }
+                if (replaySettings.showSeedHorizontalSpeed) {
+                    if (const NumericSeries *series = FindSeriesByName(replayAnalysis.table, "derived_replay_seed_horizontal_speed_mps"); series != nullptr) {
+                        seedSeries.push_back(series);
+                    }
+                }
+                if (replaySettings.showSeedZenith) {
+                    if (const NumericSeries *series = FindSeriesByName(replayAnalysis.table, "derived_replay_seed_zenith_deg"); series != nullptr) {
+                        seedSeries.push_back(series);
+                    }
+                }
+                if (replaySettings.showSeedAngularRate) {
+                    if (const NumericSeries *series = FindSeriesByName(replayAnalysis.table, "derived_replay_seed_angular_rate_deg_s"); series != nullptr) {
+                        seedSeries.push_back(series);
+                    }
+                }
+
+                const float replayRef = std::isfinite(replayAnalysis.actualApogeeMeters) ? replayAnalysis.actualApogeeMeters : referenceValue;
+                replayHasHoveredPoint = false;
+                if (!apogeeSeries.empty()) {
+                    DrawOverlayChart(replayAnalysis.table,
+                                     apogeeSeries,
+                                     dataset.events,
+                                     tMin,
+                                     tMax,
+                                     drawEventLines,
+                                     std::isfinite(replayAnalysis.actualApogeeMeters),
+                                     replayRef,
+                                     false,
+                                     chartHeight,
+                                     &replayHasHoveredPoint,
+                                     &replayHoveredRow,
+                                     &replayHoveredTime);
+                    ImGui::Dummy(ImVec2(0.0f, 8.0f));
+                }
+                if (!errorSeries.empty()) {
+                    bool errorHovered = false;
+                    DrawOverlayChart(replayAnalysis.table,
+                                     errorSeries,
+                                     dataset.events,
+                                     tMin,
+                                     tMax,
+                                     false,
+                                     true,
+                                     0.0f,
+                                     replaySettings.normalizeErrorPlots,
+                                     chartHeight * 0.75f,
+                                     &errorHovered,
+                                     &replayHoveredRow,
+                                     &replayHoveredTime);
+                    replayHasHoveredPoint = replayHasHoveredPoint || errorHovered;
+                    ImGui::Dummy(ImVec2(0.0f, 8.0f));
+                }
+                if (!seedSeries.empty()) {
+                    bool seedHovered = false;
+                    DrawOverlayChart(replayAnalysis.table,
+                                     seedSeries,
+                                     dataset.events,
+                                     tMin,
+                                     tMax,
+                                     false,
+                                     false,
+                                     0.0f,
+                                     replaySettings.normalizeSeedPlots,
+                                     chartHeight * 0.8f,
+                                     &seedHovered,
+                                     &replayHoveredRow,
+                                     &replayHoveredTime);
+                    replayHasHoveredPoint = replayHasHoveredPoint || seedHovered;
+                }
+                if (replaySettings.showRawInspector && replayHasHoveredPoint && replayHoveredRow < replayAnalysis.table.RowCount() &&
+                    replayHoveredRow < dataset.table.RowCount()) {
+                    ImGui::Dummy(ImVec2(0.0f, 8.0f));
+                    ImGui::SeparatorText("Hovered Sample");
+                    ImGui::BeginChild("replay_hover_inspector", ImVec2(0.0f, 240.0f), true);
+                    ImGui::Text("Row %zu  t=%.4f s", replayHoveredRow, static_cast<double>(replayHoveredTime));
+
+                    const NumericSeries *altitude = FindSeriesByName(replayAnalysis.table, "derived_replay_altitude_m");
+                    const NumericSeries *saferApogee = FindSeriesByName(replayAnalysis.table, "derived_replay_apogee_safer_m");
+                    const NumericSeries *ballisticApogee = FindSeriesByName(replayAnalysis.table, "derived_replay_apogee_ballistic_m");
+                    const NumericSeries *stateApogee = FindSeriesByName(replayAnalysis.table, "derived_replay_logged_state_apogee_m");
+                    const NumericSeries *optimizerApogee = FindSeriesByName(replayAnalysis.table, "derived_replay_logged_optimizer_apogee_m");
+                    const NumericSeries *errorActual = FindSeriesByName(replayAnalysis.table, "derived_replay_error_vs_actual_m");
+                    const NumericSeries *errorState = FindSeriesByName(replayAnalysis.table, "derived_replay_error_vs_logged_state_m");
+                    const NumericSeries *errorOptimizer = FindSeriesByName(replayAnalysis.table, "derived_replay_error_vs_logged_optimizer_m");
+                    const NumericSeries *seedHorizontal = FindSeriesByName(replayAnalysis.table, "derived_replay_seed_horizontal_speed_mps");
+                    const NumericSeries *seedZenith = FindSeriesByName(replayAnalysis.table, "derived_replay_seed_zenith_deg");
+                    const NumericSeries *seedRate = FindSeriesByName(replayAnalysis.table, "derived_replay_seed_angular_rate_deg_s");
+                    const NumericSeries *sourceVz = FindSeriesByName(dataset.table, "state_velocity_z");
+                    const NumericSeries *sourceStatus = FindSeriesByName(dataset.table, "flight_status_raw");
+                    const NumericSeries *sourceFlags = FindSeriesByName(dataset.table, "sensor_predictor_seed_confidence_flags");
+
+                    ImGui::Columns(2, "replay_hover_columns", false);
+                    ImGui::TextUnformatted("Replay");
+                    ImGui::Separator();
+                    ImGui::Text("Altitude: %s", FormatOptionalFloat(SeriesValueAt(altitude, replayHoveredRow), "m").c_str());
+                    ImGui::Text("Safer Apogee: %s", FormatOptionalFloat(SeriesValueAt(saferApogee, replayHoveredRow), "m").c_str());
+                    ImGui::Text("Ballistic Apogee: %s", FormatOptionalFloat(SeriesValueAt(ballisticApogee, replayHoveredRow), "m").c_str());
+                    ImGui::Text("State Apogee: %s", FormatOptionalFloat(SeriesValueAt(stateApogee, replayHoveredRow), "m").c_str());
+                    ImGui::Text("Optimizer Apogee: %s", FormatOptionalFloat(SeriesValueAt(optimizerApogee, replayHoveredRow), "m").c_str());
+                    ImGui::Text("Err vs Actual: %s", FormatOptionalFloat(SeriesValueAt(errorActual, replayHoveredRow), "m").c_str());
+                    ImGui::Text("Err vs State: %s", FormatOptionalFloat(SeriesValueAt(errorState, replayHoveredRow), "m").c_str());
+                    ImGui::Text("Err vs Optimizer: %s", FormatOptionalFloat(SeriesValueAt(errorOptimizer, replayHoveredRow), "m").c_str());
+                    ImGui::Text("Seed Horizontal: %s", FormatOptionalFloat(SeriesValueAt(seedHorizontal, replayHoveredRow), "m/s").c_str());
+                    ImGui::Text("Seed Zenith: %s", FormatOptionalFloat(SeriesValueAt(seedZenith, replayHoveredRow), "deg").c_str());
+                    ImGui::Text("Seed Rate: %s", FormatOptionalFloat(SeriesValueAt(seedRate, replayHoveredRow), "deg/s").c_str());
+
+                    ImGui::NextColumn();
+                    ImGui::TextUnformatted("Source");
+                    ImGui::Separator();
+                    ImGui::Text("Flight Status: %s", FormatOptionalFloat(SeriesValueAt(sourceStatus, replayHoveredRow)).c_str());
+                    ImGui::Text("Vertical Velocity: %s", FormatOptionalFloat(SeriesValueAt(sourceVz, replayHoveredRow), "m/s").c_str());
+                    ImGui::Text("Predictor Flags: %s", FormatOptionalFloat(SeriesValueAt(sourceFlags, replayHoveredRow)).c_str());
+                    ImGui::Text("State X Vel: %s", FormatOptionalFloat(SeriesValueAt(FindSeriesByName(dataset.table, "state_velocity_x"), replayHoveredRow), "m/s").c_str());
+                    ImGui::Text("State Y Vel: %s", FormatOptionalFloat(SeriesValueAt(FindSeriesByName(dataset.table, "state_velocity_y"), replayHoveredRow), "m/s").c_str());
+                    ImGui::Text("Inertial Ax: %s", FormatOptionalFloat(SeriesValueAt(FindSeriesByName(dataset.table, "state_inertial_acceleration_x"), replayHoveredRow), "m/s^2").c_str());
+                    ImGui::Text("Inertial Ay: %s", FormatOptionalFloat(SeriesValueAt(FindSeriesByName(dataset.table, "state_inertial_acceleration_y"), replayHoveredRow), "m/s^2").c_str());
+                    ImGui::Text("Zenith Raw: %s", FormatOptionalFloat(SeriesValueAt(FindSeriesByName(dataset.table, "state_zenith"), replayHoveredRow), "rad").c_str());
+                    ImGui::Text("Auto Cmd: %s", FormatOptionalFloat(SeriesValueAt(FindSeriesByName(dataset.table, "sensor_auto_cmd_deg"), replayHoveredRow), "deg").c_str());
+                    ImGui::Text("Altimeter: %s", FormatOptionalFloat(SeriesValueAt(FindSeriesByName(dataset.table, "sensor_altitude_feet"), replayHoveredRow), "ft").c_str());
+                    ImGui::Columns(1);
+                    ImGui::EndChild();
+                }
+            }
+            ImGui::EndChild();
+            ImGui::EndTabItem();
         }
 
         if (ImGui::BeginTabItem("Raw CSV")) {

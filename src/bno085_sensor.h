@@ -4,3 +4,4 @@
 
 bool Bno085SensorBegin();
 bool Bno085SensorAcquire(SensorData &out);
+bool Bno085SensorIsInitialized();

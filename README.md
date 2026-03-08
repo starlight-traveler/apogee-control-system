@@ -7,9 +7,9 @@ Apogee Control System firmware plus Python-based analysis and tuning tools.
 - `src/` - PlatformIO firmware sources (Teensy flight computer).
 - `include/`, `lib/`, `test/` - PlatformIO headers, libraries, and tests.
 - `python/` - Python analysis scripts and models.
-- `tools/` - Offline utilities (log decoding, etc.).
+- `tools/` - Native decoders, replay utilities, and offline analysis helpers.
+- `telemetry/` - Live ground-station clients and telemetry UI code.
 - `data/` - Sample logs, events, and subscale datasets.
-- `standalone-c/` - Hosted replay tool and vendored Matplot++.
 - `docs/` - Project flow and architecture notes.
 
 ## Firmware flow (PlatformIO)
@@ -33,7 +33,7 @@ Apogee Control System firmware plus Python-based analysis and tuning tools.
 - Stream rate is capped by `settings::network::kTelemetryIntervalMs` to limit loop overhead.
 - Telemetry can be subscriber-gated via heartbeat (`kRequireSubscriberHeartbeat`), so send work is skipped when the ground client disconnects.
 
-Local ImGui receiver app: `local-imgui-telemetry/`.
+Local ImGui receiver app: `telemetry/imgui/`.
 
 ## Python analysis flow
 

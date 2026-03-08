@@ -7,10 +7,10 @@ from pathlib import Path
 from typing import List, Tuple
 
 
-ROOT = Path(__file__).resolve().parents[1]
-INPUT_CSV = ROOT / "standalone-c" / "fullscale_2.csv"
+ROOT = Path(__file__).resolve().parents[2]
+INPUT_CSV = ROOT / "tools" / "replay" / "fullscale_2.csv"
 CFD_CSV = ROOT / "lib" / "cfd.csv"
-OUTPUT_CSV = ROOT / "standalone-c" / "fullscale_2_option1_prediction.csv"
+OUTPUT_CSV = ROOT / "tools" / "replay" / "fullscale_2_option1_prediction.csv"
 
 
 # Constants (match src/constants.h and src/settings.h)

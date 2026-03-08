@@ -24,10 +24,10 @@ Install these development packages (via your package manager or vcpkg):
 ## Build and run
 
 ```bash
-cd local-imgui-telemetry
+cd telemetry/imgui
 cmake -S . -B build
 cmake --build build -j
-./build/teensy_imgui_telemetry 5005 192.168.4.1 5006
+./build/bin/teensy_imgui_telemetry 5005 192.168.4.1 5006
 ```
 
 Arguments:
@@ -63,7 +63,7 @@ The UI toggle launches `voice_listener.py`, which requires:
 
 Arch/PEP668-safe setup (recommended):
 ```bash
-cd local-imgui-telemetry
+cd telemetry/imgui
 python3 -m venv .venv
 . .venv/bin/activate
 python -m pip install --upgrade pip

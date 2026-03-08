@@ -155,6 +155,14 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
     const double accX = kalmanX_.Acceleration();
     const double accY = kalmanY_.Acceleration();
     const double accZ = kalmanZ_.Acceleration();
+    const double predictorHorizontalVelocity = UpdatePredictorHorizontalSpeed(
+        predictorHorizontalVelocity_,
+        accX,
+        accY,
+        dt,
+        (status_ == FlightStatus::Burn || status_ == FlightStatus::Coast),
+        velZ,
+        zenithRadians_);
 
     if (status_ == FlightStatus::Ground) {
         const bool accelerationSuggestsLiftoff =
@@ -229,16 +237,10 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
         predictorState.altitudeMeters = posZ;
         predictorState.horizontalDistanceMeters = 0.0;
         predictorState.verticalVelocity = velZ;
-        // Approximate total airspeed from vertical speed and zenith angle.
-        // Assume velocity aligns with body axis; project total speed into horizontal.
-        const double cosZenith = std::cos(zenithRadians_);
-        const double clampedCos = std::clamp(cosZenith, 0.1, 1.0);
-        const double speedAlongAxis = velZ / clampedCos;
-        const double speedSquared = speedAlongAxis * speedAlongAxis;
-        const double horizontalSquared = speedSquared - (velZ * velZ);
-        predictorState.horizontalVelocity = (horizontalSquared > 0.0) ? std::sqrt(horizontalSquared) : 0.0;
-        predictorState.zenith = zenithRadians_;
-        predictorState.angularVelocity = (dt != 0.0) ? (zenithRadians_ - lastZenith_) / dt : 0.0;
+        predictorState.horizontalVelocity = predictorHorizontalVelocity;
+        predictorState.zenith = ClampPredictorZenithRadians(zenithRadians_);
+        predictorState.angularVelocity =
+            ClampPredictorAngularRate((dt != 0.0) ? (zenithRadians_ - lastZenith_) / dt : 0.0);
         lastApogeePrediction_ = apogeePredictor_.PredictApogee(predictorState);
     }
 
@@ -322,6 +324,7 @@ void FlightComputer::ResetInternalState() {
     smoothedAcceleration_[0] = 0.0;
     smoothedAcceleration_[1] = 0.0;
     smoothedAcceleration_[2] = 0.0;
+    ResetPredictorHorizontalVelocityTracker(predictorHorizontalVelocity_);
 }
 
 void FlightComputer::ReportEvent(bool includeAltitude, float timeSeconds, const char *label) {

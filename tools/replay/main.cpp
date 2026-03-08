@@ -19,9 +19,9 @@
 
 #include "include/Arduino.h"
 
-#include "../src/constants.h"
-#include "../src/flight_computer.h"
-#include "../src/apogee_model.h"
+#include "../../src/constants.h"
+#include "../../src/flight_computer.h"
+#include "../../src/apogee_model.h"
 #include <matplot/matplot.h>
 
 namespace {

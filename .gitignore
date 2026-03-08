@@ -116,6 +116,13 @@ tools/*_events.json
 tools/*.png
 tools/*.svg
 
+# Replay generated artifacts
+tools/replay/output*
+tools/replay/*_output.txt
+tools/replay/predictor_sim_*.csv
+tools/replay/predictor_sim_*.svg
+tools/replay/*_replay_*.svg
+
 # Local replay/generated files
 standalone-c/*.BIN
 standalone-c/*.bin

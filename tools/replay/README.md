@@ -1,4 +1,4 @@
-# Standalone Flight Computer Driver
+# Hosted Replay Driver
 
 This directory contains a small hosted application that reuses the
 Teensy flight computer logic to replay telemetry from CSV files. It makes
@@ -8,13 +8,13 @@ prediction algorithm without loading firmware onto the rocket avionics.
 ## Building
 
 ```bash
-cd standalone-c
-make
+cd tools/replay
+cmake -S . -B build
+cmake --build build -j
 ```
 
-The build produces the `flight_computer_standalone` executable next to
-the Makefile. Set `CXX` if you prefer a different compiler, and extend
-`CXXFLAGS`/`LDFLAGS` as needed.
+The build produces `build/bin/acs_replay`. A legacy `Makefile` is still
+present for ad-hoc local builds, but CMake is now the primary entry point.
 
 ## Input format
 
@@ -33,7 +33,7 @@ Recognised column names are listed when you run the program with
 custom labels, e.g.
 
 ```bash
-./flight_computer_standalone data.csv \
+./build/bin/acs_replay data.csv \
     --field timestamp=Time_s \
     --field altitude_feet=Alt_pad_ft \
     --field accel_icm_z=AX_wf
@@ -42,7 +42,7 @@ custom labels, e.g.
 ## Running
 
 ```bash
-./flight_computer_standalone flight_log.csv [options]
+./build/bin/acs_replay flight_log.csv [options]
 ```
 
 Important flags:

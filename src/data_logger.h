@@ -43,6 +43,18 @@ struct LogFilePreamble {
     uint8_t reserved[12];
 };
 
+struct DataLoggerDiagnostics {
+    bool initialized = false;
+    bool syncPending = false;
+    size_t bufferedBytes = 0;
+    uint32_t lastWriteDurationUs = 0;
+    uint32_t maxWriteDurationUs = 0;
+    uint32_t lastSyncDurationUs = 0;
+    uint32_t maxSyncDurationUs = 0;
+    uint32_t droppedTelemetryRecords = 0;
+    uint32_t appendFailures = 0;
+};
+
 bool DataLoggerBegin();
 void DataLoggerLogTelemetry(const SensorData &sensor,
                             FlightStatus status,
@@ -53,8 +65,10 @@ void DataLoggerLogEvent(FlightEventType type,
                         float altitudeMeters,
                         float verticalVelocity,
                         float apogeeEstimate);
+void DataLoggerForceSync();
 void DataLoggerService();
 bool DataLoggerIsInitialized();
+DataLoggerDiagnostics DataLoggerGetDiagnostics();
 // Reads a text file from the SD card line-by-line and invokes the callback for each line.
 // Returns false if the SD card or file is unavailable.
 bool DataLoggerReadTextFile(const char *path, bool (*lineCallback)(const char *line, void *context), void *context);
