@@ -84,6 +84,16 @@ void FlightComputer::Begin(double sigmaAccelXY,
     ResetInternalState();
 }
 
+/// Updates the runtime-configurable environment/vehicle parameters in-place.
+void FlightComputer::ReconfigurePredictor(const EnvironmentModel::Config &environmentConfig,
+                                          const ApogeeVehicleParameters &vehicleParameters,
+                                          const ApogeeForceTable *forceTable) {
+    environment_.Configure(environmentConfig);
+    apogeePredictor_.SetEnvironment(environment_);
+    apogeePredictor_.SetVehicleParameters(vehicleParameters);
+    apogeePredictor_.SetForceTable(forceTable);
+}
+
 /// Processes one sensor sample and updates the filtered flight state.
 bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
     const bool hasBnoAccel =
@@ -164,14 +174,13 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
     const double accX = kalmanX_.Acceleration();
     const double accY = kalmanY_.Acceleration();
     const double accZ = kalmanZ_.Acceleration();
-    const double predictorHorizontalVelocity = UpdatePredictorHorizontalSpeed(
-        predictorHorizontalVelocity_,
-        accX,
-        accY,
-        dt,
-        (status_ == FlightStatus::Burn || status_ == FlightStatus::Coast),
-        velZ,
-        zenithRadians_);
+    UpdatePredictorHorizontalSpeed(predictorHorizontalVelocity_,
+                                   accX,
+                                   accY,
+                                   dt,
+                                   (status_ == FlightStatus::Burn || status_ == FlightStatus::Coast),
+                                   velZ,
+                                   zenithRadians_);
 
     if (status_ == FlightStatus::Ground) {
         const bool accelerationSuggestsLiftoff =

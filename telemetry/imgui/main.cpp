@@ -11,10 +11,12 @@
 #include <chrono>
 #include <cmath>
 #include <cctype>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <filesystem>
 #include <limits.h>
 #include <mutex>
@@ -23,8 +25,6 @@
 #include <thread>
 #include <unordered_map>
 #include <vector>
-#include <sys/wait.h>
-#include <signal.h>
 
 #if defined(__APPLE__)
 #include <OpenGL/gl3.h>
@@ -37,17 +37,26 @@
 #include <imgui_impl_glfw.h>
 #include <imgui_impl_opengl3.h>
 
+#if defined(ACS_ENABLE_NATIVE_VOICE) && ACS_ENABLE_NATIVE_VOICE
+#include <curl/curl.h>
+#include <portaudio.h>
+#include <whisper.h>
+#endif
+
 #include "../../include/telemetry_packet.h"
 
 namespace {
 
 struct SharedTelemetry {
     telemetry::PacketV1 latest{};
+    telemetry::SettingsSnapshotV1 settings{};
     uint64_t packetsReceived = 0;
     uint64_t packetsDropped = 0;
     uint32_t lastSequence = 0;
     bool hasPacket = false;
+    bool hasSettings = false;
     std::chrono::steady_clock::time_point lastRx = std::chrono::steady_clock::time_point::min();
+    std::chrono::steady_clock::time_point lastSettingsRx = std::chrono::steady_clock::time_point::min();
 };
 
 struct ServoCalibrationPoint {
@@ -86,6 +95,31 @@ float SnapToServoLookupAngle(float angleDeg) {
         }
     }
     return bestAngle;
+}
+
+const char *SettingsResultName(uint8_t result) {
+    switch (result) {
+        case telemetry::kSettingsResultNone:
+            return "none";
+        case telemetry::kSettingsResultApplied:
+            return "applied";
+        case telemetry::kSettingsResultRejected:
+            return "rejected";
+        case telemetry::kSettingsResultPersistFailed:
+            return "persist failed";
+        case telemetry::kSettingsResultStorageUnavailable:
+            return "storage unavailable";
+        default:
+            return "unknown";
+    }
+}
+
+bool SettingsStatusFlagSet(uint8_t statusFlags, uint8_t flag) {
+    return (statusFlags & flag) != 0u;
+}
+
+telemetry::RuntimeSettingsPayloadV1 PayloadFromSnapshot(const telemetry::SettingsSnapshotV1 &snapshot) {
+    return snapshot.payload;
 }
 
 std::string TrimString(const std::string &value) {
@@ -258,127 +292,282 @@ std::optional<ParsedVoiceCommand> ParseVoiceCommand(const std::string &rawText) 
     return command;
 }
 
-std::string ResolveVoiceScriptPath(const char *argv0) {
-    const char *envScript = std::getenv("ACS_VOICE_SCRIPT");
-    if (envScript != nullptr && envScript[0] != '\0' && access(envScript, R_OK) == 0) {
-        return std::string(envScript);
+struct WhisperModelChoice {
+    const char *label;
+    const char *fileName;
+    const char *url;
+};
+
+constexpr std::array<WhisperModelChoice, 4> kWhisperModels = {{
+    {"tiny.en (75 MB)", "ggml-tiny.en.bin", "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en.bin"},
+    {"base.en (142 MB)", "ggml-base.en.bin", "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin"},
+    {"small.en (466 MB)", "ggml-small.en.bin", "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.en.bin"},
+    {"medium.en (1.5 GB)", "ggml-medium.en.bin", "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-medium.en.bin"},
+}};
+
+std::string DefaultModelsDirectory(const char *argv0) {
+    const char *envModelDir = std::getenv("WHISPER_MODEL_DIR");
+    if (envModelDir != nullptr && envModelDir[0] != '\0') {
+        return std::string(envModelDir);
     }
 
-    std::vector<std::string> candidates;
-    candidates.emplace_back("voice_listener.py");
+    std::vector<std::filesystem::path> candidates;
+    candidates.emplace_back("models");
 
     if (argv0 != nullptr && argv0[0] != '\0') {
         const std::filesystem::path argPath(argv0);
         if (argPath.has_parent_path()) {
-            candidates.push_back((argPath.parent_path() / "voice_listener.py").string());
+            candidates.push_back(argPath.parent_path() / "models");
         }
     }
 
-#if defined(__linux__)
-    char exePath[PATH_MAX];
-    const ssize_t exeLen = readlink("/proc/self/exe", exePath, sizeof(exePath) - 1);
-    if (exeLen > 0) {
-        exePath[exeLen] = '\0';
-        const std::filesystem::path selfPath(exePath);
-        candidates.push_back((selfPath.parent_path() / "voice_listener.py").string());
+    for (const std::filesystem::path &candidate : candidates) {
+        if (std::filesystem::exists(candidate) && std::filesystem::is_directory(candidate)) {
+            return candidate.string();
+        }
+    }
+
+    return "models";
+}
+
+std::string ResolveWhisperModelPath(const char *argv0, const char *defaultFileName) {
+    const char *envModel = std::getenv("WHISPER_MODEL_PATH");
+    if (envModel != nullptr && envModel[0] != '\0' && std::filesystem::is_regular_file(envModel)) {
+        return std::string(envModel);
+    }
+
+    const std::filesystem::path modelPath = std::filesystem::path(DefaultModelsDirectory(argv0)) / defaultFileName;
+    return modelPath.string();
+}
+
+class WhisperModelDownloader {
+  public:
+    ~WhisperModelDownloader() { Stop(); }
+
+    bool Start(const std::string &url, const std::string &outputPath) {
+#if !defined(ACS_ENABLE_NATIVE_VOICE) || !ACS_ENABLE_NATIVE_VOICE
+        (void)url;
+        (void)outputPath;
+        SetError("native voice support not built");
+        return false;
+#else
+        if (running_.load()) {
+            SetError("download already in progress");
+            return false;
+        }
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            lastError_.clear();
+            latestStatus_ = "starting download";
+            completedPath_.clear();
+            hasCompletedDownload_ = false;
+            progress_ = 0.0f;
+        }
+        running_.store(true);
+        worker_ = std::thread([this, url, outputPath]() { DownloadLoop(url, outputPath); });
+        return true;
+#endif
+    }
+
+    void Stop() {
+        cancelRequested_.store(true);
+        if (worker_.joinable()) {
+            worker_.join();
+        }
+        cancelRequested_.store(false);
+        running_.store(false);
+    }
+
+    bool Running() const { return running_.load(); }
+
+    float Progress() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return progress_;
+    }
+
+    std::string Status() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return latestStatus_;
+    }
+
+    std::string LastError() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return lastError_;
+    }
+
+    bool ConsumeCompletedDownload(std::string *pathOut) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!hasCompletedDownload_) {
+            return false;
+        }
+        *pathOut = completedPath_;
+        hasCompletedDownload_ = false;
+        return true;
+    }
+
+  private:
+#if defined(ACS_ENABLE_NATIVE_VOICE) && ACS_ENABLE_NATIVE_VOICE
+    struct DownloadContext {
+        WhisperModelDownloader *self = nullptr;
+        FILE *file = nullptr;
+    };
+
+    static size_t WriteCallback(char *ptr, size_t size, size_t nmemb, void *userdata) {
+        DownloadContext *context = static_cast<DownloadContext *>(userdata);
+        return fwrite(ptr, size, nmemb, context->file);
+    }
+
+    static int ProgressCallback(void *clientp, curl_off_t total, curl_off_t now, curl_off_t, curl_off_t) {
+        DownloadContext *context = static_cast<DownloadContext *>(clientp);
+        if (context->self->cancelRequested_.load()) {
+            return 1;
+        }
+        std::lock_guard<std::mutex> lock(context->self->mutex_);
+        if (total > 0) {
+            context->self->progress_ = static_cast<float>(static_cast<double>(now) / static_cast<double>(total));
+        }
+        char buffer[96];
+        std::snprintf(buffer,
+                      sizeof(buffer),
+                      "downloading %.1f MB / %.1f MB",
+                      static_cast<double>(now) / (1024.0 * 1024.0),
+                      static_cast<double>(total) / (1024.0 * 1024.0));
+        context->self->latestStatus_ = buffer;
+        return 0;
+    }
+
+    void DownloadLoop(const std::string &url, const std::string &outputPath) {
+        const std::filesystem::path outPath(outputPath);
+        std::filesystem::create_directories(outPath.parent_path());
+        const std::filesystem::path tempPath = outPath.string() + ".part";
+
+        CURL *curl = curl_easy_init();
+        if (curl == nullptr) {
+            SetError("failed to initialize CURL");
+            running_.store(false);
+            return;
+        }
+
+        FILE *file = std::fopen(tempPath.string().c_str(), "wb");
+        if (file == nullptr) {
+            curl_easy_cleanup(curl);
+            SetError("failed to open model output file");
+            running_.store(false);
+            return;
+        }
+
+        DownloadContext context{};
+        context.self = this;
+        context.file = file;
+
+        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+        curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+        curl_easy_setopt(curl, CURLOPT_FAILONERROR, 1L);
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, &WriteCallback);
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &context);
+        curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, &ProgressCallback);
+        curl_easy_setopt(curl, CURLOPT_XFERINFODATA, &context);
+        curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+
+        const CURLcode result = curl_easy_perform(curl);
+        std::fclose(file);
+        curl_easy_cleanup(curl);
+
+        if (result != CURLE_OK) {
+            std::filesystem::remove(tempPath);
+            SetError(std::string("download failed: ") + curl_easy_strerror(result));
+            running_.store(false);
+            return;
+        }
+
+        std::error_code renameError;
+        std::filesystem::rename(tempPath, outPath, renameError);
+        if (renameError) {
+            std::filesystem::remove(tempPath);
+            SetError(std::string("failed to finalize model file: ") + renameError.message());
+            running_.store(false);
+            return;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            completedPath_ = outPath.string();
+            hasCompletedDownload_ = true;
+            progress_ = 1.0f;
+            latestStatus_ = "download complete";
+            lastError_.clear();
+        }
+        running_.store(false);
     }
 #endif
 
-    for (const std::string &candidate : candidates) {
-        if (access(candidate.c_str(), R_OK) == 0) {
-            return candidate;
-        }
+    void SetError(const std::string &text) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        lastError_ = text;
+        latestStatus_ = text;
     }
 
-    return "voice_listener.py";
-}
+    mutable std::mutex mutex_;
+    std::atomic<bool> running_{false};
+    std::atomic<bool> cancelRequested_{false};
+    std::thread worker_;
+    float progress_ = 0.0f;
+    std::string latestStatus_;
+    std::string lastError_;
+    std::string completedPath_;
+    bool hasCompletedDownload_ = false;
+};
 
 class VoiceCommandReceiver {
   public:
     ~VoiceCommandReceiver() { Stop(); }
 
-    bool Start(const char *scriptPath) {
+    bool Start(const char *modelPath) {
         if (running_.load()) {
             return true;
         }
-        if (scriptPath == nullptr || scriptPath[0] == '\0' || access(scriptPath, R_OK) != 0) {
-            SetError("voice script not found (set ACS_VOICE_SCRIPT or place voice_listener.py near app)");
+#if !defined(ACS_ENABLE_NATIVE_VOICE) || !ACS_ENABLE_NATIVE_VOICE
+        (void)modelPath;
+        SetError("native voice support not built; provide whisper.cpp and PortAudio to CMake");
+        return false;
+#else
+        if (modelPath == nullptr || modelPath[0] == '\0' || !std::filesystem::is_regular_file(modelPath)) {
+            SetError("Whisper model not found; download one in the GUI or set WHISPER_MODEL_PATH");
             return false;
         }
-
-        int pipeFds[2];
-        if (pipe(pipeFds) != 0) {
-            SetError("voice pipe() failed");
-            return false;
-        }
-
-        const pid_t childPid = fork();
-        if (childPid < 0) {
-            close(pipeFds[0]);
-            close(pipeFds[1]);
-            SetError("voice fork() failed");
-            return false;
-        }
-
-        if (childPid == 0) {
-            dup2(pipeFds[1], STDOUT_FILENO);
-            dup2(pipeFds[1], STDERR_FILENO);
-            close(pipeFds[0]);
-            close(pipeFds[1]);
-
-            const char *existingModelPath = std::getenv("VOSK_MODEL_PATH");
-            if (existingModelPath == nullptr || existingModelPath[0] == '\0') {
-                const std::filesystem::path scriptFile(scriptPath);
-                const std::filesystem::path modelPath =
-                    scriptFile.parent_path() / "models" / "vosk-model-en-us-0.22";
-                const std::string modelPathString = modelPath.string();
-                setenv("VOSK_MODEL_PATH", modelPathString.c_str(), 0);
-            }
-
-            const char *overridePython = std::getenv("ACS_VOICE_PYTHON");
-            if (overridePython != nullptr && overridePython[0] != '\0') {
-                execl(overridePython, overridePython, scriptPath, (char *)nullptr);
-            }
-
-            const char *venvPython = ".venv/bin/python3";
-            if (access(venvPython, X_OK) == 0) {
-                execl(venvPython, venvPython, scriptPath, (char *)nullptr);
-            }
-
-            execlp("python3", "python3", scriptPath, (char *)nullptr);
-            _exit(127);
-        }
-
-        close(pipeFds[1]);
         {
             std::lock_guard<std::mutex> lock(mutex_);
             lastError_.clear();
             latestTranscript_.clear();
             latestAcceptedCommand_.clear();
             hasPendingCommand_ = false;
+            modelPath_ = modelPath;
         }
-        readFd_ = pipeFds[0];
-        childPid_ = childPid;
+        {
+            std::lock_guard<std::mutex> lock(audioMutex_);
+            chunkQueue_.clear();
+        }
         running_.store(true);
-        worker_ = std::thread([this]() { ReadLoop(); });
+        captureWorker_ = std::thread([this]() { CaptureLoop(); });
+        transcribeWorker_ = std::thread([this]() { TranscribeLoop(); });
         return true;
+#endif
     }
 
     void Stop() {
-        const bool wasRunning = running_.exchange(false);
-
-        if (wasRunning && childPid_ > 0) {
-            kill(childPid_, SIGTERM);
+        running_.store(false);
+#if defined(ACS_ENABLE_NATIVE_VOICE) && ACS_ENABLE_NATIVE_VOICE
+        if (stream_ != nullptr) {
+            Pa_AbortStream(stream_);
         }
+#endif
+        audioCv_.notify_all();
 
-        if (worker_.joinable()) {
-            worker_.join();
+        if (captureWorker_.joinable()) {
+            captureWorker_.join();
         }
-
-        if (childPid_ > 0) {
-            int status = 0;
-            waitpid(childPid_, &status, 0);
-            childPid_ = -1;
+        if (transcribeWorker_.joinable()) {
+            transcribeWorker_.join();
         }
     }
 
@@ -410,61 +599,195 @@ class VoiceCommandReceiver {
     }
 
   private:
+    void PublishTranscriptLocked(const std::string &line) {
+        latestTranscript_ = line;
+        const std::optional<ParsedVoiceCommand> parsed = ParseVoiceCommand(line);
+        if (!parsed.has_value()) {
+            return;
+        }
+        pendingCommand_ = parsed.value();
+        hasPendingCommand_ = true;
+        if (parsed->setAuto) {
+            latestAcceptedCommand_ = "Voice: return to auto";
+        } else {
+            char temp[96];
+            std::snprintf(temp, sizeof(temp), "Voice: actuate %.0f deg", parsed->angleDeg);
+            latestAcceptedCommand_ = temp;
+        }
+    }
+
     void SetError(const std::string &text) {
         std::lock_guard<std::mutex> lock(mutex_);
         lastError_ = text;
     }
 
-    void ReadLoop() {
-        FILE *stream = fdopen(readFd_, "r");
-        if (stream == nullptr) {
-            SetError("voice fdopen() failed");
+    void CaptureLoop() {
+#if !defined(ACS_ENABLE_NATIVE_VOICE) || !ACS_ENABLE_NATIVE_VOICE
+        return;
+#else
+        if (Pa_Initialize() != paNoError) {
+            SetError("PortAudio initialization failed");
+            running_.store(false);
+            audioCv_.notify_all();
             return;
         }
 
-        char lineBuffer[512];
-        while (running_.load() && std::fgets(lineBuffer, sizeof(lineBuffer), stream) != nullptr) {
-            std::string line = TrimString(std::string(lineBuffer));
-            if (line.empty()) {
+        const PaError openError =
+            Pa_OpenDefaultStream(&stream_, 1, 0, paInt16, kSampleRate, kFramesPerBuffer, nullptr, nullptr);
+        if (openError != paNoError) {
+            SetError(std::string("PortAudio open failed: ") + Pa_GetErrorText(openError));
+            Pa_Terminate();
+            running_.store(false);
+            audioCv_.notify_all();
+            return;
+        }
+
+        const PaError startError = Pa_StartStream(stream_);
+        if (startError != paNoError) {
+            SetError(std::string("PortAudio start failed: ") + Pa_GetErrorText(startError));
+            Pa_CloseStream(stream_);
+            stream_ = nullptr;
+            Pa_Terminate();
+            running_.store(false);
+            audioCv_.notify_all();
+            return;
+        }
+
+        std::vector<int16_t> audioBuffer(kFramesPerBuffer);
+        std::vector<float> captureBuffer;
+        captureBuffer.reserve(kChunkSamples * 2);
+        while (running_.load()) {
+            const PaError readError = Pa_ReadStream(stream_, audioBuffer.data(), kFramesPerBuffer);
+            if (readError == paInputOverflowed) {
                 continue;
             }
-
-            if (line.rfind("ERROR:", 0) == 0) {
-                std::lock_guard<std::mutex> lock(mutex_);
-                lastError_ = line;
-                continue;
-            }
-
-            std::lock_guard<std::mutex> lock(mutex_);
-            latestTranscript_ = line;
-            const std::optional<ParsedVoiceCommand> parsed = ParseVoiceCommand(line);
-            if (parsed.has_value()) {
-                pendingCommand_ = parsed.value();
-                hasPendingCommand_ = true;
-                if (parsed->setAuto) {
-                    latestAcceptedCommand_ = "Voice: return to auto";
-                } else {
-                    char temp[96];
-                    std::snprintf(temp, sizeof(temp), "Voice: actuate %.0f deg", parsed->angleDeg);
-                    latestAcceptedCommand_ = temp;
+            if (readError != paNoError) {
+                if (running_.load()) {
+                    SetError(std::string("PortAudio read failed: ") + Pa_GetErrorText(readError));
                 }
+                break;
+            }
+
+            for (int16_t sample : audioBuffer) {
+                captureBuffer.push_back(static_cast<float>(sample) / 32768.0f);
+            }
+
+            while (captureBuffer.size() >= static_cast<size_t>(kChunkSamples)) {
+                std::vector<float> chunk(captureBuffer.begin(), captureBuffer.begin() + kChunkSamples);
+                captureBuffer.erase(captureBuffer.begin(), captureBuffer.begin() + kChunkSamples);
+
+                double sumSquares = 0.0;
+                for (float sample : chunk) {
+                    sumSquares += static_cast<double>(sample) * static_cast<double>(sample);
+                }
+                const float rms = std::sqrt(static_cast<float>(sumSquares / std::max<size_t>(1, chunk.size())));
+                if (rms < kMinRms) {
+                    continue;
+                }
+
+                {
+                    std::lock_guard<std::mutex> lock(audioMutex_);
+                    while (chunkQueue_.size() >= kMaxQueuedChunks) {
+                        chunkQueue_.pop_front();
+                    }
+                    chunkQueue_.push_back(std::move(chunk));
+                }
+                audioCv_.notify_one();
             }
         }
 
-        std::fclose(stream);
+        if (stream_ != nullptr) {
+            Pa_StopStream(stream_);
+            Pa_CloseStream(stream_);
+            stream_ = nullptr;
+        }
         running_.store(false);
+        Pa_Terminate();
+        audioCv_.notify_all();
+#endif
     }
 
+    void TranscribeLoop() {
+#if !defined(ACS_ENABLE_NATIVE_VOICE) || !ACS_ENABLE_NATIVE_VOICE
+        return;
+#else
+        whisper_context_params contextParams = whisper_context_default_params();
+        whisper_context *context = whisper_init_from_file_with_params(modelPath_.c_str(), contextParams);
+        if (context == nullptr) {
+            SetError("failed to load Whisper model");
+            running_.store(false);
+            audioCv_.notify_all();
+            if (stream_ != nullptr) {
+                Pa_AbortStream(stream_);
+            }
+            return;
+        }
+
+        std::string lastPublishedTranscript;
+        while (running_.load()) {
+            std::vector<float> chunk;
+            {
+                std::unique_lock<std::mutex> lock(audioMutex_);
+                audioCv_.wait(lock, [this]() { return !running_.load() || !chunkQueue_.empty(); });
+                if (!running_.load() && chunkQueue_.empty()) {
+                    break;
+                }
+                chunk = std::move(chunkQueue_.front());
+                chunkQueue_.pop_front();
+            }
+
+            whisper_full_params params = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
+            params.print_progress = false;
+            params.print_realtime = false;
+            params.print_timestamps = false;
+            params.print_special = false;
+            params.translate = false;
+            params.language = "en";
+            params.n_threads = std::max(1u, std::thread::hardware_concurrency() / 2u);
+            const int whisperResult = whisper_full(context, params, chunk.data(), static_cast<int>(chunk.size()));
+            if (whisperResult != 0) {
+                continue;
+            }
+
+            std::string transcript;
+            const int segmentCount = whisper_full_n_segments(context);
+            for (int i = 0; i < segmentCount; ++i) {
+                transcript += whisper_full_get_segment_text(context, i);
+            }
+            transcript = TrimString(transcript);
+            if (!transcript.empty() && ToLowerString(transcript) != lastPublishedTranscript) {
+                lastPublishedTranscript = ToLowerString(transcript);
+                std::lock_guard<std::mutex> lock(mutex_);
+                PublishTranscriptLocked(transcript);
+            }
+        }
+
+        whisper_free(context);
+#endif
+    }
+
+    static constexpr float kSampleRate = 16000.0f;
+    static constexpr unsigned long kFramesPerBuffer = 1024;
+    static constexpr size_t kChunkSamples = 16000 * 3;
+    static constexpr float kMinRms = 0.008f;
+    static constexpr size_t kMaxQueuedChunks = 2;
+
     mutable std::mutex mutex_;
+    std::mutex audioMutex_;
+    std::condition_variable audioCv_;
     std::atomic<bool> running_{false};
-    std::thread worker_;
-    int readFd_ = -1;
-    pid_t childPid_ = -1;
+    std::thread captureWorker_;
+    std::thread transcribeWorker_;
+    std::deque<std::vector<float>> chunkQueue_;
     std::string lastError_;
     std::string latestTranscript_;
     std::string latestAcceptedCommand_;
     ParsedVoiceCommand pendingCommand_{};
     bool hasPendingCommand_ = false;
+    std::string modelPath_;
+#if defined(ACS_ENABLE_NATIVE_VOICE) && ACS_ENABLE_NATIVE_VOICE
+    PaStream *stream_ = nullptr;
+#endif
 };
 
 class UdpReceiver {
@@ -517,6 +840,7 @@ class UdpReceiver {
         manualActuationAngleDeg_ = snappedAngleDeg;
         if (changed) {
             sendActuationImmediately_ = true;
+            commandBurstPacketsRemaining_ = kCommandBurstPacketCount;
         }
     }
 
@@ -534,6 +858,7 @@ class UdpReceiver {
 
         manualActuationOverride_ = false;
         manualActuationAngleDeg_ = 0.0f;
+        commandBurstPacketsRemaining_ = kCommandBurstPacketCount;
         disconnectPacketsRemaining_ = 5;
     }
 
@@ -543,6 +868,20 @@ class UdpReceiver {
     }
 
     bool HeartbeatEnabled() const { return heartbeatEnabled_; }
+
+    uint32_t RequestSettingsSnapshot() {
+        telemetry::RuntimeSettingsPayloadV1 payload{};
+        return QueueSettingsCommand(telemetry::kSettingsOpRequestCurrent, payload);
+    }
+
+    uint32_t ApplyAndPersistSettings(const telemetry::RuntimeSettingsPayloadV1 &payload) {
+        return QueueSettingsCommand(telemetry::kSettingsOpApplyAndPersist, payload);
+    }
+
+    uint32_t RestoreDefaultSettings() {
+        telemetry::RuntimeSettingsPayloadV1 payload{};
+        return QueueSettingsCommand(telemetry::kSettingsOpRestoreDefaults, payload);
+    }
 
   private:
     void SetError(const char *text) {
@@ -594,14 +933,26 @@ class UdpReceiver {
                     sendActuationImmediately_ = false;
                 }
             }
+            bool sendBurstPacket = false;
+            {
+                std::lock_guard<std::mutex> lock(commandMutex_);
+                sendBurstPacket = commandBurstPacketsRemaining_ > 0;
+            }
+            const auto periodicActuationInterval = std::chrono::milliseconds(100);
+            const auto burstActuationInterval = std::chrono::milliseconds(25);
+            const auto requiredInterval = sendBurstPacket ? burstActuationInterval : periodicActuationInterval;
             if (heartbeatEnabled_ &&
-                (sendActuationNow || (now - lastActuationCommandSent_) >= std::chrono::milliseconds(100))) {
+                (sendActuationNow || (sendBurstPacket && (now - lastActuationCommandSent_) >= requiredInterval) ||
+                 (now - lastActuationCommandSent_) >= periodicActuationInterval)) {
                 telemetry::ActuationCommandV1 command{};
                 {
                     std::lock_guard<std::mutex> lock(commandMutex_);
                     command.mode = manualActuationOverride_ ? telemetry::kActuationModeManual
                                                             : telemetry::kActuationModeAuto;
                     command.angleDeg = manualActuationAngleDeg_;
+                    if (commandBurstPacketsRemaining_ > 0) {
+                        --commandBurstPacketsRemaining_;
+                    }
                 }
                 sendto(socketFd_,
                        &command,
@@ -630,6 +981,29 @@ class UdpReceiver {
                     --disconnectPacketsRemaining_;
                 }
             }
+            bool sendSettingsPacket = false;
+            {
+                std::lock_guard<std::mutex> lock(commandMutex_);
+                sendSettingsPacket = settingsBurstPacketsRemaining_ > 0;
+            }
+            if (heartbeatEnabled_ && sendSettingsPacket &&
+                (now - lastSettingsCommandSent_) >= std::chrono::milliseconds(75)) {
+                telemetry::SettingsCommandV1 command{};
+                {
+                    std::lock_guard<std::mutex> lock(commandMutex_);
+                    command = pendingSettingsCommand_;
+                    if (settingsBurstPacketsRemaining_ > 0) {
+                        --settingsBurstPacketsRemaining_;
+                    }
+                }
+                sendto(socketFd_,
+                       &command,
+                       sizeof(command),
+                       0,
+                       reinterpret_cast<const sockaddr *>(&teensyAddr_),
+                       sizeof(teensyAddr_));
+                lastSettingsCommandSent_ = now;
+            }
 
             fd_set readSet;
             FD_ZERO(&readSet);
@@ -644,41 +1018,74 @@ class UdpReceiver {
                 continue;
             }
 
-            telemetry::PacketV1 packet{};
+            std::array<uint8_t, 256> packetBuffer{};
             sockaddr_in src{};
             socklen_t srcLen = sizeof(src);
             const ssize_t n = recvfrom(socketFd_,
-                                       &packet,
-                                       sizeof(packet),
+                                       packetBuffer.data(),
+                                       packetBuffer.size(),
                                        0,
                                        reinterpret_cast<sockaddr *>(&src),
                                        &srcLen);
-            if (n != static_cast<ssize_t>(sizeof(packet))) {
+            if (n < 8) {
                 continue;
             }
 
-            if (packet.magic != telemetry::kPacketMagic || packet.version != telemetry::kPacketVersion ||
-                packet.size != sizeof(telemetry::PacketV1)) {
-                continue;
-            }
+            uint32_t magic = 0;
+            std::memcpy(&magic, packetBuffer.data(), sizeof(magic));
+            if (magic == telemetry::kPacketMagic && n == static_cast<ssize_t>(sizeof(telemetry::PacketV1))) {
+                telemetry::PacketV1 packet{};
+                std::memcpy(&packet, packetBuffer.data(), sizeof(packet));
+                if (packet.version != telemetry::kPacketVersion || packet.size != sizeof(telemetry::PacketV1)) {
+                    continue;
+                }
 
-            std::lock_guard<std::mutex> lock(mutex_);
-            if (shared_.hasPacket) {
-                const uint32_t expected = shared_.lastSequence + 1u;
-                if (packet.sequence != expected) {
-                    if (packet.sequence > expected) {
-                        shared_.packetsDropped += static_cast<uint64_t>(packet.sequence - expected);
-                    } else {
-                        shared_.packetsDropped += 1;
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (shared_.hasPacket) {
+                    const uint32_t expected = shared_.lastSequence + 1u;
+                    if (packet.sequence != expected) {
+                        if (packet.sequence > expected) {
+                            shared_.packetsDropped += static_cast<uint64_t>(packet.sequence - expected);
+                        } else {
+                            shared_.packetsDropped += 1;
+                        }
                     }
                 }
+                shared_.latest = packet;
+                shared_.lastSequence = packet.sequence;
+                shared_.packetsReceived++;
+                shared_.hasPacket = true;
+                shared_.lastRx = std::chrono::steady_clock::now();
+                continue;
             }
-            shared_.latest = packet;
-            shared_.lastSequence = packet.sequence;
-            shared_.packetsReceived++;
-            shared_.hasPacket = true;
-            shared_.lastRx = std::chrono::steady_clock::now();
+
+            if (magic == telemetry::kSettingsSnapshotMagic &&
+                n == static_cast<ssize_t>(sizeof(telemetry::SettingsSnapshotV1))) {
+                telemetry::SettingsSnapshotV1 settings{};
+                std::memcpy(&settings, packetBuffer.data(), sizeof(settings));
+                if (settings.version != telemetry::kSettingsSnapshotVersion ||
+                    settings.size != sizeof(telemetry::SettingsSnapshotV1)) {
+                    continue;
+                }
+
+                std::lock_guard<std::mutex> lock(mutex_);
+                shared_.settings = settings;
+                shared_.hasSettings = true;
+                shared_.lastSettingsRx = std::chrono::steady_clock::now();
+                continue;
+            }
         }
+    }
+
+    uint32_t QueueSettingsCommand(uint8_t operation, const telemetry::RuntimeSettingsPayloadV1 &payload) {
+        std::lock_guard<std::mutex> lock(commandMutex_);
+        telemetry::SettingsCommandV1 command{};
+        command.operation = operation;
+        command.requestId = nextSettingsRequestId_++;
+        command.payload = payload;
+        pendingSettingsCommand_ = command;
+        settingsBurstPacketsRemaining_ = kSettingsBurstPacketCount;
+        return command.requestId;
     }
 
     uint16_t port_ = 0;
@@ -694,12 +1101,19 @@ class UdpReceiver {
     std::chrono::steady_clock::time_point lastHeartbeatSent_ = std::chrono::steady_clock::time_point::min();
     std::chrono::steady_clock::time_point lastActuationCommandSent_ = std::chrono::steady_clock::time_point::min();
     std::chrono::steady_clock::time_point lastTelemetryControlSent_ = std::chrono::steady_clock::time_point::min();
+    std::chrono::steady_clock::time_point lastSettingsCommandSent_ = std::chrono::steady_clock::time_point::min();
     mutable std::mutex commandMutex_;
     bool manualActuationOverride_ = false;
     float manualActuationAngleDeg_ = 0.0f;
     bool sendActuationImmediately_ = false;
     bool telemetryStreamingEnabled_ = true;
     uint8_t disconnectPacketsRemaining_ = 0;
+    static constexpr uint8_t kCommandBurstPacketCount = 8;
+    uint8_t commandBurstPacketsRemaining_ = 0;
+    static constexpr uint8_t kSettingsBurstPacketCount = 4;
+    uint8_t settingsBurstPacketsRemaining_ = 0;
+    telemetry::SettingsCommandV1 pendingSettingsCommand_{};
+    uint32_t nextSettingsRequestId_ = 1;
 };
 
 const char *FlightStatusName(uint8_t value) {
@@ -944,15 +1358,26 @@ int main(int argc, char **argv) {
     ImGui_ImplGlfw_InitForOpenGL(window, true);
     ImGui_ImplOpenGL3_Init(glslVersion);
 
+#if defined(ACS_ENABLE_NATIVE_VOICE) && ACS_ENABLE_NATIVE_VOICE
+    curl_global_init(CURL_GLOBAL_DEFAULT);
+#endif
+
     UdpReceiver receiver(port, teensyIp, teensyPort);
     receiver.Start();
-    const std::string voiceScriptPath = ResolveVoiceScriptPath(argv[0]);
+    uint32_t pendingSettingsRequestId = receiver.RequestSettingsSnapshot();
+    int selectedWhisperModelIndex = 1;
+    std::string voiceModelPath = ResolveWhisperModelPath(argv[0], kWhisperModels[selectedWhisperModelIndex].fileName);
     bool manualActuationOverride = false;
     float manualActuationAngleDeg = 0.0f;
     bool telemetryStreamingEnabled = true;
     bool voiceListenEnabled = false;
     VoiceCommandReceiver voiceReceiver;
+    WhisperModelDownloader modelDownloader;
     DashboardState dashboard{};
+    telemetry::RuntimeSettingsPayloadV1 settingsDraft{};
+    bool settingsDraftInitialized = false;
+    bool settingsDraftDirty = false;
+    uint32_t lastSettingsRevisionSeen = 0;
 
     while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();
@@ -962,6 +1387,25 @@ int main(int argc, char **argv) {
         ImGui::NewFrame();
 
         const SharedTelemetry snap = receiver.Snapshot();
+        std::string completedModelPath;
+        if (modelDownloader.ConsumeCompletedDownload(&completedModelPath)) {
+            voiceModelPath = completedModelPath;
+        }
+        if (snap.hasSettings) {
+            const bool shouldRefreshDraft =
+                !settingsDraftInitialized ||
+                (!settingsDraftDirty && snap.settings.settingsRevision != lastSettingsRevisionSeen) ||
+                (pendingSettingsRequestId != 0 && snap.settings.appliedRequestId == pendingSettingsRequestId);
+            if (shouldRefreshDraft) {
+                settingsDraft = PayloadFromSnapshot(snap.settings);
+                settingsDraftInitialized = true;
+                settingsDraftDirty = false;
+                lastSettingsRevisionSeen = snap.settings.settingsRevision;
+            }
+            if (pendingSettingsRequestId != 0 && snap.settings.appliedRequestId == pendingSettingsRequestId) {
+                pendingSettingsRequestId = 0;
+            }
+        }
         ParsedVoiceCommand voiceCommand{};
         if (voiceReceiver.ConsumePendingCommand(&voiceCommand)) {
             if (voiceCommand.setAuto) {
@@ -1044,168 +1488,320 @@ int main(int argc, char **argv) {
         }
 
         ImGui::Separator();
-        if (ImGui::BeginTable("dashboard_split", 2, ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchSame)) {
-            ImGui::TableNextColumn();
-            ImGui::BeginChild("left_column", ImVec2(0.0f, 0.0f), false);
-            if (snap.hasPacket) {
-                const telemetry::PacketV1 &p = snap.latest;
-                const bool hasPadAltitude = (p.flags & telemetry::kFlagHasPadAltitude) != 0;
-                char overlayAgl[64];
-                if (hasPadAltitude) {
-                    std::snprintf(overlayAgl, sizeof(overlayAgl), "latest %.1f ft AGL", p.altitudeAglFeet);
-                } else {
-                    std::snprintf(overlayAgl, sizeof(overlayAgl), "pad altitude unavailable");
-                }
-                DrawSeriesPlot("Altitude (AGL)", dashboard.altitudeAglFeet, overlayAgl, ImVec2(-1.0f, 115.0f));
-                char overlayVel[64];
-                std::snprintf(overlayVel, sizeof(overlayVel), "vertical %.2f m/s", p.stateVelocity[2]);
-                DrawSeriesPlot("Vertical Velocity", dashboard.verticalVelocity, overlayVel, ImVec2(-1.0f, 115.0f));
-                char overlayAccel[64];
-                std::snprintf(overlayAccel, sizeof(overlayAccel), "ICM mag %.2f m/s^2", Norm3(p.sensorAccelIcm));
-                DrawSeriesPlot("Acceleration Magnitude", dashboard.accelMagnitude, overlayAccel, ImVec2(-1.0f, 115.0f));
-            } else {
-                DrawSeriesPlot("Altitude (AGL)", dashboard.altitudeAglFeet, "no data", ImVec2(-1.0f, 115.0f));
-                DrawSeriesPlot("Vertical Velocity", dashboard.verticalVelocity, "no data", ImVec2(-1.0f, 115.0f));
-                DrawSeriesPlot("Acceleration Magnitude", dashboard.accelMagnitude, "no data", ImVec2(-1.0f, 115.0f));
-            }
-            ImGui::EndChild();
-
-            ImGui::TableNextColumn();
-            ImGui::BeginChild("right_column", ImVec2(0.0f, 0.0f), false);
-            ImGui::Text("Actuation Control");
-            if (!telemetryStreamingEnabled) {
-                ImGui::BeginDisabled();
-            }
-            if (ImGui::Button("Disconnect Telemetry")) {
-                telemetryStreamingEnabled = false;
-            }
-            if (!telemetryStreamingEnabled) {
-                ImGui::EndDisabled();
-            }
-            ImGui::TextDisabled("%s", telemetryStreamingEnabled ? "telemetry streaming enabled"
-                                                                : "telemetry disabled on Teensy until reboot");
-            ImGui::Separator();
-            const bool manualOverrideChanged = ImGui::Checkbox("Manual flap override", &manualActuationOverride);
-            float requestedManualAngleDeg = manualActuationAngleDeg;
-            const bool sliderChanged =
-                ImGui::SliderFloat("Manual angle (deg)", &requestedManualAngleDeg, 0.0f, 60.0f, "%.1f");
-            if (sliderChanged) {
-                manualActuationAngleDeg = SnapToServoLookupAngle(requestedManualAngleDeg);
-                manualActuationOverride = true;
-            } else {
-                manualActuationAngleDeg = SnapToServoLookupAngle(manualActuationAngleDeg);
-            }
-            if (ImGui::Button("Deploy 30 deg")) {
-                manualActuationOverride = true;
-                manualActuationAngleDeg = SnapToServoLookupAngle(30.0f);
-            }
-            ImGui::SameLine();
-            if (ImGui::Button("Full 60 deg")) {
-                manualActuationOverride = true;
-                manualActuationAngleDeg = SnapToServoLookupAngle(60.0f);
-            }
-            if (ImGui::Button("Return To Auto")) {
-                manualActuationOverride = false;
-                manualActuationAngleDeg = 0.0f;
-            }
-            if (manualOverrideChanged && manualActuationOverride) {
-                manualActuationAngleDeg = SnapToServoLookupAngle(manualActuationAngleDeg);
-            }
-            ImGui::ProgressBar(dashboard.servoGaugeAnimated, ImVec2(-1.0f, 8.0f), "");
-            ImGui::Text("Commanded mode: %s", manualActuationOverride ? "manual override" : "auto");
-            ImGui::TextDisabled("Manual setpoint %.1f deg (lookup snapped)", manualActuationAngleDeg);
-
-            ImGui::Separator();
-            bool voiceToggle = voiceListenEnabled;
-            if (ImGui::Checkbox("Voice listen (wake: ACS/Apogee)", &voiceToggle)) {
-                if (voiceToggle) {
-                    voiceListenEnabled = voiceReceiver.Start(voiceScriptPath.c_str());
-                } else {
-                    voiceReceiver.Stop();
-                    voiceListenEnabled = false;
-                }
-            }
-            ImGui::Text("Voice status: %s", voiceReceiver.Running() ? "listening" : "stopped");
-            const std::string voiceError = voiceReceiver.LastError();
-            if (!voiceError.empty()) {
-                ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.35f, 1.0f), "%s", voiceError.c_str());
-            } else {
-                ImGui::TextDisabled("Voice commands (wake word optional):");
-                ImGui::BulletText("\"move 30\", \"set angle 45\", \"actuate sixty\"");
-                ImGui::BulletText("\"thirty\", \"three zero\", \"full\", \"half\"");
-                ImGui::BulletText("\"return to auto\", \"auto off\", \"disable automatic\"");
-            }
-            const std::string transcript = voiceReceiver.LatestTranscript();
-            if (!transcript.empty()) {
-                ImGui::TextWrapped("Heard: %s", transcript.c_str());
-            }
-            const std::string accepted = voiceReceiver.LatestAcceptedCommand();
-            if (!accepted.empty()) {
-                ImGui::TextColored(ImVec4(0.50f, 0.90f, 0.62f, 1.0f), "%s", accepted.c_str());
-            }
-
-            receiver.SetActuationOverride(manualActuationOverride, manualActuationAngleDeg);
-            receiver.SetTelemetryStreamingEnabled(telemetryStreamingEnabled);
-
-            if (snap.hasPacket) {
-                const telemetry::PacketV1 &p = snap.latest;
-                const bool hasState = (p.flags & telemetry::kFlagHasFilteredState) != 0;
-                const bool flightManualOverride = (p.flags & telemetry::kFlagManualActuationOverride) != 0;
-
-                ImGui::Separator();
-                ImGui::Text("Primary Telemetry");
-                ImGui::Text("Uptime: %u ms", p.uptimeMs);
-                ImGui::Text("Sensor timestamp: %.3f s", p.sensorTimestamp);
-                ImGui::Text("Sensor altitude: %.2f ft", p.sensorAltitudeFeet);
-                ImGui::Text("Servo command/effective: %.2f / %.2f deg", p.servoCommandDeg, p.servoEffectiveDeg);
-                ImGui::Text("Flight computer mode: %s", flightManualOverride ? "manual override" : "auto");
-                ImGui::TextDisabled("Commanded mode: %s", manualActuationOverride ? "manual override" : "auto");
-                DrawSeriesPlot("Servo Command", dashboard.servoCommand, "deg", ImVec2(-1.0f, 84.0f));
-                DrawSeriesPlot("Servo Effective", dashboard.servoEffective, "deg", ImVec2(-1.0f, 84.0f));
-
-                if (ImGui::CollapsingHeader("Sensor Vectors", ImGuiTreeNodeFlags_DefaultOpen)) {
-                    DrawVectorRow("Accel BNO XYZ", p.sensorAccelBno, "m/s^2");
-                    DrawVectorRow("Accel ICM XYZ", p.sensorAccelIcm, "m/s^2");
-                    DrawVectorRow("Gyro XYZ", p.sensorGyro, "rad/s");
-                    ImGui::Text("Quaternion");
-                    ImGui::SameLine(170.0f);
-                    ImGui::Text("%.3f  %.3f  %.3f  %.3f",
-                                p.sensorQuaternion[0],
-                                p.sensorQuaternion[1],
-                                p.sensorQuaternion[2],
-                                p.sensorQuaternion[3]);
-                    ImGui::Text("Has quaternion: %s", p.sensorHasQuaternion ? "true" : "false");
-                    ImGui::Text("ICM quaternion");
-                    ImGui::SameLine(170.0f);
-                    ImGui::Text("%.3f  %.3f  %.3f  %.3f",
-                                p.sensorIcmQuaternion[0],
-                                p.sensorIcmQuaternion[1],
-                                p.sensorIcmQuaternion[2],
-                                p.sensorIcmQuaternion[3]);
-                    ImGui::Text("Has ICM quaternion: %s", p.sensorHasIcmQuaternion ? "true" : "false");
-                    DrawVectorRow("ICM Yaw/Pitch/Roll", p.sensorIcmYprDeg, "deg");
-                    ImGui::Text("Has ICM YPR: %s", p.sensorHasIcmYpr ? "true" : "false");
-                }
-
-                if (ImGui::CollapsingHeader("Filtered State", ImGuiTreeNodeFlags_DefaultOpen)) {
-                    ImGui::Text("Status: %s", hasState ? "valid" : "not available");
-                    if (hasState) {
-                        ImGui::Text("State time: %.3f s", p.stateTime);
-                        DrawVectorRow("Position XYZ", p.statePosition, "m");
-                        DrawVectorRow("Velocity XYZ", p.stateVelocity, "m/s");
-                        DrawVectorRow("Accel XYZ", p.stateAcceleration, "m/s^2");
-                        DrawVectorRow("Inertial Accel", p.stateInertialAcceleration, "m/s^2");
-                        ImGui::Text("Zenith: %.3f rad", p.stateZenith);
-                        ImGui::Text("Apogee estimate: %.2f m", p.stateApogeeEstimate);
+        if (ImGui::BeginTabBar("main_tabs")) {
+            if (ImGui::BeginTabItem("Flight")) {
+                if (ImGui::BeginTable("dashboard_split", 2, ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchSame)) {
+                    ImGui::TableNextColumn();
+                    ImGui::BeginChild("left_column", ImVec2(0.0f, 0.0f), false);
+                    if (snap.hasPacket) {
+                        const telemetry::PacketV1 &p = snap.latest;
+                        const bool hasPadAltitude = (p.flags & telemetry::kFlagHasPadAltitude) != 0;
+                        char overlayAgl[64];
+                        if (hasPadAltitude) {
+                            std::snprintf(overlayAgl, sizeof(overlayAgl), "latest %.1f ft AGL", p.altitudeAglFeet);
+                        } else {
+                            std::snprintf(overlayAgl, sizeof(overlayAgl), "pad altitude unavailable");
+                        }
+                        DrawSeriesPlot("Altitude (AGL)", dashboard.altitudeAglFeet, overlayAgl, ImVec2(-1.0f, 115.0f));
+                        char overlayVel[64];
+                        std::snprintf(overlayVel, sizeof(overlayVel), "vertical %.2f m/s", p.stateVelocity[2]);
+                        DrawSeriesPlot("Vertical Velocity", dashboard.verticalVelocity, overlayVel, ImVec2(-1.0f, 115.0f));
+                        char overlayAccel[64];
+                        std::snprintf(overlayAccel, sizeof(overlayAccel), "ICM mag %.2f m/s^2", Norm3(p.sensorAccelIcm));
+                        DrawSeriesPlot("Acceleration Magnitude", dashboard.accelMagnitude, overlayAccel, ImVec2(-1.0f, 115.0f));
+                    } else {
+                        DrawSeriesPlot("Altitude (AGL)", dashboard.altitudeAglFeet, "no data", ImVec2(-1.0f, 115.0f));
+                        DrawSeriesPlot("Vertical Velocity", dashboard.verticalVelocity, "no data", ImVec2(-1.0f, 115.0f));
+                        DrawSeriesPlot("Acceleration Magnitude", dashboard.accelMagnitude, "no data", ImVec2(-1.0f, 115.0f));
                     }
+                    ImGui::EndChild();
+
+                    ImGui::TableNextColumn();
+                    ImGui::BeginChild("right_column", ImVec2(0.0f, 0.0f), false);
+                    ImGui::Text("Actuation Control");
+                    if (!telemetryStreamingEnabled) {
+                        ImGui::BeginDisabled();
+                    }
+                    if (ImGui::Button("Disconnect Telemetry")) {
+                        telemetryStreamingEnabled = false;
+                    }
+                    if (!telemetryStreamingEnabled) {
+                        ImGui::EndDisabled();
+                    }
+                    ImGui::TextDisabled("%s", telemetryStreamingEnabled ? "telemetry streaming enabled"
+                                                                        : "telemetry disabled on Teensy until reboot");
+                    ImGui::Separator();
+                    const bool manualOverrideChanged = ImGui::Checkbox("Manual flap override", &manualActuationOverride);
+                    float requestedManualAngleDeg = manualActuationAngleDeg;
+                    const bool sliderChanged =
+                        ImGui::SliderFloat("Manual angle (deg)", &requestedManualAngleDeg, 0.0f, 60.0f, "%.1f");
+                    if (sliderChanged) {
+                        manualActuationAngleDeg = SnapToServoLookupAngle(requestedManualAngleDeg);
+                        manualActuationOverride = true;
+                    } else {
+                        manualActuationAngleDeg = SnapToServoLookupAngle(manualActuationAngleDeg);
+                    }
+                    if (ImGui::Button("Deploy 30 deg")) {
+                        manualActuationOverride = true;
+                        manualActuationAngleDeg = SnapToServoLookupAngle(30.0f);
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::Button("Full 60 deg")) {
+                        manualActuationOverride = true;
+                        manualActuationAngleDeg = SnapToServoLookupAngle(60.0f);
+                    }
+                    if (ImGui::Button("Return To Auto")) {
+                        manualActuationOverride = false;
+                        manualActuationAngleDeg = 0.0f;
+                    }
+                    if (manualOverrideChanged && manualActuationOverride) {
+                        manualActuationAngleDeg = SnapToServoLookupAngle(manualActuationAngleDeg);
+                    }
+                    ImGui::ProgressBar(dashboard.servoGaugeAnimated, ImVec2(-1.0f, 8.0f), "");
+                    ImGui::Text("Commanded mode: %s", manualActuationOverride ? "manual override" : "auto");
+                    ImGui::TextDisabled("Manual setpoint %.1f deg (lookup snapped)", manualActuationAngleDeg);
+
+                    ImGui::Separator();
+                    const WhisperModelChoice &selectedModel = kWhisperModels[selectedWhisperModelIndex];
+                    const std::filesystem::path selectedModelPath =
+                        std::filesystem::path(DefaultModelsDirectory(argv[0])) / selectedModel.fileName;
+                    if (ImGui::BeginCombo("Whisper model", selectedModel.label)) {
+                        for (int i = 0; i < static_cast<int>(kWhisperModels.size()); ++i) {
+                            const bool isSelected = (selectedWhisperModelIndex == i);
+                            if (ImGui::Selectable(kWhisperModels[i].label, isSelected)) {
+                                selectedWhisperModelIndex = i;
+                                if (!voiceListenEnabled) {
+                                    voiceModelPath = ResolveWhisperModelPath(argv[0], kWhisperModels[i].fileName);
+                                }
+                            }
+                            if (isSelected) {
+                                ImGui::SetItemDefaultFocus();
+                            }
+                        }
+                        ImGui::EndCombo();
+                    }
+                    if (ImGui::Button("Use selected model")) {
+                        voiceModelPath = selectedModelPath.string();
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::Button("Download selected model")) {
+                        modelDownloader.Start(selectedModel.url, selectedModelPath.string());
+                    }
+                    ImGui::TextDisabled("Active model: %s", voiceModelPath.c_str());
+                    ImGui::TextDisabled("Selected model file: %s", selectedModelPath.string().c_str());
+                    if (std::filesystem::exists(selectedModelPath)) {
+                        ImGui::TextColored(ImVec4(0.46f, 0.86f, 0.58f, 1.0f), "Selected model is present on disk");
+                    } else {
+                        ImGui::TextColored(ImVec4(0.98f, 0.68f, 0.26f, 1.0f), "Selected model has not been downloaded yet");
+                    }
+                    if (modelDownloader.Running()) {
+                        ImGui::ProgressBar(modelDownloader.Progress(), ImVec2(-1.0f, 8.0f), "");
+                        ImGui::TextDisabled("%s", modelDownloader.Status().c_str());
+                    } else {
+                        const std::string downloadStatus = modelDownloader.Status();
+                        if (!downloadStatus.empty()) {
+                            ImGui::TextDisabled("%s", downloadStatus.c_str());
+                        }
+                    }
+                    const std::string downloadError = modelDownloader.LastError();
+                    if (!downloadError.empty()) {
+                        ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.35f, 1.0f), "%s", downloadError.c_str());
+                    }
+
+                    ImGui::Separator();
+                    bool voiceToggle = voiceListenEnabled;
+                    if (ImGui::Checkbox("Voice listen (wake: ACS/Apogee)", &voiceToggle)) {
+                        if (voiceToggle) {
+                            voiceListenEnabled = voiceReceiver.Start(voiceModelPath.c_str());
+                        } else {
+                            voiceReceiver.Stop();
+                            voiceListenEnabled = false;
+                        }
+                    }
+                    ImGui::Text("Voice status: %s", voiceReceiver.Running() ? "listening" : "stopped");
+                    const std::string voiceError = voiceReceiver.LastError();
+                    if (!voiceError.empty()) {
+                        ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.35f, 1.0f), "%s", voiceError.c_str());
+                    } else {
+                        ImGui::TextDisabled("Whisper commands (wake word optional):");
+                        ImGui::BulletText("\"move 30\", \"set angle 45\", \"actuate sixty\"");
+                        ImGui::BulletText("\"thirty\", \"three zero\", \"full\", \"half\"");
+                        ImGui::BulletText("\"return to auto\", \"auto off\", \"disable automatic\"");
+                        ImGui::TextDisabled("Model path: %s", voiceModelPath.c_str());
+                    }
+                    const std::string transcript = voiceReceiver.LatestTranscript();
+                    if (!transcript.empty()) {
+                        ImGui::TextWrapped("Heard: %s", transcript.c_str());
+                    }
+                    const std::string accepted = voiceReceiver.LatestAcceptedCommand();
+                    if (!accepted.empty()) {
+                        ImGui::TextColored(ImVec4(0.50f, 0.90f, 0.62f, 1.0f), "%s", accepted.c_str());
+                    }
+
+                    if (snap.hasPacket) {
+                        const telemetry::PacketV1 &p = snap.latest;
+                        const bool hasState = (p.flags & telemetry::kFlagHasFilteredState) != 0;
+                        const bool flightManualOverride = (p.flags & telemetry::kFlagManualActuationOverride) != 0;
+
+                        ImGui::Separator();
+                        ImGui::Text("Primary Telemetry");
+                        ImGui::Text("Uptime: %u ms", p.uptimeMs);
+                        ImGui::Text("Sensor timestamp: %.3f s", p.sensorTimestamp);
+                        ImGui::Text("Sensor altitude: %.2f ft", p.sensorAltitudeFeet);
+                        ImGui::Text("Servo command/effective: %.2f / %.2f deg", p.servoCommandDeg, p.servoEffectiveDeg);
+                        ImGui::Text("Flight computer mode: %s", flightManualOverride ? "manual override" : "auto");
+                        ImGui::TextDisabled("Commanded mode: %s", manualActuationOverride ? "manual override" : "auto");
+                        if (manualActuationOverride != flightManualOverride) {
+                            ImGui::TextColored(ImVec4(0.98f, 0.68f, 0.26f, 1.0f),
+                                               "Manual command sent; waiting for firmware acknowledgement");
+                        } else {
+                            ImGui::TextColored(ImVec4(0.46f, 0.86f, 0.58f, 1.0f),
+                                               "Ground command matches firmware mode");
+                        }
+                        DrawSeriesPlot("Servo Command", dashboard.servoCommand, "deg", ImVec2(-1.0f, 84.0f));
+                        DrawSeriesPlot("Servo Effective", dashboard.servoEffective, "deg", ImVec2(-1.0f, 84.0f));
+
+                        if (ImGui::CollapsingHeader("Sensor Vectors", ImGuiTreeNodeFlags_DefaultOpen)) {
+                            DrawVectorRow("Accel BNO XYZ", p.sensorAccelBno, "m/s^2");
+                            DrawVectorRow("Accel ICM XYZ", p.sensorAccelIcm, "m/s^2");
+                            DrawVectorRow("Gyro XYZ", p.sensorGyro, "rad/s");
+                            ImGui::Text("Quaternion");
+                            ImGui::SameLine(170.0f);
+                            ImGui::Text("%.3f  %.3f  %.3f  %.3f",
+                                        p.sensorQuaternion[0],
+                                        p.sensorQuaternion[1],
+                                        p.sensorQuaternion[2],
+                                        p.sensorQuaternion[3]);
+                            ImGui::Text("Has quaternion: %s", p.sensorHasQuaternion ? "true" : "false");
+                            ImGui::Text("ICM quaternion");
+                            ImGui::SameLine(170.0f);
+                            ImGui::Text("%.3f  %.3f  %.3f  %.3f",
+                                        p.sensorIcmQuaternion[0],
+                                        p.sensorIcmQuaternion[1],
+                                        p.sensorIcmQuaternion[2],
+                                        p.sensorIcmQuaternion[3]);
+                            ImGui::Text("Has ICM quaternion: %s", p.sensorHasIcmQuaternion ? "true" : "false");
+                            DrawVectorRow("ICM Yaw/Pitch/Roll", p.sensorIcmYprDeg, "deg");
+                            ImGui::Text("Has ICM YPR: %s", p.sensorHasIcmYpr ? "true" : "false");
+                        }
+
+                        if (ImGui::CollapsingHeader("Filtered State", ImGuiTreeNodeFlags_DefaultOpen)) {
+                            ImGui::Text("Status: %s", hasState ? "valid" : "not available");
+                            if (hasState) {
+                                ImGui::Text("State time: %.3f s", p.stateTime);
+                                DrawVectorRow("Position XYZ", p.statePosition, "m");
+                                DrawVectorRow("Velocity XYZ", p.stateVelocity, "m/s");
+                                DrawVectorRow("Accel XYZ", p.stateAcceleration, "m/s^2");
+                                DrawVectorRow("Inertial Accel", p.stateInertialAcceleration, "m/s^2");
+                                ImGui::Text("Zenith: %.3f rad", p.stateZenith);
+                                ImGui::Text("Apogee estimate: %.2f m", p.stateApogeeEstimate);
+                            }
+                        }
+                    } else {
+                        ImGui::Separator();
+                        ImGui::TextDisabled("No telemetry packet has arrived yet.");
+                    }
+                    ImGui::EndChild();
+                    ImGui::EndTable();
                 }
-            } else {
-                ImGui::Separator();
-                ImGui::TextDisabled("No telemetry packet has arrived yet.");
+                ImGui::EndTabItem();
             }
-            ImGui::EndChild();
-            ImGui::EndTable();
+
+            if (ImGui::BeginTabItem("Settings")) {
+                if (!snap.hasSettings) {
+                    ImGui::TextDisabled("Waiting for runtime settings snapshot from Teensy.");
+                    if (ImGui::Button("Request Settings")) {
+                        pendingSettingsRequestId = receiver.RequestSettingsSnapshot();
+                    }
+                } else {
+                    const telemetry::SettingsSnapshotV1 &settings = snap.settings;
+                    ImGui::Text("Runtime Settings");
+                    ImGui::TextDisabled("Apply/save is intended for preflight use while the flight computer is on the ground.");
+                    ImGui::Text("Revision: %u", settings.settingsRevision);
+                    ImGui::Text("Last request id: %u", settings.appliedRequestId);
+                    ImGui::Text("Last result: %s", SettingsResultName(settings.lastCommandResult));
+                    if (pendingSettingsRequestId != 0) {
+                        ImGui::TextColored(ImVec4(0.98f, 0.68f, 0.26f, 1.0f),
+                                           "Awaiting Teensy acknowledgement for request %u",
+                                           pendingSettingsRequestId);
+                    }
+                    ImGui::Separator();
+                    ImGui::Text("Storage");
+                    ImGui::BulletText("SD available: %s",
+                                      SettingsStatusFlagSet(settings.statusFlags, telemetry::kSettingsStatusStorageAvailable)
+                                          ? "yes"
+                                          : "no");
+                    ImGui::BulletText("Settings file present: %s",
+                                      SettingsStatusFlagSet(settings.statusFlags, telemetry::kSettingsStatusFilePresent)
+                                          ? "yes"
+                                          : "no");
+                    ImGui::BulletText("Using defaults: %s",
+                                      SettingsStatusFlagSet(settings.statusFlags, telemetry::kSettingsStatusUsingDefaults)
+                                          ? "yes"
+                                          : "no");
+                    ImGui::BulletText("Last load ok: %s",
+                                      SettingsStatusFlagSet(settings.statusFlags, telemetry::kSettingsStatusLastLoadSucceeded)
+                                          ? "yes"
+                                          : "no");
+                    ImGui::BulletText("Last save ok: %s",
+                                      SettingsStatusFlagSet(settings.statusFlags, telemetry::kSettingsStatusLastSaveSucceeded)
+                                          ? "yes"
+                                          : "no");
+                    ImGui::BulletText("Default file created: %s",
+                                      SettingsStatusFlagSet(settings.statusFlags, telemetry::kSettingsStatusCreatedDefaultFile)
+                                          ? "yes"
+                                          : "no");
+                    ImGui::Separator();
+
+                    if (ImGui::Button("Refresh From Teensy")) {
+                        pendingSettingsRequestId = receiver.RequestSettingsSnapshot();
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::Button("Revert Local Edits")) {
+                        settingsDraft = PayloadFromSnapshot(settings);
+                        settingsDraftDirty = false;
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::Button("Restore Defaults On Teensy")) {
+                        pendingSettingsRequestId = receiver.RestoreDefaultSettings();
+                    }
+
+                    if (!settingsDraftInitialized) {
+                        settingsDraft = PayloadFromSnapshot(settings);
+                        settingsDraftInitialized = true;
+                    }
+
+                    ImGui::BeginDisabled(!settingsDraftInitialized);
+                    if (ImGui::Button("Apply And Save To Teensy")) {
+                        pendingSettingsRequestId = receiver.ApplyAndPersistSettings(settingsDraft);
+                    }
+                    ImGui::EndDisabled();
+                    ImGui::TextDisabled("%s", settingsDraftDirty ? "local edits not yet saved" : "local draft matches latest snapshot");
+                    ImGui::Separator();
+
+                    ImGui::Text("Environment");
+                    settingsDraftDirty |= ImGui::InputDouble("Ground temperature (F)", &settingsDraft.groundTemperatureF, 0.0, 0.0, "%.6f");
+                    settingsDraftDirty |= ImGui::InputDouble("Wind speed (mph)", &settingsDraft.windSpeedMph, 0.0, 0.0, "%.6f");
+                    settingsDraftDirty |= ImGui::InputDouble("Wind direction (deg)", &settingsDraft.windDirectionDeg, 0.0, 0.0, "%.6f");
+                    settingsDraftDirty |= ImGui::InputDouble("Launch direction (deg)", &settingsDraft.launchDirectionDeg, 0.0, 0.0, "%.6f");
+                    settingsDraftDirty |= ImGui::InputDouble("Roughness length (m)", &settingsDraft.roughnessLengthMeters, 0.0, 0.0, "%.6f");
+                    settingsDraftDirty |= ImGui::InputDouble("Gradient height (m)", &settingsDraft.gradientHeightMeters, 0.0, 0.0, "%.6f");
+                    settingsDraftDirty |= ImGui::InputDouble("Measurement height (m)", &settingsDraft.measurementHeightMeters, 0.0, 0.0, "%.6f");
+
+                    ImGui::Separator();
+                    ImGui::Text("Vehicle");
+                    settingsDraftDirty |= ImGui::InputDouble("CP offset (m)", &settingsDraft.centerOfPressureOffsetMeters, 0.0, 0.0, "%.8f");
+                    settingsDraftDirty |= ImGui::InputDouble("Moment of inertia (kg*m^2)", &settingsDraft.momentOfInertiaKgM2, 0.0, 0.0, "%.8f");
+                    settingsDraftDirty |= ImGui::InputDouble("Dry mass (kg)", &settingsDraft.dryMassKg, 0.0, 0.0, "%.8f");
+                }
+                ImGui::EndTabItem();
+            }
+
+            ImGui::EndTabBar();
         }
+
+        receiver.SetActuationOverride(manualActuationOverride, manualActuationAngleDeg);
+        receiver.SetTelemetryStreamingEnabled(telemetryStreamingEnabled);
 
         ImGui::End();
 
@@ -1223,6 +1819,7 @@ int main(int argc, char **argv) {
 
     receiver.Stop();
     voiceReceiver.Stop();
+    modelDownloader.Stop();
 
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplGlfw_Shutdown();
@@ -1230,5 +1827,8 @@ int main(int argc, char **argv) {
 
     glfwDestroyWindow(window);
     glfwTerminate();
+#if defined(ACS_ENABLE_NATIVE_VOICE) && ACS_ENABLE_NATIVE_VOICE
+    curl_global_cleanup();
+#endif
     return 0;
 }

@@ -91,6 +91,8 @@ bool DataLoggerIsInitialized();
 DataLoggerDiagnostics DataLoggerGetDiagnostics();
 /// Reads a text file from the SD card line-by-line and invokes the callback for each line.
 bool DataLoggerReadTextFile(const char *path, bool (*lineCallback)(const char *line, void *context), void *context);
+/// Replaces a text file on the SD card with `contents`.
+bool DataLoggerWriteTextFile(const char *path, const char *contents);
 /// Opens a text file for streaming reads, primarily for CSV replay.
 bool DataLoggerOpenReadFile(const char *path, FsFile &file);
 /// Reads the next newline-delimited text row into `line`.

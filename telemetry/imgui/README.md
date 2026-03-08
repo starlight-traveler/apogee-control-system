@@ -15,11 +15,17 @@ Default network settings in firmware (`src/settings.h`):
 
 ## Build requirements
 
-Install these development packages (via your package manager or vcpkg):
-- `glfw3`
-- `imgui` with OpenGL3+GLFW backends
+Required:
 - OpenGL headers/libs
 - CMake 3.20+
+
+Default CMake behavior now fetches/builds:
+- `glfw`
+- `imgui`
+- `whisper.cpp` when native voice is enabled
+
+On macOS, the build prefers a Homebrew `portaudio` install before falling back
+to `FetchContent`.
 
 ## Build and run
 
@@ -56,59 +62,60 @@ You can enable voice control from the ImGui panel with:
   - `auto off`
   - `disable automatic`
 
-The UI toggle launches `voice_listener.py`, which requires:
-- Python package `vosk`
-- Python package `sounddevice`
-- A local Vosk English model directory
+Voice control now runs natively inside the C++ app.
 
-Arch/PEP668-safe setup (recommended):
+Native dependencies:
+- `whisper.cpp`
+- a local Whisper model file
+
+CMake behavior:
+- `portaudio` is fetched automatically by default
+- `whisper.cpp` is fetched automatically by default
+- models are runtime files, not compile-time SDK dependencies
+
+Example:
 ```bash
 cd telemetry/imgui
-python3 -m venv .venv
-. .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install vosk sounddevice
+cmake -S . -B build
+cmake --build build -j
+```
 
-# Download a Vosk model (example):
+Inside the GUI you can:
+- choose a Whisper model preset
+- download the selected model
+- switch the active voice model path
+
+Default downloaded model location:
+- `build/bin/models` at runtime, or `models/` next to the executable if present
+
+If you want to use system-installed packages instead of `FetchContent`:
+
+```bash
+brew install portaudio
+cmake -S . -B build \
+  -DACS_FETCH_GLFW=OFF \
+  -DACS_FETCH_IMGUI=OFF \
+  -DACS_FETCH_PORTAUDIO=OFF
+cmake --build build -j
+```
+
+Model setup:
+```bash
 mkdir -p models
 cd models
-wget https://alphacephei.com/vosk/models/vosk-model-en-us-0.22.zip
-unzip vosk-model-en-us-0.22.zip
+wget https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin
 cd ..
-
-# Point to model:
-export VOSK_MODEL_PATH=/path/to/vosk-model-en-us-0.22
+export WHISPER_MODEL_PATH=/path/to/ggml-base.en.bin
 ```
 
 Notes:
-- The app now auto-prefers `.venv/bin/python3` for voice mode if present.
-- You can override interpreter explicitly with `ACS_VOICE_PYTHON=/path/to/python3`.
-- The build copies `voice_listener.py` next to the executable; runtime can also be overridden with `ACS_VOICE_SCRIPT=/path/to/voice_listener.py`.
-- If dependencies/model are missing, the UI shows an `ERROR:` message in the voice section.
-
-CMake bootstrap option:
-- Create/update the local voice venv manually:
+- If `whisper.cpp` or `portaudio` are not available, the app still builds but voice mode is disabled.
+- The UI shows the current model path and any native voice initialization error.
+- You can still use `voice_model` to download the default model into the runtime `models/` folder:
 ```bash
-cmake -S . -B build
-cmake --build build --target voice_env
-```
-- Download/unpack the Vosk model into the runtime `models/` folder:
-```bash
-cmake -S . -B build
-cmake --build build --target voice_model
-```
-- Or enable automatic venv bootstrap during normal builds:
-```bash
-cmake -S . -B build -DACS_SETUP_VOICE_ENV=ON
+cmake -S . -B build -DACS_SETUP_VOICE_MODEL=ON
 cmake --build build -j
 ```
-- Or enable both auto venv + auto model download:
-```bash
-cmake -S . -B build -DACS_SETUP_VOICE_ENV=ON -DACS_SETUP_VOICE_MODEL=ON
-cmake --build build -j
-```
-
-By default, bootstrap is off, so builds remain fast and offline-friendly unless you opt in.
 
 ## Latency behavior
 

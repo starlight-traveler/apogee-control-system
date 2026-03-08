@@ -66,6 +66,11 @@ class FlightComputer {
                const ApogeeVehicleParameters &vehicleParameters,
                const ApogeeForceTable *forceTable = nullptr);
 
+    /// Reapplies runtime-editable predictor dependencies without resetting the estimator.
+    void ReconfigurePredictor(const EnvironmentModel::Config &environmentConfig,
+                              const ApogeeVehicleParameters &vehicleParameters,
+                              const ApogeeForceTable *forceTable = nullptr);
+
     /// Ingests one sensor sample and publishes the latest filtered state.
     ///
     /// @return false when the sample cannot be used, usually because no valid

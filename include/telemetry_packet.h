@@ -12,6 +12,10 @@ constexpr uint32_t kActuationCommandMagic = 0x31434154u;  // "TAC1"
 constexpr uint16_t kActuationCommandVersion = 1;
 constexpr uint32_t kTelemetryControlMagic = 0x31544354u;  // "TCT1"
 constexpr uint16_t kTelemetryControlVersion = 1;
+constexpr uint32_t kSettingsCommandMagic = 0x31534354u;  // "TCS1"
+constexpr uint16_t kSettingsCommandVersion = 1;
+constexpr uint32_t kSettingsSnapshotMagic = 0x31535354u;  // "TSS1"
+constexpr uint16_t kSettingsSnapshotVersion = 1;
 
 constexpr uint8_t kFlagHasFilteredState = 1u << 0;
 constexpr uint8_t kFlagHasPadAltitude = 1u << 1;
@@ -19,6 +23,23 @@ constexpr uint8_t kFlagManualActuationOverride = 1u << 2;
 
 constexpr uint8_t kActuationModeAuto = 0u;
 constexpr uint8_t kActuationModeManual = 1u;
+
+constexpr uint8_t kSettingsOpRequestCurrent = 0u;
+constexpr uint8_t kSettingsOpApplyAndPersist = 1u;
+constexpr uint8_t kSettingsOpRestoreDefaults = 2u;
+
+constexpr uint8_t kSettingsResultNone = 0u;
+constexpr uint8_t kSettingsResultApplied = 1u;
+constexpr uint8_t kSettingsResultRejected = 2u;
+constexpr uint8_t kSettingsResultPersistFailed = 3u;
+constexpr uint8_t kSettingsResultStorageUnavailable = 4u;
+
+constexpr uint8_t kSettingsStatusStorageAvailable = 1u << 0;
+constexpr uint8_t kSettingsStatusFilePresent = 1u << 1;
+constexpr uint8_t kSettingsStatusUsingDefaults = 1u << 2;
+constexpr uint8_t kSettingsStatusLastLoadSucceeded = 1u << 3;
+constexpr uint8_t kSettingsStatusLastSaveSucceeded = 1u << 4;
+constexpr uint8_t kSettingsStatusCreatedDefaultFile = 1u << 5;
 
 #pragma pack(push, 1)
 struct PacketV1 {
@@ -96,5 +117,55 @@ struct TelemetryControlV1 {
 
 static_assert(sizeof(TelemetryControlV1) == 12,
               "TelemetryControlV1 size changed; update sender/receiver together.");
+
+#pragma pack(push, 1)
+struct RuntimeSettingsPayloadV1 {
+    double groundTemperatureF = 0.0;
+    double windSpeedMph = 0.0;
+    double windDirectionDeg = 0.0;
+    double launchDirectionDeg = 0.0;
+    double roughnessLengthMeters = 0.0;
+    double gradientHeightMeters = 0.0;
+    double measurementHeightMeters = 0.0;
+    double centerOfPressureOffsetMeters = 0.0;
+    double momentOfInertiaKgM2 = 0.0;
+    double dryMassKg = 0.0;
+};
+#pragma pack(pop)
+
+static_assert(sizeof(RuntimeSettingsPayloadV1) == 80,
+              "RuntimeSettingsPayloadV1 size changed; update sender/receiver together.");
+
+#pragma pack(push, 1)
+struct SettingsCommandV1 {
+    uint32_t magic = kSettingsCommandMagic;
+    uint16_t version = kSettingsCommandVersion;
+    uint16_t size = sizeof(SettingsCommandV1);
+    uint8_t operation = kSettingsOpRequestCurrent;
+    uint8_t reserved[3] = {0, 0, 0};
+    uint32_t requestId = 0;
+    RuntimeSettingsPayloadV1 payload{};
+};
+#pragma pack(pop)
+
+static_assert(sizeof(SettingsCommandV1) == 96,
+              "SettingsCommandV1 size changed; update sender/receiver together.");
+
+#pragma pack(push, 1)
+struct SettingsSnapshotV1 {
+    uint32_t magic = kSettingsSnapshotMagic;
+    uint16_t version = kSettingsSnapshotVersion;
+    uint16_t size = sizeof(SettingsSnapshotV1);
+    uint32_t settingsRevision = 0;
+    uint32_t appliedRequestId = 0;
+    uint8_t statusFlags = 0;
+    uint8_t lastCommandResult = kSettingsResultNone;
+    uint16_t reserved = 0;
+    RuntimeSettingsPayloadV1 payload{};
+};
+#pragma pack(pop)
+
+static_assert(sizeof(SettingsSnapshotV1) == 100,
+              "SettingsSnapshotV1 size changed; update sender/receiver together.");
 
 }  // namespace telemetry

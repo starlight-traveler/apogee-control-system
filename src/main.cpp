@@ -16,6 +16,7 @@
 #include "ms5611_sensor.h"
 #include "network_telemetry.h"
 #include "predictor_seed.h"
+#include "runtime_settings.h"
 #include "serial_logging.h"
 #include "settings.h"
 #include "status_leds.h"
@@ -440,6 +441,11 @@ static bool g_actuationHasLastControlUpdate = false;
 static uint32_t g_actuationLastControlUpdateMs = 0;
 static float g_actuationLastCommandDeg = 0.0f;
 static PredictorHorizontalVelocityTracker g_actuationPredictorHorizontalVelocity;
+static RuntimeSettings g_runtimeSettings = RuntimeSettingsDefaults();
+static RuntimeSettingsStorageStatus g_runtimeSettingsStorageStatus;
+static uint32_t g_runtimeSettingsRevision = 0;
+static uint32_t g_runtimeSettingsLastRequestId = 0;
+static uint8_t g_runtimeSettingsLastCommandResult = telemetry::kSettingsResultNone;
 
 struct AutoActuationTelemetry {
     float autoCommandDeg = std::numeric_limits<float>::quiet_NaN();
@@ -551,6 +557,118 @@ static void LogTimingDiagnostics(uint32_t nowMs) {
     LOG_PRINTLN("");
 
     g_timingStats = TimingStats{};
+}
+
+/// Converts a telemetry packet payload into the runtime settings layout.
+static RuntimeSettings RuntimeSettingsFromPayload(const telemetry::RuntimeSettingsPayloadV1 &payload) {
+    RuntimeSettings settings;
+    settings.environment.groundTemperatureF = static_cast<float>(payload.groundTemperatureF);
+    settings.environment.windSpeedMph = static_cast<float>(payload.windSpeedMph);
+    settings.environment.windDirectionDeg = static_cast<float>(payload.windDirectionDeg);
+    settings.environment.launchDirectionDeg = static_cast<float>(payload.launchDirectionDeg);
+    settings.environment.roughnessLengthMeters = static_cast<float>(payload.roughnessLengthMeters);
+    settings.environment.gradientHeightMeters = static_cast<float>(payload.gradientHeightMeters);
+    settings.environment.measurementHeightMeters = static_cast<float>(payload.measurementHeightMeters);
+    settings.vehicle.centerOfPressureOffsetMeters = payload.centerOfPressureOffsetMeters;
+    settings.vehicle.momentOfInertia = payload.momentOfInertiaKgM2;
+    settings.vehicle.dryMass = payload.dryMassKg;
+    return settings;
+}
+
+/// Rebinds the live predictor stack to the currently active runtime settings.
+static void ApplyRuntimeSettingsToPredictors() {
+    g_actuationEnvironment.Configure(g_runtimeSettings.environment);
+    g_actuationPredictor.SetEnvironment(g_actuationEnvironment);
+    g_actuationPredictor.SetVehicleParameters(g_runtimeSettings.vehicle);
+    g_actuationPredictor.SetForceTable(g_cfdTable.loaded ? &g_cfdTable.table : nullptr);
+    g_actuationPredictor.SetMaxIntegrationSteps(settings::actuation::kActuationPredictorMaxSteps);
+    g_actuationPredictorReady = g_cfdTable.loaded;
+    g_actuationHasLastZenithSample = false;
+    g_actuationHasLastControlUpdate = false;
+    ResetPredictorHorizontalVelocityTracker(g_actuationPredictorHorizontalVelocity);
+    flightComputer.ReconfigurePredictor(g_runtimeSettings.environment,
+                                        g_runtimeSettings.vehicle,
+                                        g_cfdTable.loaded ? &g_cfdTable.table : nullptr);
+}
+
+/// Publishes the latest runtime settings/status snapshot to telemetry subscribers.
+static void PublishRuntimeSettingsSnapshot() {
+    g_runtimeSettingsStorageStatus.storageAvailable = DataLoggerIsInitialized();
+    NetworkTelemetrySetRuntimeSettingsSnapshot(g_runtimeSettings,
+                                              g_runtimeSettingsStorageStatus,
+                                              g_runtimeSettingsRevision,
+                                              g_runtimeSettingsLastRequestId,
+                                              g_runtimeSettingsLastCommandResult);
+}
+
+/// Loads SD-backed runtime settings when possible, otherwise keeps defaults.
+static void InitializeRuntimeSettings() {
+    g_runtimeSettings = RuntimeSettingsDefaults();
+    g_runtimeSettingsStorageStatus = RuntimeSettingsStorageStatus{};
+    if (DataLoggerIsInitialized()) {
+        RuntimeSettings loadedSettings = RuntimeSettingsDefaults();
+        RuntimeSettingsStorageStatus loadedStatus;
+        if (RuntimeSettingsLoadOrCreate(loadedSettings, loadedStatus)) {
+            g_runtimeSettings = loadedSettings;
+        }
+        g_runtimeSettingsStorageStatus = loadedStatus;
+    }
+    g_runtimeSettingsRevision = 1;
+    g_runtimeSettingsLastRequestId = 0;
+    g_runtimeSettingsLastCommandResult = telemetry::kSettingsResultNone;
+}
+
+/// Applies one settings command from the ground station and updates the live predictor config.
+static void ServiceRuntimeSettingsCommands() {
+    telemetry::SettingsCommandV1 command{};
+    if (!NetworkTelemetryConsumeSettingsCommand(command)) {
+        return;
+    }
+
+    g_runtimeSettingsLastRequestId = command.requestId;
+    g_runtimeSettingsLastCommandResult = telemetry::kSettingsResultNone;
+
+    if (command.operation == telemetry::kSettingsOpRequestCurrent) {
+        PublishRuntimeSettingsSnapshot();
+        return;
+    }
+
+    if (flightComputer.Status() != FlightStatus::Ground && !g_csvReplay.enabled) {
+        g_runtimeSettingsLastCommandResult = telemetry::kSettingsResultRejected;
+        PublishRuntimeSettingsSnapshot();
+        return;
+    }
+
+    RuntimeSettings candidate =
+        (command.operation == telemetry::kSettingsOpRestoreDefaults)
+            ? RuntimeSettingsDefaults()
+            : RuntimeSettingsFromPayload(command.payload);
+
+    if (!RuntimeSettingsValidate(candidate)) {
+        g_runtimeSettingsLastCommandResult = telemetry::kSettingsResultRejected;
+        PublishRuntimeSettingsSnapshot();
+        return;
+    }
+
+    RuntimeSettingsStorageStatus storageStatus = g_runtimeSettingsStorageStatus;
+    storageStatus.createdDefaultFile = false;
+    storageStatus.storageAvailable = DataLoggerIsInitialized();
+    const bool persisted = RuntimeSettingsSave(candidate, storageStatus);
+    if (!persisted) {
+        g_runtimeSettingsStorageStatus = storageStatus;
+        g_runtimeSettingsLastCommandResult = storageStatus.storageAvailable
+                                                 ? telemetry::kSettingsResultPersistFailed
+                                                 : telemetry::kSettingsResultStorageUnavailable;
+        PublishRuntimeSettingsSnapshot();
+        return;
+    }
+
+    g_runtimeSettings = candidate;
+    g_runtimeSettingsStorageStatus = storageStatus;
+    ++g_runtimeSettingsRevision;
+    g_runtimeSettingsLastCommandResult = telemetry::kSettingsResultApplied;
+    ApplyRuntimeSettingsToPredictors();
+    PublishRuntimeSettingsSnapshot();
 }
 
 /// Computes the commanded flap angle for automatic apogee control.
@@ -902,12 +1020,14 @@ void setup() {
     }
     LogSetupCheckpoint(g_cfdTable.loaded ? "CFD table loaded" : "CFD table unavailable");
 
+    LogSetupCheckpoint("loading runtime settings");
+    InitializeRuntimeSettings();
+    LogSetupCheckpoint(g_runtimeSettingsStorageStatus.usingDefaults ? "using default runtime settings"
+                                                                   : "runtime settings loaded from SD");
+
     LogSetupCheckpoint("configuring flight computer");
-    const EnvironmentModel::Config environmentConfig;
-    ApogeeVehicleParameters vehicleParameters;
-    vehicleParameters.centerOfPressureOffsetMeters = settings::vehicle::kCenterOfPressureOffsetMeters;
-    vehicleParameters.momentOfInertia = settings::vehicle::kMomentOfInertiaKgM2;
-    vehicleParameters.dryMass = settings::vehicle::kDryMassKg;
+    const EnvironmentModel::Config &environmentConfig = g_runtimeSettings.environment;
+    const ApogeeVehicleParameters &vehicleParameters = g_runtimeSettings.vehicle;
 
     g_actuationEnvironment.Configure(environmentConfig);
     g_actuationPredictor.SetEnvironment(g_actuationEnvironment);
@@ -937,6 +1057,7 @@ void setup() {
 
     LogSetupCheckpoint("starting network telemetry");
     NetworkTelemetryBegin();
+    PublishRuntimeSettingsSnapshot();
     LogSetupCheckpoint("network telemetry ready");
 
     LogSetupCheckpoint("starting status LEDs");
@@ -978,11 +1099,16 @@ void loop() {
     const uint32_t loopStartUs = micros();
     const uint32_t nowMs = millis();
     NetworkTelemetryPollControl();
+    ServiceRuntimeSettingsCommands();
 
     if (!g_csvReplay.enabled) {
         ServiceRetry(nowMs, g_dataLoggerRetry, DataLoggerIsInitialized(), &DataLoggerBegin, "data_logger");
         if (kEnableCsvReplay && DataLoggerIsInitialized() && !g_csvReplay.enabled && !g_csvReplay.completed) {
             CsvReplayInit();
+        }
+        if (DataLoggerIsInitialized() && !g_runtimeSettingsStorageStatus.storageAvailable) {
+            g_runtimeSettingsStorageStatus.storageAvailable = true;
+            PublishRuntimeSettingsSnapshot();
         }
     }
 

@@ -26,6 +26,13 @@ uint16_t g_subscriberPort = settings::network::kTelemetryUdpRemotePort;
 bool g_manualActuationOverride = false;
 float g_manualActuationAngleDeg = 0.0f;
 bool g_telemetryStreamingEnabled = true;
+telemetry::SettingsSnapshotV1 g_settingsSnapshot{};
+bool g_hasPendingSettingsCommand = false;
+telemetry::SettingsCommandV1 g_pendingSettingsCommand{};
+bool g_settingsSnapshotDirty = true;
+uint32_t g_lastSettingsSendMs = 0;
+
+constexpr uint32_t kSettingsIntervalMs = 1000;
 
 IPAddress ConfiguredRemoteIp() {
     return IPAddress(settings::network::kTelemetryRemoteIp0,
@@ -143,6 +150,19 @@ void FillPacket(const TelemetrySnapshot &snapshot, telemetry::PacketV1 &packet) 
     }
 }
 
+void FillSettingsPayload(const RuntimeSettings &settings, telemetry::RuntimeSettingsPayloadV1 &payload) {
+    payload.groundTemperatureF = static_cast<double>(settings.environment.groundTemperatureF);
+    payload.windSpeedMph = static_cast<double>(settings.environment.windSpeedMph);
+    payload.windDirectionDeg = static_cast<double>(settings.environment.windDirectionDeg);
+    payload.launchDirectionDeg = static_cast<double>(settings.environment.launchDirectionDeg);
+    payload.roughnessLengthMeters = static_cast<double>(settings.environment.roughnessLengthMeters);
+    payload.gradientHeightMeters = static_cast<double>(settings.environment.gradientHeightMeters);
+    payload.measurementHeightMeters = static_cast<double>(settings.environment.measurementHeightMeters);
+    payload.centerOfPressureOffsetMeters = settings.vehicle.centerOfPressureOffsetMeters;
+    payload.momentOfInertiaKgM2 = settings.vehicle.momentOfInertia;
+    payload.dryMassKg = settings.vehicle.dryMass;
+}
+
 void PollSubscriberPackets(uint32_t nowMs) {
     int packetBytes = g_udp.parsePacket();
     while (packetBytes > 0) {
@@ -196,6 +216,21 @@ void PollSubscriberPackets(uint32_t nowMs) {
                     g_manualActuationOverride = false;
                     g_manualActuationAngleDeg = 0.0f;
                 }
+            }
+        } else if (packetBytes == static_cast<int>(sizeof(telemetry::SettingsCommandV1))) {
+            telemetry::SettingsCommandV1 command{};
+            const int n = g_udp.read(reinterpret_cast<uint8_t *>(&command), sizeof(command));
+            if (n == static_cast<int>(sizeof(command)) &&
+                command.magic == telemetry::kSettingsCommandMagic &&
+                command.version == telemetry::kSettingsCommandVersion &&
+                command.size == sizeof(telemetry::SettingsCommandV1)) {
+                g_pendingSettingsCommand = command;
+                g_hasPendingSettingsCommand = true;
+                g_settingsSnapshotDirty = true;
+                g_hasSubscriber = true;
+                g_lastSubscriberMs = nowMs;
+                g_subscriberIp = g_udp.remoteIP();
+                g_subscriberPort = g_udp.remotePort();
             }
         } else {
             while (packetBytes-- > 0) {
@@ -287,6 +322,16 @@ void NetworkTelemetryService(const TelemetrySnapshot &snapshot) {
     }
     g_udp.write(reinterpret_cast<const uint8_t *>(&packet), sizeof(packet));
     g_udp.endPacket();
+
+    if (subscriberActive &&
+        (g_settingsSnapshotDirty || (now - g_lastSettingsSendMs) >= kSettingsIntervalMs)) {
+        if (g_udp.beginPacket(targetIp, targetPort)) {
+            g_udp.write(reinterpret_cast<const uint8_t *>(&g_settingsSnapshot), sizeof(g_settingsSnapshot));
+            g_udp.endPacket();
+            g_lastSettingsSendMs = now;
+            g_settingsSnapshotDirty = false;
+        }
+    }
 }
 
 bool NetworkTelemetryConnected() {
@@ -300,4 +345,45 @@ bool NetworkTelemetrySubscriberActive() {
 bool NetworkTelemetryManualActuationOverride(float &angleDegOut) {
     angleDegOut = g_manualActuationAngleDeg;
     return g_manualActuationOverride;
+}
+
+void NetworkTelemetrySetRuntimeSettingsSnapshot(const RuntimeSettings &settings,
+                                                const RuntimeSettingsStorageStatus &storageStatus,
+                                                uint32_t settingsRevision,
+                                                uint32_t appliedRequestId,
+                                                uint8_t lastCommandResult) {
+    telemetry::SettingsSnapshotV1 snapshot{};
+    snapshot.settingsRevision = settingsRevision;
+    snapshot.appliedRequestId = appliedRequestId;
+    snapshot.lastCommandResult = lastCommandResult;
+    if (storageStatus.storageAvailable) {
+        snapshot.statusFlags |= telemetry::kSettingsStatusStorageAvailable;
+    }
+    if (storageStatus.filePresent) {
+        snapshot.statusFlags |= telemetry::kSettingsStatusFilePresent;
+    }
+    if (storageStatus.usingDefaults) {
+        snapshot.statusFlags |= telemetry::kSettingsStatusUsingDefaults;
+    }
+    if (storageStatus.lastLoadSucceeded) {
+        snapshot.statusFlags |= telemetry::kSettingsStatusLastLoadSucceeded;
+    }
+    if (storageStatus.lastSaveSucceeded) {
+        snapshot.statusFlags |= telemetry::kSettingsStatusLastSaveSucceeded;
+    }
+    if (storageStatus.createdDefaultFile) {
+        snapshot.statusFlags |= telemetry::kSettingsStatusCreatedDefaultFile;
+    }
+    FillSettingsPayload(settings, snapshot.payload);
+    g_settingsSnapshot = snapshot;
+    g_settingsSnapshotDirty = true;
+}
+
+bool NetworkTelemetryConsumeSettingsCommand(telemetry::SettingsCommandV1 &commandOut) {
+    if (!g_hasPendingSettingsCommand) {
+        return false;
+    }
+    commandOut = g_pendingSettingsCommand;
+    g_hasPendingSettingsCommand = false;
+    return true;
 }

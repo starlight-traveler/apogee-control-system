@@ -375,6 +375,31 @@ bool DataLoggerReadTextFile(const char *path, bool (*lineCallback)(const char *l
     return true;
 }
 
+/// Replaces a text file on the mounted SD card.
+bool DataLoggerWriteTextFile(const char *path, const char *contents) {
+    if (!g_loggerInitialized || path == nullptr || contents == nullptr) {
+        return false;
+    }
+
+    FsFile file = g_sd.open(path, O_WRONLY | O_CREAT | O_TRUNC);
+    if (!file) {
+        return false;
+    }
+
+    const size_t length = strlen(contents);
+    const size_t bytesWritten = file.write(contents, length);
+    if (bytesWritten != length) {
+        file.close();
+        return false;
+    }
+    if (!file.sync()) {
+        file.close();
+        return false;
+    }
+    file.close();
+    return true;
+}
+
 /// Opens a text file for sequential reads, primarily for replay and tooling.
 bool DataLoggerOpenReadFile(const char *path, FsFile &file) {
     if (!g_loggerInitialized || path == nullptr) {
