@@ -26,7 +26,6 @@ constexpr float kSeaLevelPressureInv = 1.0f / kSeaLevelPressureHpa;
 constexpr float kMaxAltitudeRateFeetPerSecond = settings::sensors::bmp585::kMaxAltitudeRateFeetPerSecond;
 constexpr float kMinSpikeJumpFeet = settings::sensors::bmp585::kMinSpikeJumpFeet;
 constexpr float kMaxValidAltitudeFeet = settings::sensors::bmp585::kMaxValidAltitudeFeet;
-
 bool g_initialized = false;
 bool g_hasSample = false;
 
@@ -40,6 +39,7 @@ uint32_t g_lastReadDurationUs = 0;
 uint32_t g_averageReadDurationUs = 0;
 uint32_t g_averageUpdatePeriodUs = 0;
 
+/// Updates an exponentially weighted average used for sensor timing diagnostics.
 void UpdateAverage(uint32_t sample, uint32_t &average) {
     if (sample == 0) {
         return;
@@ -51,6 +51,7 @@ void UpdateAverage(uint32_t sample, uint32_t &average) {
     average = (average * 7u + sample) / 8u;
 }
 
+/// Applies the BMP585 oversampling/filter/output-rate configuration.
 bool ConfigureSensor() {
     return g_pressureSensor.setTemperatureOversampling(BMP5XX_OVERSAMPLING_2X) &&
            g_pressureSensor.setPressureOversampling(BMP5XX_OVERSAMPLING_16X) &&
@@ -59,6 +60,7 @@ bool ConfigureSensor() {
            g_pressureSensor.setPowerMode(BMP5XX_POWERMODE_NORMAL);
 }
 
+/// Converts pressure to altitude in feet using the configured sea-level reference.
 float ComputeAltitudeFeet(float pressureHpa) {
     const float32_t ratio = std::max(pressureHpa * kSeaLevelPressureInv, 1.0e-6f);
     const float32_t powTerm = static_cast<float32_t>(std::pow(static_cast<double>(ratio), 0.190294957));
@@ -76,6 +78,7 @@ float ComputeAltitudeFeet(float pressureHpa) {
     return altitudeFeet[0];
 }
 
+/// Caches the latest accepted sample and updates timing diagnostics.
 void UpdateCachedSample(float pressureHpa, float temperatureC) {
     const uint32_t nowMicros = micros();
     if (g_lastUpdateMicros != 0) {
@@ -89,6 +92,7 @@ void UpdateCachedSample(float pressureHpa, float temperatureC) {
     g_hasSample = true;
 }
 
+/// Rejects implausible single-sample altitude jumps before they reach the estimator.
 bool IsAltitudeSpike(float candidateAltitudeFeet, float timestampSeconds) {
     if (!isfinite(candidateAltitudeFeet)) {
         return true;
@@ -111,6 +115,7 @@ bool IsAltitudeSpike(float candidateAltitudeFeet, float timestampSeconds) {
 
 }  // namespace
 
+/// Initializes and configures the BMP585.
 bool Bmp585SensorBegin() {
     if (g_initialized) {
         return true;
@@ -141,6 +146,7 @@ bool Bmp585SensorBegin() {
     return true;
 }
 
+/// Returns the latest BMP585 sample, subject to read pacing and spike rejection.
 bool Bmp585SensorAcquire(SensorData &out) {
     if (g_hasSample) {
         out.altitudeFeet = g_lastAltitudeFeet;
@@ -190,10 +196,12 @@ bool Bmp585SensorAcquire(SensorData &out) {
     return true;
 }
 
+/// Returns true once the BMP585 transport/configuration completed successfully.
 bool Bmp585SensorIsInitialized() {
     return g_initialized;
 }
 
+/// Returns cached BMP585 diagnostics for logging and field debugging.
 BarometerDiagnostics Bmp585SensorGetDiagnostics() {
     BarometerDiagnostics diagnostics;
     diagnostics.initialized = g_initialized;

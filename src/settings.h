@@ -284,17 +284,38 @@ constexpr int kApogeePredictorMaxSteps = APOGEE_PREDICTOR_MAX_STEPS;
 // Sensor-specific configuration and runtime sanity checks.
 // ---------------------------------------------------------------------------
 namespace sensors {
-namespace bno085 {
+namespace bno {
+enum class Model : uint8_t { Bno055 = 0, Bno085 = 1 };
+enum class Transport : uint8_t { I2c = 0, Spi = 1 };
+
+// Select the active BNO-family device used by the firmware.
+constexpr Model kModel = Model::Bno055;
+// Select the transport used by the active BNO-family device.
+constexpr Transport kTransport = Transport::I2c;
+}
+
+namespace bno055 {
 // BNO055 I2C address.
 constexpr uint8_t kI2cAddress = 0x28;
 // Optional BNO055 reset pin. Set to -1 if reset is not wired.
 constexpr int8_t kResetPin = -1;
 // Poll interval for consuming queued sensor events.
 constexpr uint32_t kSampleIntervalUs = 10000;
-// Number of full startup attempts before giving up to the caller.
-constexpr uint8_t kInitializationAttempts = 5;
-// Delay between failed startup attempts.
-constexpr uint32_t kRetryDelayMs = 80;
+// If no complete sample arrives for this long, force a full reinit.
+constexpr uint32_t kDataTimeoutUs = 250000;
+}
+
+namespace bno085 {
+// BNO085 I2C address.
+constexpr uint8_t kI2cAddress = 0x4B;
+// SPI chip-select pin for the BNO085 when SPI transport is selected.
+constexpr uint8_t kChipSelectPin = 24;
+// Optional interrupt pin for the BNO085 SPI transport. Set to -1 if unused.
+constexpr int8_t kInterruptPin = -1;
+// Optional BNO085 reset pin. Set to -1 if reset is not wired.
+constexpr int8_t kResetPin = -1;
+// Poll interval for consuming queued sensor events.
+constexpr uint32_t kSampleIntervalUs = 10000;
 // If no complete sample arrives for this long, force a full reinit.
 constexpr uint32_t kDataTimeoutUs = 250000;
 }

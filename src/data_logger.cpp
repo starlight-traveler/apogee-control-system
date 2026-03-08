@@ -38,6 +38,9 @@ constexpr const char *kFirmwareGitHash = ACS_FIRMWARE_GIT_HASH;
 constexpr const char *kFirmwareGitHash = "unknown";
 #endif
 
+// These static asserts are the first line of defense for the binary schema.
+// If any of them changes, the decoder table in tools/decode/native must be
+// updated in lockstep before new logs are trusted.
 static_assert(sizeof(SensorData) == 136, "SensorData size mismatch.");
 static_assert(sizeof(FilteredState) == 60, "FilteredState size mismatch.");
 static_assert(sizeof(TelemetryLogRecord) == 200, "TelemetryLogRecord size mismatch.");
@@ -51,12 +54,14 @@ static_assert(std::is_trivially_copyable<TelemetryLogRecord>::value,
 static_assert(std::is_trivially_copyable<EventLogRecord>::value,
               "EventLogRecord must be trivially copyable.");
 
+/// Tracks the maximum observed value for a timing diagnostic.
 void UpdateMax(uint32_t sample, uint32_t &maximum) {
     if (sample > maximum) {
         maximum = sample;
     }
 }
 
+/// Tears down the logger after an unrecoverable write/sync failure.
 void FailLogger() {
     g_logFile.close();
     g_loggerInitialized = false;
@@ -67,6 +72,7 @@ void FailLogger() {
     g_diagnostics.bufferedBytes = 0;
 }
 
+/// Syncs pending metadata/data to the SD card when a deferred sync is due.
 bool SyncFile() {
     if (!g_loggerInitialized || !g_syncPending) {
         return true;
@@ -85,6 +91,10 @@ bool SyncFile() {
     return true;
 }
 
+/// Flushes the RAM buffer to the log file.
+///
+/// Telemetry writes are buffered to reduce loop latency; high-priority event
+/// records request a later sync so flight-critical control work can continue.
 bool FlushBuffer(bool requestSync) {
     if (!g_loggerInitialized || g_bufferPosition == 0) {
         if (requestSync) {
@@ -112,6 +122,10 @@ bool FlushBuffer(bool requestSync) {
     return true;
 }
 
+/// Appends one binary record to the RAM buffer.
+///
+/// Low-priority telemetry may be dropped when the buffer is full; high-priority
+/// event records force a flush instead.
 bool AppendRecord(const void *record, size_t size, bool highPriority) {
     if (!g_loggerInitialized) {
         return false;
@@ -138,6 +152,7 @@ bool AppendRecord(const void *record, size_t size, bool highPriority) {
     return true;
 }
 
+/// Finds the next sequential `SENSxxx.BIN` filename on the SD card.
 bool NextLogFilename(char *buffer, size_t length) {
     for (uint16_t index = 0; index < 1000; ++index) {
         const int written = snprintf(buffer, length, "%s%03u.%s", kLogPrefix, index, kLogExtension);
@@ -152,6 +167,7 @@ bool NextLogFilename(char *buffer, size_t length) {
     return false;
 }
 
+/// Writes the log preamble that the native decoder validates before parsing.
 bool WriteLogPreamble() {
     LogFilePreamble preamble{};
     memcpy(preamble.magic, kLogMagic, sizeof(kLogMagic));
@@ -171,6 +187,7 @@ bool WriteLogPreamble() {
 
 }  // namespace
 
+/// Initializes the SD card, opens the next log file, and writes the preamble.
 bool DataLoggerBegin() {
     if (g_loggerInitialized) {
         return true;
@@ -212,6 +229,7 @@ bool DataLoggerBegin() {
     return true;
 }
 
+/// Serializes and buffers one telemetry record.
 void DataLoggerLogTelemetry(const SensorData &sensor, FlightStatus status, const FilteredState *state) {
     if (!g_loggerInitialized) {
         return;
@@ -231,6 +249,7 @@ void DataLoggerLogTelemetry(const SensorData &sensor, FlightStatus status, const
     }
 }
 
+/// Serializes and buffers one high-priority event record.
 void DataLoggerLogEvent(FlightEventType type,
                         FlightStatus status,
                         float timestamp,
@@ -259,6 +278,7 @@ void DataLoggerLogEvent(FlightEventType type,
     }
 }
 
+/// Forces an immediate flush and sync of the current log file.
 void DataLoggerForceSync() {
     if (!g_loggerInitialized) {
         return;
@@ -272,6 +292,11 @@ void DataLoggerForceSync() {
     }
 }
 
+/// Background logger service called from the main loop.
+///
+/// This is intentionally non-blocking in the common case: writes are buffered
+/// and sync is deferred to reduce the chance of a long SD stall in control
+/// code.
 void DataLoggerService() {
     if (!g_loggerInitialized) {
         return;
@@ -293,10 +318,12 @@ void DataLoggerService() {
     }
 }
 
+/// Returns true while the logger can accept records.
 bool DataLoggerIsInitialized() {
     return g_loggerInitialized;
 }
 
+/// Returns current logger diagnostics for timing/backpressure telemetry.
 DataLoggerDiagnostics DataLoggerGetDiagnostics() {
     g_diagnostics.initialized = g_loggerInitialized;
     g_diagnostics.syncPending = g_syncPending;
@@ -304,6 +331,7 @@ DataLoggerDiagnostics DataLoggerGetDiagnostics() {
     return g_diagnostics;
 }
 
+/// Reads a text file line-by-line from the mounted SD card.
 bool DataLoggerReadTextFile(const char *path, bool (*lineCallback)(const char *line, void *context), void *context) {
     if (!g_loggerInitialized || path == nullptr || lineCallback == nullptr) {
         return false;
@@ -347,6 +375,7 @@ bool DataLoggerReadTextFile(const char *path, bool (*lineCallback)(const char *l
     return true;
 }
 
+/// Opens a text file for sequential reads, primarily for replay and tooling.
 bool DataLoggerOpenReadFile(const char *path, FsFile &file) {
     if (!g_loggerInitialized || path == nullptr) {
         return false;
@@ -355,6 +384,7 @@ bool DataLoggerOpenReadFile(const char *path, FsFile &file) {
     return static_cast<bool>(file);
 }
 
+/// Reads the next non-empty text line from an open file handle.
 bool DataLoggerReadLine(FsFile &file, char *line, size_t lineSize) {
     if (!file || line == nullptr || lineSize == 0) {
         return false;

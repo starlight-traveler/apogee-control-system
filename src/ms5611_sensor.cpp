@@ -30,6 +30,7 @@ uint32_t g_lastReadDurationUs = 0;
 uint32_t g_averageReadDurationUs = 0;
 uint32_t g_averageUpdatePeriodUs = 0;
 
+/// Updates an exponentially weighted timing average.
 void UpdateAverage(uint32_t sample, uint32_t &average) {
     if (sample == 0) {
         return;
@@ -41,6 +42,7 @@ void UpdateAverage(uint32_t sample, uint32_t &average) {
     average = (average * 7u + sample) / 8u;
 }
 
+/// Converts pressure to altitude in feet using the MS5611 sea-level reference.
 float ComputeAltitudeFeet(float pressureHpa) {
     const float ratio = pressureHpa * kSeaLevelPressureInv;
     if (!(ratio > 0.0f)) {
@@ -52,6 +54,7 @@ float ComputeAltitudeFeet(float pressureHpa) {
 
 }  // namespace
 
+/// Initializes the MS5611 over SPI.
 bool Ms5611SensorBegin() {
     if (g_initialized) {
         return true;
@@ -80,6 +83,7 @@ bool Ms5611SensorBegin() {
     return true;
 }
 
+/// Acquires one paced MS5611 sample and updates cached diagnostics.
 bool Ms5611SensorAcquire() {
     if (!g_initialized) {
         return false;
@@ -124,6 +128,7 @@ bool Ms5611SensorAcquire() {
     return true;
 }
 
+/// Returns cached MS5611 diagnostics for comparison against the BMP585 path.
 BarometerDiagnostics Ms5611SensorGetDiagnostics() {
     BarometerDiagnostics diagnostics;
     diagnostics.initialized = g_initialized;

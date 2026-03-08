@@ -1,10 +1,11 @@
 #include "bno085_sensor.h"
 
 #include <Arduino.h>
+#include <SPI.h>
 #include <Wire.h>
 
-#include <Adafruit_BNO055.h>
-#include <utility/imumaths.h>
+#include <Adafruit_BNO08x.h>
+#include <sh2.h>
 
 #include "bno085_orientation.h"
 #include "serial_logging.h"
@@ -14,12 +15,12 @@ namespace {
 
 constexpr uint32_t kSampleIntervalUs = settings::sensors::bno085::kSampleIntervalUs;
 constexpr uint8_t kBnoI2cAddress = settings::sensors::bno085::kI2cAddress;
+constexpr uint8_t kBnoChipSelectPin = settings::sensors::bno085::kChipSelectPin;
+constexpr int8_t kBnoInterruptPin = settings::sensors::bno085::kInterruptPin;
 constexpr int8_t kBnoResetPin = settings::sensors::bno085::kResetPin;
-constexpr uint8_t kInitializationAttempts = settings::sensors::bno085::kInitializationAttempts;
-constexpr uint32_t kRetryDelayMs = settings::sensors::bno085::kRetryDelayMs;
 constexpr uint32_t kDataTimeoutUs = settings::sensors::bno085::kDataTimeoutUs;
 
-Adafruit_BNO055 g_bno(55, kBnoI2cAddress, &Wire);
+Adafruit_BNO08x g_bno(kBnoResetPin);
 bool g_initialized = false;
 uint32_t g_lastSampleUs = 0;
 uint32_t g_lastHealthyEventUs = 0;
@@ -39,18 +40,29 @@ void ResetCachedState() {
     g_haveQuat = false;
 }
 
+bool EnableReports() {
+    return g_bno.enableReport(SH2_ACCELEROMETER, kSampleIntervalUs) &&
+           g_bno.enableReport(SH2_GYROSCOPE_CALIBRATED, kSampleIntervalUs) &&
+           g_bno.enableReport(SH2_ROTATION_VECTOR, kSampleIntervalUs);
+}
+
 bool StartSensorTransport() {
-    Wire.begin();
-    if (!g_bno.begin()) {
-        return false;
+    switch (settings::sensors::bno::kTransport) {
+        case settings::sensors::bno::Transport::I2c:
+            Wire.begin();
+            if (!g_bno.begin_I2C(kBnoI2cAddress, &Wire)) {
+                return false;
+            }
+            break;
+        case settings::sensors::bno::Transport::Spi:
+            SPI.begin();
+            if (!g_bno.begin_SPI(kBnoChipSelectPin, kBnoInterruptPin, &SPI)) {
+                return false;
+            }
+            break;
     }
-    if (kBnoResetPin >= 0) {
-        pinMode(kBnoResetPin, OUTPUT);
-        digitalWrite(kBnoResetPin, HIGH);
-    }
-    g_bno.setExtCrystalUse(false);
     delay(10);
-    return true;
+    return EnableReports();
 }
 
 bool RecoverSensor(const char *reason) {
@@ -64,14 +76,11 @@ bool RecoverSensor(const char *reason) {
 
     if (StartSensorTransport()) {
         g_initialized = true;
-        LOG_PRINTLN("BNO055 online");
+        LOG_PRINT("BNO085 online via ");
+        LOG_PRINTLN(settings::sensors::bno::kTransport == settings::sensors::bno::Transport::I2c ? "I2C" : "SPI");
         return true;
     }
-    LOG_PRINT("BNO055 init failed; caller will retry (attempt budget=");
-    LOG_PRINT(static_cast<unsigned>(kInitializationAttempts));
-    LOG_PRINT(", retry delay ms=");
-    LOG_PRINT(kRetryDelayMs);
-    LOG_PRINTLN(")");
+    LOG_PRINTLN("BNO085 init failed; caller will retry");
     return false;
 }
 
@@ -90,13 +99,48 @@ void PopulateOutput(SensorData &out, uint32_t nowUs) {
     out.hasQuaternion = g_haveQuat;
 }
 
+void ConsumeEvent(const sh2_SensorValue_t &sensorValue, uint32_t nowUs) {
+    switch (sensorValue.sensorId) {
+        case SH2_ACCELEROMETER:
+            bno085_orientation::TransformVector(sensorValue.un.accelerometer.x,
+                                                sensorValue.un.accelerometer.y,
+                                                sensorValue.un.accelerometer.z,
+                                                g_lastAccel[0],
+                                                g_lastAccel[1],
+                                                g_lastAccel[2]);
+            g_haveAccel = true;
+            g_lastHealthyEventUs = nowUs;
+            break;
+        case SH2_GYROSCOPE_CALIBRATED:
+            bno085_orientation::TransformVector(sensorValue.un.gyroscope.x,
+                                                sensorValue.un.gyroscope.y,
+                                                sensorValue.un.gyroscope.z,
+                                                g_lastGyro[0],
+                                                g_lastGyro[1],
+                                                g_lastGyro[2]);
+            g_haveGyro = true;
+            g_lastHealthyEventUs = nowUs;
+            break;
+        case SH2_ROTATION_VECTOR:
+            bno085_orientation::AdjustQuaternion(sensorValue.un.rotationVector.real,
+                                                 sensorValue.un.rotationVector.i,
+                                                 sensorValue.un.rotationVector.j,
+                                                 sensorValue.un.rotationVector.k,
+                                                 g_lastQuat);
+            g_haveQuat = true;
+            g_lastHealthyEventUs = nowUs;
+            break;
+        default:
+            break;
+    }
+}
+
 }  // namespace
 
 bool Bno085SensorBegin() {
     if (g_initialized) {
         return true;
     }
-
     return RecoverSensor("startup");
 }
 
@@ -118,30 +162,19 @@ bool Bno085SensorAcquire(SensorData &out) {
     }
     g_lastSampleUs = nowUs;
 
-    imu::Vector<3> accel = g_bno.getVector(Adafruit_BNO055::VECTOR_ACCELEROMETER);
-    imu::Vector<3> gyro = g_bno.getVector(Adafruit_BNO055::VECTOR_GYROSCOPE);
-    imu::Quaternion quat = g_bno.getQuat();
-
-    if (quat.w() == 0.0f && quat.x() == 0.0f && quat.y() == 0.0f && quat.z() == 0.0f) {
-        if (!g_haveQuat) {
-            return false;
-        }
-        PopulateOutput(out, nowUs);
-        return true;
+    sh2_SensorValue_t sensorValue;
+    bool consumedAny = false;
+    while (g_bno.getSensorEvent(&sensorValue)) {
+        ConsumeEvent(sensorValue, nowUs);
+        consumedAny = true;
     }
 
-    bno085_orientation::TransformVector(accel.x(), accel.y(), accel.z(),
-                                        g_lastAccel[0], g_lastAccel[1], g_lastAccel[2]);
-    bno085_orientation::TransformVector(gyro.x(), gyro.y(), gyro.z(),
-                                        g_lastGyro[0], g_lastGyro[1], g_lastGyro[2]);
-    bno085_orientation::AdjustQuaternion(quat.w(), quat.x(), quat.y(), quat.z(), g_lastQuat);
-    g_haveAccel = true;
-    g_haveGyro = true;
-    g_haveQuat = true;
-    g_lastHealthyEventUs = nowUs;
+    if (!consumedAny && !g_haveQuat) {
+        return false;
+    }
 
     PopulateOutput(out, nowUs);
-    return true;
+    return g_haveQuat;
 }
 
 bool Bno085SensorIsInitialized() {

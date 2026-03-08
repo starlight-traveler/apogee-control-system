@@ -9,6 +9,7 @@
 
 namespace {
 
+/// Rotates body-frame acceleration into the simplified inertial frame used by the filters.
 math_utils::Vec3 RotateBodyToInertial(const math_utils::Vec3 &bodyAccel, float zenith) {
     constexpr float kHalfPi = 1.5707963267948966f;
     const float angle = zenith - kHalfPi;
@@ -23,6 +24,7 @@ math_utils::Vec3 RotateBodyToInertial(const math_utils::Vec3 &bodyAccel, float z
     return result;
 }
 
+/// Returns the discrete-time smoothing alpha for the requested time constant.
 double ComputeSmoothingAlpha(double dt, double tauSeconds) {
     if (dt <= 0.0 || tauSeconds <= 0.0) {
         return 1.0;
@@ -37,6 +39,7 @@ double ComputeSmoothingAlpha(double dt, double tauSeconds) {
     return alpha;
 }
 
+/// Limits per-sample output movement so published telemetry does not jump abruptly.
 double ApplySlewLimit(double previous, double target, double maxDeltaPerStep) {
     if (maxDeltaPerStep <= 0.0) {
         return target;
@@ -55,6 +58,7 @@ double ApplySlewLimit(double previous, double target, double maxDeltaPerStep) {
 
 FlightComputer::FlightComputer() = default;
 
+/// Configures filters and predictor dependencies for a new flight.
 void FlightComputer::Begin(double sigmaAccelXY,
                            double sigmaAccelZ,
                            double sigmaAltimeter,
@@ -80,13 +84,14 @@ void FlightComputer::Begin(double sigmaAccelXY,
     ResetInternalState();
 }
 
+/// Processes one sensor sample and updates the filtered flight state.
 bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
     const bool hasBnoAccel =
         !(data.accelBNO[0] == 0.0f && data.accelBNO[1] == 0.0f && data.accelBNO[2] == 0.0f);
     const bool hasIcmAccel =
         !(data.accelICM[0] == 0.0f && data.accelICM[1] == 0.0f && data.accelICM[2] == 0.0f);
     if (!hasBnoAccel && !hasIcmAccel) {
-        return false;  // No valid accelerometer data; skip this update.
+        return false;  // No usable acceleration source means the filters cannot advance safely.
     }
     
     double dt = static_cast<double>(settings::flight::kDefaultDtSeconds);
@@ -102,6 +107,8 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
     const double altitudeMeters = static_cast<double>(data.altitudeFeet) * constants::kFeetToMeters;
 
     float accelBody[3];
+    // Prefer the ICM path during the higher-dynamic ground/burn phases when it
+    // is available; otherwise fall back to the BNO source.
     const bool preferIcm = (status_ == FlightStatus::Ground || status_ == FlightStatus::Burn) && hasIcmAccel;
     if (preferIcm || !hasBnoAccel) {
         accelBody[0] = data.accelICM[0];
@@ -119,6 +126,8 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
         quaternionValid_ = true;
         orientation = previousQuaternion_;
     } else if ((status_ == FlightStatus::Burn || status_ == FlightStatus::Coast) && quaternionValid_) {
+        // Propagate attitude through ascent with gyro-only integration so brief
+        // quaternion dropouts do not immediately collapse the predictor seed.
         orientation = TeasleyFilter(previousQuaternion_, data.gyro, static_cast<float>(dt));
         previousQuaternion_ = orientation;
     } else if (data.hasQuaternion) {
@@ -233,20 +242,44 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
     const bool shouldPredictApogee =
         (status_ == FlightStatus::Burn || status_ == FlightStatus::Coast) && velZ > 0.0;
     if (shouldPredictApogee) {
+        // Deliberately degrade to a simpler predictor seed whenever attitude
+        // freshness is questionable rather than integrating unstable XY terms.
+        const double seedZenith = quaternionValid_ ? SanitizePredictorZenithRadians(zenithRadians_) : 0.0;
+        const bool freshSeedSample = PredictorSeedHasFreshSample(dt);
+        const bool canUseHorizontalSeed = quaternionValid_ && freshSeedSample;
+        if (!canUseHorizontalSeed) {
+            ResetPredictorHorizontalVelocityTracker(predictorHorizontalVelocity_);
+        }
+        const double predictorHorizontalVelocity =
+            canUseHorizontalSeed
+                ? UpdatePredictorHorizontalSpeed(predictorHorizontalVelocity_,
+                                                 kalmanX_.Acceleration(),
+                                                 kalmanY_.Acceleration(),
+                                                 dt,
+                                                 true,
+                                                 velZ,
+                                                 seedZenith)
+                : 0.0;
+        const double predictorAngularRate =
+            canUseHorizontalSeed
+                ? ClampPredictorAngularRate(ComputePredictorAngularRate(zenithRadians_, lastZenith_, dt))
+                : 0.0;
+
         ApogeeState predictorState;
         predictorState.altitudeMeters = posZ;
         predictorState.horizontalDistanceMeters = 0.0;
         predictorState.verticalVelocity = velZ;
         predictorState.horizontalVelocity = predictorHorizontalVelocity;
-        predictorState.zenith = ClampPredictorZenithRadians(zenithRadians_);
-        predictorState.angularVelocity =
-            ClampPredictorAngularRate((dt != 0.0) ? (zenithRadians_ - lastZenith_) / dt : 0.0);
+        predictorState.zenith = seedZenith;
+        predictorState.angularVelocity = predictorAngularRate;
         lastApogeePrediction_ = apogeePredictor_.PredictApogee(predictorState);
+    } else {
+        ResetPredictorHorizontalVelocityTracker(predictorHorizontalVelocity_);
     }
 
     // Smooth only published outputs to reduce telemetry/log oscillation.
-    // Detection/state transitions above remain on raw Kalman values.
-    // Minimal-lag mode: effectively bypass output smoothing.
+    // Phase transitions above remain on raw Kalman values so state-machine
+    // timing is not delayed by presentation-oriented filtering.
     constexpr double kVelocityTauSeconds = 0.0;
     constexpr double kAccelerationTauSeconds = 0.0;
     constexpr double kMaxOutputAccelMps2 = 1.0e9;
@@ -299,6 +332,7 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
     return true;
 }
 
+/// Resets filters, phase latches, and predictor-side history.
 void FlightComputer::ResetInternalState() {
     kalmanX_.Reset();
     kalmanY_.Reset();
@@ -327,6 +361,7 @@ void FlightComputer::ResetInternalState() {
     ResetPredictorHorizontalVelocityTracker(predictorHorizontalVelocity_);
 }
 
+/// Emits a human-readable flight event to the serial logger.
 void FlightComputer::ReportEvent(bool includeAltitude, float timeSeconds, const char *label) {
     LOG_PRINT(label);
     LOG_PRINT(" at t = ");
@@ -340,6 +375,7 @@ void FlightComputer::ReportEvent(bool includeAltitude, float timeSeconds, const 
     LOG_PRINTLN();
 }
 
+/// Integrates quaternion attitude one sample forward using gyro data only.
 math_utils::Quaternion FlightComputer::TeasleyFilter(const math_utils::Quaternion &quat, const float gyro[3], float dt) {
     const float half_dt = 0.5f * dt;
     const float qw = quat.w;
@@ -363,10 +399,12 @@ math_utils::Quaternion FlightComputer::TeasleyFilter(const math_utils::Quaternio
     return math_utils::Normalize(updated);
 }
 
+/// Converts raw telemetry quaternion storage into the internal math type.
 math_utils::Quaternion FlightComputer::ArrayToQuaternion(const float values[4]) const {
     return math_utils::Normalize(math_utils::MakeQuaternion(values[0], values[1], values[2], values[3]));
 }
 
+/// Returns a stable string label for a flight status value.
 const char *FlightStatusToString(FlightStatus status) {
     switch (status) {
         case FlightStatus::Ground:

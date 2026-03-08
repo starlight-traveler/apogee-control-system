@@ -8,7 +8,7 @@
 #include "math_utils.h"
 #include "predictor_seed.h"
 
-// Data structures mirroring the layout of the Python flight.py script.
+/// Raw sensor/control sample written to logs and consumed by the estimator.
 
 struct SensorData {
     float timestamp = 0.0f;
@@ -35,6 +35,7 @@ struct SensorData {
     bool hasIcmYpr = false;
 };
 
+/// Published estimator state used by telemetry, replay, and actuation logic.
 struct FilteredState {
     float time = 0.0f;
     float position[3] = {0.0f, 0.0f, 0.0f};
@@ -45,12 +46,16 @@ struct FilteredState {
     float apogeeEstimate = 0.0f;
 };
 
+/// High-level flight phases used for event detection and control gating.
 enum class FlightStatus { Ground, Burn, Coast, Overshoot, Descent };
 
+/// Flight-state estimator and apogee predictor coordinator.
 class FlightComputer {
   public:
+    /// Constructs the flight computer in a reset state.
     FlightComputer();
 
+    /// Configures filters, environment, and apogee predictor dependencies.
     void Begin(double sigmaAccelXY,
                double sigmaAccelZ,
                double sigmaAltimeter,
@@ -61,22 +66,38 @@ class FlightComputer {
                const ApogeeVehicleParameters &vehicleParameters,
                const ApogeeForceTable *forceTable = nullptr);
 
+    /// Ingests one sensor sample and publishes the latest filtered state.
+    ///
+    /// @return false when the sample cannot be used, usually because no valid
+    /// accelerometer source is available.
     bool Update(const SensorData &data, FilteredState &output);
 
+    /// Compatibility no-op retained for older call sites.
     void SetSerialReportingEnabled(bool enabled) { (void)enabled; }
 
+    /// Returns the current flight phase.
     FlightStatus Status() const { return status_; }
+    /// Returns the latest predicted apogee in meters.
     double ApogeePrediction() const { return lastApogeePrediction_; }
+    /// Returns true once apogee has been latched on descent transition.
     bool ApogeeReached() const { return apogeeRecorded_; }
+    /// Returns the observed apogee altitude once available.
     double ApogeeAltitude() const { return apogeeAltitude_; }
+    /// Returns the burn start timestamp in seconds.
     double BurnTime() const { return burnTimestamp_; }
+    /// Returns the burnout timestamp in seconds.
     double BurnoutTime() const { return burnoutTimestamp_; }
+    /// Returns the apogee timestamp in seconds.
     double ApogeeTime() const { return apogeeTimestamp_; }
 
   private:
+    /// Resets filter state, phase counters, and predictor-side caches.
     void ResetInternalState();
+    /// Emits a human-readable event to the serial log.
     void ReportEvent(bool includeAltitude, float timeSeconds, const char *label);
+    /// Propagates attitude with gyro-only integration during ascent/coast.
     math_utils::Quaternion TeasleyFilter(const math_utils::Quaternion &quat, const float gyro[3], float dt);
+    /// Converts a raw quaternion array into the internal math type.
     math_utils::Quaternion ArrayToQuaternion(const float values[4]) const;
 
     KalmanFilterAccel kalmanX_;

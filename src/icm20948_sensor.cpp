@@ -22,6 +22,7 @@ uint32_t g_lastFilterUs = 0;
 float g_q[4] = {1.0f, 0.0f, 0.0f, 0.0f};
 float g_integralError[3] = {0.0f, 0.0f, 0.0f};
 
+/// Clamps a scalar into [-1, 1] before inverse-trig use.
 inline float ClampUnit(float value) {
     if (value < -1.0f) {
         return -1.0f;
@@ -32,6 +33,7 @@ inline float ClampUnit(float value) {
     return value;
 }
 
+/// Normalizes a 3-vector in place.
 bool Normalize3(float &x, float &y, float &z) {
     const float norm = sqrtf(x * x + y * y + z * z);
     if (norm <= 1.0e-9f) {
@@ -44,12 +46,14 @@ bool Normalize3(float &x, float &y, float &z) {
     return true;
 }
 
+/// Applies a 3x3 calibration matrix to a sensor vector.
 void Apply3x3(const float matrix[3][3], const float in[3], float out[3]) {
     out[0] = matrix[0][0] * in[0] + matrix[0][1] * in[1] + matrix[0][2] * in[2];
     out[1] = matrix[1][0] * in[0] + matrix[1][1] * in[1] + matrix[1][2] * in[2];
     out[2] = matrix[2][0] * in[0] + matrix[2][1] * in[1] + matrix[2][2] * in[2];
 }
 
+/// Applies stored calibration to gyro/accel/mag and normalizes the accel/mag vectors.
 void GetScaledImu(float gyroRadPerSec[3], float accelNorm[3], float magNorm[3]) {
     gyroRadPerSec[0] = settings::sensors::icm20948::kGyroScaleRadPerSecPerLsb *
                        (static_cast<float>(g_icm.agmt.gyr.axes.x) - settings::sensors::icm20948::kGyroOffset[0]);
@@ -75,6 +79,7 @@ void GetScaledImu(float gyroRadPerSec[3], float accelNorm[3], float magNorm[3]) 
     Normalize3(magNorm[0], magNorm[1], magNorm[2]);
 }
 
+/// Runs one Mahony AHRS update step.
 void MahonyQuaternionUpdate(float ax, float ay, float az, float gx, float gy, float gz, float mx, float my, float mz,
                             float dt) {
     if (dt <= 0.0f) {
@@ -156,6 +161,7 @@ void MahonyQuaternionUpdate(float ax, float ay, float az, float gx, float gy, fl
     g_q[3] = nq4 * inv;
 }
 
+/// Converts the current quaternion into yaw/pitch/roll degrees.
 void QuaternionToYprDeg(float &yawDeg, float &pitchDeg, float &rollDeg) {
     const float q0 = g_q[0];
     const float q1 = g_q[1];
@@ -185,6 +191,7 @@ void QuaternionToYprDeg(float &yawDeg, float &pitchDeg, float &rollDeg) {
 
 }  // namespace
 
+/// Initializes the ICM-20948 over SPI.
 bool Icm20948SensorBegin() {
     if (g_initialized) {
         return true;
@@ -209,6 +216,7 @@ bool Icm20948SensorBegin() {
     return true;
 }
 
+/// Acquires one ICM sample, updates the Mahony filter, and publishes calibrated outputs.
 bool Icm20948SensorAcquire(SensorData &out) {
     if (!g_initialized) {
         return false;
@@ -249,7 +257,8 @@ bool Icm20948SensorAcquire(SensorData &out) {
     out.gyro[1] = gyroCal[1];
     out.gyro[2] = gyroCal[2];
 
-    // Match reference implementation axis reconciliation.
+    // Match the reference implementation's mag-axis reconciliation so replay
+    // and offline analysis stay consistent with historical logs.
     magCalNorm[1] = -magCalNorm[1];
     magCalNorm[2] = -magCalNorm[2];
 

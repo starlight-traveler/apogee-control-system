@@ -3,13 +3,20 @@
 #include <algorithm>
 #include <cmath>
 
+#include "math_utils.h"
 #include "settings.h"
 
+/// Predictor-only horizontal velocity state.
+///
+/// The estimator intentionally does not publish integrated XY state because it
+/// has no horizontal measurement update. This tracker exists only to seed the
+/// apogee predictor with a bounded horizontal speed estimate.
 struct PredictorHorizontalVelocityTracker {
     double vx = 0.0;
     double vy = 0.0;
 };
 
+/// Bitfield stored in telemetry to explain which predictor seed guards were active.
 enum PredictorSeedConfidenceFlag : uint32_t {
     kPredictorSeedFlagControlActive = 1u << 0,
     kPredictorSeedFlagPositiveVerticalVelocity = 1u << 1,
@@ -19,23 +26,58 @@ enum PredictorSeedConfidenceFlag : uint32_t {
     kPredictorSeedFlagAngularRateClamped = 1u << 5,
 };
 
+/// Clears the horizontal predictor seed state.
 inline void ResetPredictorHorizontalVelocityTracker(PredictorHorizontalVelocityTracker &tracker) {
     tracker.vx = 0.0;
     tracker.vy = 0.0;
 }
 
+/// Returns true when a predictor seed sample is recent enough to trust.
+///
+/// Large or non-positive `dt` values usually indicate stale timing or skipped
+/// samples, in which case the predictor should degrade toward a simpler seed.
+inline bool PredictorSeedHasFreshSample(double dtSeconds) {
+    return std::isfinite(dtSeconds) && dtSeconds > 1.0e-4 && dtSeconds <= 0.25;
+}
+
+/// Clamps predictor zenith to the configured safe operating envelope.
 inline double ClampPredictorZenithRadians(double zenithRadians) {
     const double maxZenithRadians =
         static_cast<double>(settings::flight::kPredictorMaxSeedZenithDeg) * 0.017453292519943295;
     return std::clamp(zenithRadians, -maxZenithRadians, maxZenithRadians);
 }
 
+/// Normalizes invalid zenith input to zero before applying the configured clamp.
+inline double SanitizePredictorZenithRadians(double zenithRadians) {
+    if (!std::isfinite(zenithRadians)) {
+        return 0.0;
+    }
+    return ClampPredictorZenithRadians(zenithRadians);
+}
+
+/// Clamps predictor angular rate to the configured safe operating envelope.
 inline double ClampPredictorAngularRate(double angularRateRadPerSec) {
     return std::clamp(angularRateRadPerSec,
                       -static_cast<double>(settings::flight::kPredictorMaxSeedAngularRateRadPerSec),
                       static_cast<double>(settings::flight::kPredictorMaxSeedAngularRateRadPerSec));
 }
 
+/// Computes angular rate from successive zenith samples when the timing is fresh.
+inline double ComputePredictorAngularRate(double currentZenithRadians,
+                                          double previousZenithRadians,
+                                          double dtSeconds) {
+    if (!PredictorSeedHasFreshSample(dtSeconds) ||
+        !std::isfinite(currentZenithRadians) ||
+        !std::isfinite(previousZenithRadians)) {
+        return 0.0;
+    }
+    return (currentZenithRadians - previousZenithRadians) / dtSeconds;
+}
+
+/// Computes the horizontal-speed cap implied by vertical speed and tilt.
+///
+/// This prevents a noisy tilt estimate from exploding the horizontal seed speed
+/// and causing excessive drag prediction.
 inline double PredictorHorizontalSpeedCap(double verticalVelocityMps, double zenithRadians) {
     const double effectiveZenith =
         std::min(std::fabs(zenithRadians),
@@ -47,6 +89,11 @@ inline double PredictorHorizontalSpeedCap(double verticalVelocityMps, double zen
                       static_cast<double>(settings::flight::kPredictorMaxHorizontalSpeedMps));
 }
 
+/// Updates the bounded predictor-only horizontal speed estimate.
+///
+/// The estimate integrates inertial XY acceleration with exponential decay,
+/// then clamps the result against a tilt-based cap. It is deliberately more
+/// conservative than a free-running navigation solution.
 inline double UpdatePredictorHorizontalSpeed(PredictorHorizontalVelocityTracker &tracker,
                                              double accelXMps2,
                                              double accelYMps2,
@@ -54,8 +101,11 @@ inline double UpdatePredictorHorizontalSpeed(PredictorHorizontalVelocityTracker 
                                              bool allowIntegration,
                                              double verticalVelocityMps,
                                              double zenithRadians) {
+    const auto currentSpeed = [&tracker]() {
+        return math_utils::FastSqrt(tracker.vx * tracker.vx + tracker.vy * tracker.vy);
+    };
     if (dtSeconds <= 0.0) {
-        return std::hypot(tracker.vx, tracker.vy);
+        return currentSpeed();
     }
 
     const double clampedDt = std::min(dtSeconds, 0.25);
@@ -73,13 +123,15 @@ inline double UpdatePredictorHorizontalSpeed(PredictorHorizontalVelocityTracker 
         tracker.vy *= decay;
     }
 
-    const double speed = std::hypot(tracker.vx, tracker.vy);
+    const double speedSquared = tracker.vx * tracker.vx + tracker.vy * tracker.vy;
     const double cap = PredictorHorizontalSpeedCap(verticalVelocityMps, zenithRadians);
-    if (speed > cap && speed > 1.0e-9) {
+    const double capSquared = cap * cap;
+    if (speedSquared > capSquared && speedSquared > 1.0e-18) {
+        const double speed = math_utils::FastSqrt(speedSquared);
         const double scale = cap / speed;
         tracker.vx *= scale;
         tracker.vy *= scale;
         return cap;
     }
-    return speed;
+    return math_utils::FastSqrt(speedSquared);
 }

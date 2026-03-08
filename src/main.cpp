@@ -6,7 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "bno085_sensor.h"
+#include "bno_sensor.h"
 #include "bmp585_sensor.h"
 #include "cfd_table.h"
 #include "constants.h"
@@ -23,6 +23,7 @@
 
 namespace {
 
+/// Flight-loop constants mirrored locally to keep `main.cpp` readable.
 constexpr uint8_t kStatusLedPin = settings::hardware::kStatusLedPin;
 constexpr uint8_t kBuzzerPin = settings::hardware::kBuzzerPin;
 constexpr uint32_t kErrorBlinkIntervalMs = settings::flight::kErrorBlinkIntervalMs;
@@ -45,6 +46,10 @@ enum class SystemError : uint8_t {
     DataLoggerInitialization = 4,
 };
 
+/// CSV replay cursor used to feed recorded telemetry back through the firmware.
+///
+/// Replay intentionally reuses `SensorData` parsing so the estimator and
+/// controller exercise the same code paths as live flight data.
 struct CsvReplayState {
     bool enabled = false;
     bool completed = false;
@@ -68,6 +73,7 @@ struct CsvReplayState {
 
 CsvReplayState g_csvReplay;
 
+/// Maps each setup error to a unique LED blink count for field debugging.
 uint8_t BlinkCountForError(SystemError error) {
     switch (error) {
         case SystemError::BnoInitialization:
@@ -84,6 +90,7 @@ uint8_t BlinkCountForError(SystemError error) {
     return 1;
 }
 
+/// Emits a timestamped setup checkpoint so boot stalls are easy to localize.
 void LogSetupCheckpoint(const char *message) {
     LOG_PRINT("[setup ");
     LOG_PRINT(millis());
@@ -91,6 +98,10 @@ void LogSetupCheckpoint(const char *message) {
     LOG_PRINTLN(message);
 }
 
+/// Plays the current boot melody.
+///
+/// This is intentionally blocking and should be disabled for flight builds if
+/// startup latency matters more than audible status.
 void PlayStartupMarch() {
     struct Note {
         uint16_t frequencyHz;
@@ -112,6 +123,7 @@ void PlayStartupMarch() {
     noTone(kBuzzerPin);
 }
 
+/// Simple local clamp to avoid pulling in additional helpers from the hot path.
 float ClampFloat(float value, float minValue, float maxValue) {
     if (value < minValue) {
         return minValue;
@@ -124,6 +136,7 @@ float ClampFloat(float value, float minValue, float maxValue) {
 
 }  // namespace
 
+/// Splits a mutable CSV line in place and returns field count.
 static int SplitCsvLine(char *line, char **fields, int maxFields) {
     int count = 0;
     char *ptr = line;
@@ -139,6 +152,7 @@ static int SplitCsvLine(char *line, char **fields, int maxFields) {
     return count;
 }
 
+/// Parses one CSV field as float.
 static bool ParseFloatField(const char *text, float &out) {
     if (text == nullptr || *text == '\0') {
         return false;
@@ -152,6 +166,7 @@ static bool ParseFloatField(const char *text, float &out) {
     return true;
 }
 
+/// Parses one CSV field as a permissive boolean.
 static bool ParseBoolField(const char *text, bool &out) {
     if (text == nullptr || *text == '\0') {
         return false;
@@ -175,12 +190,14 @@ static bool ParseBoolField(const char *text, bool &out) {
     return false;
 }
 
+/// Records a CSV column index the first time a matching header name is seen.
 static void CsvAssignIndexIfMatch(const char *field, const char *name, int &target, int index) {
     if (target < 0 && strcmp(field, name) == 0) {
         target = index;
     }
 }
 
+/// Opens the replay CSV and caches the column indices the firmware cares about.
 static bool CsvReplayInit() {
     if (!kEnableCsvReplay) {
         return false;
@@ -236,6 +253,7 @@ static bool CsvReplayInit() {
     return true;
 }
 
+/// Replays logged timing by delaying until the next recorded sample timestamp.
 static void CsvReplayWaitForTimestamp(float timestamp) {
     if (!g_csvReplay.hasLastTimestamp) {
         g_csvReplay.lastTimestamp = timestamp;
@@ -268,6 +286,7 @@ static void CsvReplayWaitForTimestamp(float timestamp) {
     g_csvReplay.lastSampleMicros = micros();
 }
 
+/// Decodes the next replay CSV row into `SensorData`.
 static bool CsvReplayNextSample(SensorData &data) {
     if (!g_csvReplay.enabled || g_csvReplay.completed) {
         return false;
@@ -367,11 +386,15 @@ static bool CsvReplayNextSample(SensorData &data) {
     return false;
 }
 
+/// Acquires one sensor sample from replay or live hardware.
+///
+/// The live path currently mirrors BNO fields into the disabled ICM fields so
+/// downstream code can keep consuming a stable `SensorData` layout.
 static bool AcquireSensorData(SensorData &data) {
     if (g_csvReplay.enabled) {
         return CsvReplayNextSample(data);
     }
-    const bool hasBnoImu = Bno085SensorAcquire(data);
+    const bool hasBnoImu = BnoSensorAcquire(data);
     // ICM-20948 disabled for now.
     // const bool hasIcmImu = Icm20948SensorAcquire(data);
     const bool hasIcmImu = false;
@@ -450,12 +473,14 @@ static RetryState g_bmpRetry;
 static uint32_t g_lastTimingLogMs = 0;
 static TimingStats g_timingStats;
 
+/// Tracks the maximum of a rolling timing statistic for periodic diagnostics.
 static void UpdateMaxTiming(uint32_t sampleUs, uint32_t &targetUs) {
     if (sampleUs > targetUs) {
         targetUs = sampleUs;
     }
 }
 
+/// Runs a non-blocking exponential-backoff retry for one subsystem initializer.
 static bool ServiceRetry(uint32_t nowMs,
                          RetryState &retry,
                          bool alreadyReady,
@@ -491,6 +516,7 @@ static bool ServiceRetry(uint32_t nowMs,
     return false;
 }
 
+/// Emits periodic loop and logger timing diagnostics, then resets the maxima.
 static void LogTimingDiagnostics(uint32_t nowMs) {
     if ((nowMs - g_lastTimingLogMs) < kTimingLogIntervalMs) {
         return;
@@ -517,7 +543,7 @@ static void LogTimingDiagnostics(uint32_t nowMs) {
     LOG_PRINT(" log_buf=");
     LOG_PRINT(static_cast<unsigned long>(logger.bufferedBytes));
     LOG_PRINT(" sensors=");
-    LOG_PRINT(Bno085SensorIsInitialized() ? "bno" : "-");
+    LOG_PRINT(BnoSensorIsInitialized() ? "bno" : "-");
     LOG_PRINT('/');
     LOG_PRINT(Bmp585SensorIsInitialized() ? "bmp" : "-");
     LOG_PRINT(" logger=");
@@ -527,6 +553,11 @@ static void LogTimingDiagnostics(uint32_t nowMs) {
     g_timingStats = TimingStats{};
 }
 
+/// Computes the commanded flap angle for automatic apogee control.
+///
+/// The function builds a bounded predictor seed from the latest filtered
+/// state, evaluates each calibrated flap angle with a cheap midpoint sweep,
+/// then validates the winning candidate with the full RK4 predictor.
 static float ComputeAutoActuationCommandDeg(uint32_t nowMs,
                                             const FilteredState &state,
                                             FlightStatus status,
@@ -545,17 +576,17 @@ static float ComputeAutoActuationCommandDeg(uint32_t nowMs,
 
     double angularRate = 0.0;
     double dtSeconds = 0.0;
+    const double previousZenithRad = static_cast<double>(g_actuationLastZenithRad);
     if (g_actuationHasLastZenithSample) {
         dtSeconds = static_cast<double>(state.time) - static_cast<double>(g_actuationLastStateTime);
-        if (dtSeconds > 1.0e-4) {
-            angularRate =
-                (static_cast<double>(state.zenith) - static_cast<double>(g_actuationLastZenithRad)) / dtSeconds;
-        }
     }
+    const bool freshSeedSample = PredictorSeedHasFreshSample(dtSeconds);
+    angularRate = ComputePredictorAngularRate(static_cast<double>(state.zenith),
+                                              previousZenithRad,
+                                              dtSeconds);
     g_actuationHasLastZenithSample = true;
     g_actuationLastZenithRad = state.zenith;
     g_actuationLastStateTime = state.time;
-    angularRate = ClampPredictorAngularRate(angularRate);
 
     const bool canControl =
         g_actuationPredictorReady && (status == FlightStatus::Burn || status == FlightStatus::Coast) &&
@@ -586,26 +617,36 @@ static float ComputeAutoActuationCommandDeg(uint32_t nowMs,
     }
     g_actuationHasLastControlUpdate = true;
     g_actuationLastControlUpdateMs = nowMs;
-    const double predictorHorizontalVelocity = UpdatePredictorHorizontalSpeed(
-        g_actuationPredictorHorizontalVelocity,
-        static_cast<double>(state.inertialAcceleration[0]),
-        static_cast<double>(state.inertialAcceleration[1]),
-        dtSeconds,
-        status == FlightStatus::Burn || status == FlightStatus::Coast,
-        static_cast<double>(state.velocity[2]),
-        static_cast<double>(state.zenith));
-    predictorSeedFlags |= kPredictorSeedFlagUsingHorizontalModel;
-    const double clampedZenith = ClampPredictorZenithRadians(static_cast<double>(state.zenith));
-    const double clampedAngularRate = ClampPredictorAngularRate(angularRate);
+    const double clampedZenith = SanitizePredictorZenithRadians(static_cast<double>(state.zenith));
+    // A stale seed is forced back to a simpler vertical-only predictor input.
+    const bool useHorizontalModel = freshSeedSample;
+    if (!useHorizontalModel) {
+        ResetPredictorHorizontalVelocityTracker(g_actuationPredictorHorizontalVelocity);
+    }
+    const double predictorHorizontalVelocity =
+        useHorizontalModel
+            ? UpdatePredictorHorizontalSpeed(g_actuationPredictorHorizontalVelocity,
+                                             static_cast<double>(state.inertialAcceleration[0]),
+                                             static_cast<double>(state.inertialAcceleration[1]),
+                                             dtSeconds,
+                                             status == FlightStatus::Burn || status == FlightStatus::Coast,
+                                             static_cast<double>(state.velocity[2]),
+                                             clampedZenith)
+            : 0.0;
+    if (useHorizontalModel) {
+        predictorSeedFlags |= kPredictorSeedFlagUsingHorizontalModel;
+    }
+    const double clampedAngularRate = useHorizontalModel ? ClampPredictorAngularRate(angularRate) : 0.0;
     const double horizontalSpeedCap =
-        PredictorHorizontalSpeedCap(static_cast<double>(state.velocity[2]), static_cast<double>(state.zenith));
-    if (std::fabs(clampedZenith - static_cast<double>(state.zenith)) > 1.0e-9) {
+        PredictorHorizontalSpeedCap(static_cast<double>(state.velocity[2]), clampedZenith);
+    if (std::isfinite(state.zenith) &&
+        std::fabs(clampedZenith - static_cast<double>(state.zenith)) > 1.0e-9) {
         predictorSeedFlags |= kPredictorSeedFlagZenithClamped;
     }
-    if (std::fabs(clampedAngularRate - angularRate) > 1.0e-9) {
+    if (useHorizontalModel && std::fabs(clampedAngularRate - angularRate) > 1.0e-9) {
         predictorSeedFlags |= kPredictorSeedFlagAngularRateClamped;
     }
-    if (predictorHorizontalVelocity >= (horizontalSpeedCap - 1.0e-6)) {
+    if (useHorizontalModel && predictorHorizontalVelocity >= (horizontalSpeedCap - 1.0e-6)) {
         predictorSeedFlags |= kPredictorSeedFlagHorizontalSpeedCapped;
     }
     if (telemetry != nullptr) {
@@ -644,6 +685,8 @@ static float ComputeAutoActuationCommandDeg(uint32_t nowMs,
         }
 
         if (softDisableStart > hardDisableTime && timeToApogee < softDisableStart) {
+            // Taper authority near apogee so the controller does not command a
+            // large final flap motion for a tiny remaining correction.
             const double taper =
                 std::clamp((timeToApogee - hardDisableTime) / (softDisableStart - hardDisableTime), 0.0, 1.0);
             maxAllowedAngle = maxAngle * taper;
@@ -653,13 +696,16 @@ static float ComputeAutoActuationCommandDeg(uint32_t nowMs,
     float bestAngleDeg = g_actuationLastCommandDeg;
     double bestCost = INFINITY;
     float bestPredictedApogeeM = std::numeric_limits<float>::quiet_NaN();
+    bool hasBestCandidate = false;
 
     for (const auto &point : settings::actuation::kServoCalibrationTable) {
         if (static_cast<double>(point.angleDeg) > (maxAllowedAngle + 1.0e-6)) {
             continue;
         }
         predictorState.acsAngleDeg = static_cast<double>(point.angleDeg);
-        const double predictedApogee = g_actuationPredictor.PredictApogee(predictorState);
+        // Use the cheaper midpoint predictor to rank candidates, then validate
+        // the winner with RK4 below.
+        const double predictedApogee = g_actuationPredictor.PredictApogeeMidpoint(predictorState);
         if (!std::isfinite(predictedApogee)) {
             continue;
         }
@@ -681,14 +727,23 @@ static float ComputeAutoActuationCommandDeg(uint32_t nowMs,
             bestCost = totalCost;
             bestAngleDeg = point.angleDeg;
             bestPredictedApogeeM = static_cast<float>(predictedApogee);
+            hasBestCandidate = true;
         }
     }
 
-    if (!std::isfinite(bestCost)) {
+    if (!hasBestCandidate || !std::isfinite(bestCost)) {
         if (telemetry != nullptr) {
             telemetry->autoCommandDeg = g_actuationLastCommandDeg;
         }
         return g_actuationLastCommandDeg;
+    }
+
+    predictorState.acsAngleDeg = static_cast<double>(bestAngleDeg);
+    // Re-run the winning angle with RK4 so telemetry and the final decision are
+    // tied to the higher-accuracy predictor path.
+    const double validatedApogee = g_actuationPredictor.PredictApogee(predictorState);
+    if (std::isfinite(validatedApogee)) {
+        bestPredictedApogeeM = static_cast<float>(validatedApogee);
     }
 
     if (std::fabs(bestAngleDeg - g_actuationLastCommandDeg) < settings::actuation::kAngleCommandDeadbandDeg) {
@@ -705,8 +760,9 @@ static float ComputeAutoActuationCommandDeg(uint32_t nowMs,
 }
 
 static void ServiceStatusLeds(uint32_t nowMs, bool manualOverrideActive) {
+    // In replay mode missing sensors are not treated as a hardware fault.
     const bool faultActive =
-        !DataLoggerIsInitialized() || (!g_csvReplay.enabled && !Bno085SensorIsInitialized() && !Bmp585SensorIsInitialized());
+        !DataLoggerIsInitialized() || (!g_csvReplay.enabled && !BnoSensorIsInitialized() && !Bmp585SensorIsInitialized());
     StatusLedsSetFault(faultActive);
     StatusLedsSetFlightStatus(flightComputer.Status());
     StatusLedsSetComms(NetworkTelemetryConnected(), NetworkTelemetrySubscriberActive());
@@ -714,6 +770,7 @@ static void ServiceStatusLeds(uint32_t nowMs, bool manualOverrideActive) {
     StatusLedsService(nowMs);
 }
 
+/// Emits side-by-side primary/secondary barometer timing and agreement metrics.
 static void LogBarometerDiagnostics(uint32_t nowMs) {
     if ((nowMs - g_lastBarometerLogMs) < settings::flight::kDebugHeartbeatIntervalMs) {
         return;
@@ -785,6 +842,10 @@ static void LogBarometerDiagnostics(uint32_t nowMs) {
     Serial.flush();
 }
 
+/// Arduino setup entry point.
+///
+/// Setup favors degraded-mode startup over retry-forever behavior so the main
+/// loop can continue running even if logging or a sensor is temporarily down.
 void setup() {
     // pinMode(kStatusLedPin, OUTPUT);
     // digitalWrite(kStatusLedPin, LOW);
@@ -807,9 +868,13 @@ void setup() {
     LogSetupCheckpoint(g_csvReplay.enabled ? "CSV replay active" : "CSV replay disabled");
 
     if (!g_csvReplay.enabled) {
-        LogSetupCheckpoint("starting BNO085 init");
-        ServiceRetry(millis(), g_bnoRetry, Bno085SensorIsInitialized(), &Bno085SensorBegin, "bno085");
-        LogSetupCheckpoint(Bno085SensorIsInitialized() ? "BNO085 init complete" : "BNO085 unavailable");
+        LOG_PRINT("Configured BNO sensor: ");
+        LOG_PRINT(BnoSensorModelName());
+        LOG_PRINT(" over ");
+        LOG_PRINTLN(BnoSensorTransportName());
+        LogSetupCheckpoint("starting BNO init");
+        ServiceRetry(millis(), g_bnoRetry, BnoSensorIsInitialized(), &BnoSensorBegin, "bno");
+        LogSetupCheckpoint(BnoSensorIsInitialized() ? "BNO init complete" : "BNO unavailable");
 
         // ICM-20948 disabled for now.
         // LogSetupCheckpoint("starting ICM-20948 init");
@@ -849,6 +914,7 @@ void setup() {
     g_actuationPredictor.SetVehicleParameters(vehicleParameters);
     g_actuationPredictor.SetForceTable(g_cfdTable.loaded ? &g_cfdTable.table : nullptr);
     g_actuationPredictor.SetMaxIntegrationSteps(settings::actuation::kActuationPredictorMaxSteps);
+    // The actuation predictor is only armed when the CFD table is available.
     g_actuationPredictorReady = g_cfdTable.loaded;
 
     const double sigmaAccelXY = settings::flight::kSigmaAccelXY;
@@ -900,6 +966,14 @@ void setup() {
     LogSetupCheckpoint("setup complete");
 }
 
+/// Arduino loop entry point.
+///
+/// The loop is intentionally ordered as:
+/// 1. poll control input/recovery
+/// 2. acquire sensors
+/// 3. update estimator
+/// 4. compute actuation
+/// 5. log/telemetry/service diagnostics
 void loop() {
     const uint32_t loopStartUs = micros();
     const uint32_t nowMs = millis();
@@ -913,11 +987,12 @@ void loop() {
     }
 
     if (!g_csvReplay.enabled) {
-        ServiceRetry(nowMs, g_bnoRetry, Bno085SensorIsInitialized(), &Bno085SensorBegin, "bno085");
+        ServiceRetry(nowMs, g_bnoRetry, BnoSensorIsInitialized(), &BnoSensorBegin, "bno");
         ServiceRetry(nowMs, g_bmpRetry, Bmp585SensorIsInitialized(), &Bmp585SensorBegin, "bmp585");
     }
 
     if (g_servoCycleTestMode) {
+        // Servo cycle mode intentionally bypasses the rest of the flight stack.
         ServiceStatusLeds(nowMs, false);
         delay(1000);
         return;
@@ -965,6 +1040,8 @@ void loop() {
         }
     }
 
+    // Barometer innovations are temporarily widened around flap motion so the
+    // estimator does not overreact to local pressure disturbances.
     const bool flapTransientActive = g_flapActuator.IsSettling() || (nowMs < g_altimeterTransientUntilMs);
     data.altimeterGateSigma = flapTransientActive ? settings::actuation::kBaroInnovationGateSigmaTransient
                                                   : settings::actuation::kBaroInnovationGateSigmaNominal;

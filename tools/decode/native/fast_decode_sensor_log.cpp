@@ -45,6 +45,9 @@ namespace fs = std::filesystem;
 
 namespace {
 
+// The constants below must stay aligned with the firmware-side binary layout in
+// `src/data_logger.h` and `src/data_logger.cpp`. The native decoder is strict
+// about record sizes because it decodes directly from raw bytes.
 constexpr std::size_t kHeaderSize = 4;
 constexpr std::size_t kSensorSize = 136;
 constexpr std::size_t kFilteredSize = 60;
@@ -88,6 +91,7 @@ struct LogPreamble {
     uint8_t reserved[12];
 };
 
+/// Describes where a decoded telemetry field comes from inside one binary record.
 enum class TelemetryFieldSource {
     StatusRaw,
     HasFilteredState,
@@ -103,6 +107,9 @@ struct TelemetryFieldDescriptor {
     ColumnMeta meta;
 };
 
+// Single source of truth for the binary telemetry schema used by the decoder.
+// Each entry corresponds to one CSV column / GUI series and is kept in lockstep
+// with the firmware's `SensorData` + `FilteredState` layout.
 constexpr std::array<TelemetryFieldDescriptor, 53> kTelemetryFields = {{
     {"flight_status_raw", TelemetryFieldSource::StatusRaw, 0, {"enum", ColumnClass::State, 0.0f, 4.0f}},
     {"has_filtered_state", TelemetryFieldSource::HasFilteredState, 0, {"bool", ColumnClass::State, 0.0f, 1.0f}},
@@ -231,6 +238,7 @@ void AppendBoolWord(std::string &line, bool value) { line.append(value ? "True" 
 
 void AppendComma(std::string &line) { line.push_back(','); }
 
+/// Reads one decoded telemetry field from a binary telemetry record.
 bool ReadTelemetryFieldValue(const TelemetryRecordRef &rec, const TelemetryFieldDescriptor &field, float &outValue) {
     const bool hasFiltered = (rec.flags & 0x01u) != 0u;
     switch (field.source) {
@@ -264,6 +272,7 @@ bool ReadTelemetryFieldValue(const TelemetryRecordRef &rec, const TelemetryField
     return false;
 }
 
+/// Serializes one telemetry record into the decoder's CSV output format.
 void BuildTelemetryLine(const TelemetryRecordRef &rec, std::string &line) {
     line.clear();
     line.reserve(900);
@@ -285,6 +294,7 @@ void BuildTelemetryLine(const TelemetryRecordRef &rec, std::string &line) {
     line.push_back('\n');
 }
 
+/// Builds the CSV header from the shared schema descriptor table.
 std::string TelemetryHeader() {
     std::string header = "flight_status";
     for (const auto &field : kTelemetryFields) {
@@ -295,6 +305,7 @@ std::string TelemetryHeader() {
     return header;
 }
 
+/// Emits decoder-side metadata lines that describe schema and provenance.
 std::string TelemetryMetadataPreamble() {
     std::string out;
     out.reserve(128);
@@ -307,6 +318,11 @@ std::string TelemetryMetadataPreamble() {
     return out;
 }
 
+/// Parses a raw ACS binary log into telemetry/event record references.
+///
+/// The parser validates the log preamble when present, records schema warnings,
+/// and leaves payload bytes in-place so downstream code can decode fields on
+/// demand without copying the whole file again.
 bool ParseLog(const std::vector<uint8_t> &data,
               std::vector<TelemetryRecordRef> &telemetry,
               std::vector<EventRecord> &events,
