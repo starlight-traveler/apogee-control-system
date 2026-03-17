@@ -6,7 +6,11 @@ from pathlib import Path
 
 
 G = 9.8067
-DEFAULT_CSV_PATH = Path(__file__).with_name("fullscale_2_replay.csv")
+SCRIPT_DIR = Path(__file__).resolve().parent
+REPLAY_DIR = SCRIPT_DIR.parent
+DATA_DIR = REPLAY_DIR / "data"
+PLOTS_DIR = REPLAY_DIR / "plots"
+DEFAULT_CSV_PATH = DATA_DIR / "fullscale_2_replay.csv"
 DEFAULT_T_MIN = 607.9
 DEFAULT_T_MAX = 609.2
 DEFAULT_FLAP_TIME = 608.2
@@ -77,7 +81,9 @@ def main() -> None:
 
     t_min_tag = f"{t_min:.1f}".replace(".", "p")
     t_max_tag = f"{t_max:.1f}".replace(".", "p")
-    output_path = csv_path.with_name(f"{csv_path.stem}_compare_zoom_{t_min_tag}_{t_max_tag}.svg")
+    stem = csv_path.stem.replace("fullscale_2", "fullscale2")
+    output_path = PLOTS_DIR / f"{stem}_zoom_{t_min_tag}_{t_max_tag}.svg"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
 
     rows = []
     with csv_path.open(newline="") as handle:

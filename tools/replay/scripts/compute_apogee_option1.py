@@ -7,10 +7,13 @@ from pathlib import Path
 from typing import List, Tuple
 
 
-ROOT = Path(__file__).resolve().parents[2]
-INPUT_CSV = ROOT / "tools" / "replay" / "fullscale_2.csv"
+SCRIPT_DIR = Path(__file__).resolve().parent
+REPLAY_DIR = SCRIPT_DIR.parent
+ROOT = REPLAY_DIR.parents[1]
+DATA_DIR = REPLAY_DIR / "data"
+INPUT_CSV = DATA_DIR / "fullscale_2.csv"
 CFD_CSV = ROOT / "lib" / "cfd.csv"
-OUTPUT_CSV = ROOT / "tools" / "replay" / "fullscale_2_option1_prediction.csv"
+OUTPUT_CSV = DATA_DIR / "fullscale_2_option1_prediction.csv"
 
 
 # Constants (match src/constants.h and src/settings.h)

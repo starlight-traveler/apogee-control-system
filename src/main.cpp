@@ -741,7 +741,7 @@ static float ComputeAutoActuationCommandDeg(uint32_t nowMs,
     if (!useHorizontalModel) {
         ResetPredictorHorizontalVelocityTracker(g_actuationPredictorHorizontalVelocity);
     }
-    const double predictorHorizontalVelocity =
+    const double trackedHorizontalVelocity =
         useHorizontalModel
             ? UpdatePredictorHorizontalSpeed(g_actuationPredictorHorizontalVelocity,
                                              static_cast<double>(state.inertialAcceleration[0]),
@@ -750,6 +750,12 @@ static float ComputeAutoActuationCommandDeg(uint32_t nowMs,
                                              status == FlightStatus::Burn || status == FlightStatus::Coast,
                                              static_cast<double>(state.velocity[2]),
                                              clampedZenith)
+            : 0.0;
+    const double predictorHorizontalVelocity =
+        useHorizontalModel
+            ? ResolvePredictorHorizontalSpeed(trackedHorizontalVelocity,
+                                              static_cast<double>(state.velocity[2]),
+                                              clampedZenith)
             : 0.0;
     if (useHorizontalModel) {
         predictorSeedFlags |= kPredictorSeedFlagUsingHorizontalModel;

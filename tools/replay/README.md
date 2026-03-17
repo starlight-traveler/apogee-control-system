@@ -5,6 +5,14 @@ Teensy flight computer logic to replay telemetry from CSV files. It makes
 it possible to tune Kalman filter parameters and validate the apogee
 prediction algorithm without loading firmware onto the rocket avionics.
 
+## Layout
+
+- `scripts/`: Python replay analysis, plotting, and tuning utilities
+- `data/`: CSV, index, and text replay artifacts
+- `plots/`: generated SVG comparison plots
+- `include/`, `main.cpp`, `arduino_stubs.cpp`: hosted replay source
+- `build/`: CMake output
+
 ## Building
 
 ```bash
@@ -67,3 +75,12 @@ While running, the program emits a filtered telemetry CSV to stdout
 (`time_s, altitude_m, velocity_mps, apogee_prediction_m, status`) and a
 summary that includes burn/apogee detection times and the most recent
 apogee estimate.
+
+## Python utilities
+
+Run the Python replay helpers from the repo root so `PYTHONPATH=.` picks up
+the shared simulator modules, for example:
+
+```bash
+env PYTHONPATH=. python3 tools/replay/scripts/compute_apogee_prediction_variants.py
+```

@@ -89,6 +89,38 @@ inline double PredictorHorizontalSpeedCap(double verticalVelocityMps, double zen
                       static_cast<double>(settings::flight::kPredictorMaxHorizontalSpeedMps));
 }
 
+/// Estimates horizontal speed directly from the measured tilt/vertical velocity.
+///
+/// This gives the predictor an immediate lower bound on cross-axis motion
+/// instead of waiting for the bounded XY acceleration integrator to ramp up.
+inline double PredictorGeometricHorizontalSpeed(double verticalVelocityMps, double zenithRadians) {
+    if (!std::isfinite(verticalVelocityMps) || !std::isfinite(zenithRadians)) {
+        return 0.0;
+    }
+
+    const double verticalSpeed = std::fabs(verticalVelocityMps);
+    if (verticalSpeed <= 0.0) {
+        return 0.0;
+    }
+
+    float sinZenith = 0.0f;
+    float cosZenith = 1.0f;
+    math_utils::FastSinCos(static_cast<float>(zenithRadians), sinZenith, cosZenith);
+    const double clampedCosZenith = std::clamp(std::fabs(static_cast<double>(cosZenith)), 0.1, 1.0);
+    const double speedAlongAxis = verticalSpeed / clampedCosZenith;
+    const double horizontalSpeedSquared = speedAlongAxis * speedAlongAxis - verticalSpeed * verticalSpeed;
+    return (horizontalSpeedSquared > 0.0) ? math_utils::FastSqrt(horizontalSpeedSquared) : 0.0;
+}
+
+/// Merges the tracked XY-speed estimate with a capped tilt-derived lower bound.
+inline double ResolvePredictorHorizontalSpeed(double trackedHorizontalSpeedMps,
+                                              double verticalVelocityMps,
+                                              double zenithRadians) {
+    const double cap = PredictorHorizontalSpeedCap(verticalVelocityMps, zenithRadians);
+    const double geometricSpeed = PredictorGeometricHorizontalSpeed(verticalVelocityMps, zenithRadians);
+    return std::clamp(std::max(trackedHorizontalSpeedMps, geometricSpeed), 0.0, cap);
+}
+
 /// Updates the bounded predictor-only horizontal speed estimate.
 ///
 /// The estimate integrates inertial XY acceleration with exponential decay,

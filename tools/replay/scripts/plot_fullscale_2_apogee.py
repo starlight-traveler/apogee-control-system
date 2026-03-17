@@ -5,7 +5,11 @@ import sys
 from pathlib import Path
 
 
-DEFAULT_CSV_PATH = Path(__file__).with_name("fullscale_2.csv")
+SCRIPT_DIR = Path(__file__).resolve().parent
+REPLAY_DIR = SCRIPT_DIR.parent
+DATA_DIR = REPLAY_DIR / "data"
+PLOTS_DIR = REPLAY_DIR / "plots"
+DEFAULT_CSV_PATH = DATA_DIR / "fullscale_2.csv"
 
 
 def _parse_float(value: str):
@@ -49,7 +53,9 @@ def _polyline_points(times, values, t_min, t_max, y_min, y_max, left, top, plot_
 
 def main() -> None:
     csv_path = Path(sys.argv[1]) if len(sys.argv) > 1 else DEFAULT_CSV_PATH
-    output_path = csv_path.with_name(f"{csv_path.stem}_apogee_vs_altitude.svg")
+    stem = csv_path.stem.replace("fullscale_2", "fullscale2")
+    output_path = PLOTS_DIR / f"{stem}_apogee_vs_altitude.svg"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
 
     times = []
     altitude_m = []
@@ -120,7 +126,7 @@ def main() -> None:
 
     svg = f"""<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">
   <rect width="100%" height="100%" fill="white"/>
-  <text x="{width / 2:.0f}" y="36" text-anchor="middle" font-family="monospace" font-size="24">fullscale_2: Altitude vs Apogee Estimate</text>
+  <text x="{width / 2:.0f}" y="36" text-anchor="middle" font-family="monospace" font-size="24">fullscale2: Altitude vs Apogee Estimate</text>
   <text x="{width / 2:.0f}" y="{height - 20}" text-anchor="middle" font-family="monospace" font-size="18">Time (s)</text>
   <text x="30" y="{height / 2:.0f}" text-anchor="middle" font-family="monospace" font-size="18" transform="rotate(-90 30 {height / 2:.0f})">Meters</text>
   {''.join(grid_lines)}

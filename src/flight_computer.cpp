@@ -174,13 +174,6 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
     const double accX = kalmanX_.Acceleration();
     const double accY = kalmanY_.Acceleration();
     const double accZ = kalmanZ_.Acceleration();
-    UpdatePredictorHorizontalSpeed(predictorHorizontalVelocity_,
-                                   accX,
-                                   accY,
-                                   dt,
-                                   (status_ == FlightStatus::Burn || status_ == FlightStatus::Coast),
-                                   velZ,
-                                   zenithRadians_);
 
     if (status_ == FlightStatus::Ground) {
         const bool accelerationSuggestsLiftoff =
@@ -259,15 +252,19 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
         if (!canUseHorizontalSeed) {
             ResetPredictorHorizontalVelocityTracker(predictorHorizontalVelocity_);
         }
-        const double predictorHorizontalVelocity =
+        const double trackedHorizontalVelocity =
             canUseHorizontalSeed
                 ? UpdatePredictorHorizontalSpeed(predictorHorizontalVelocity_,
-                                                 kalmanX_.Acceleration(),
-                                                 kalmanY_.Acceleration(),
+                                                 inertialAcceleration.x,
+                                                 inertialAcceleration.y,
                                                  dt,
                                                  true,
                                                  velZ,
                                                  seedZenith)
+                : 0.0;
+        const double predictorHorizontalVelocity =
+            canUseHorizontalSeed
+                ? ResolvePredictorHorizontalSpeed(trackedHorizontalVelocity, velZ, seedZenith)
                 : 0.0;
         const double predictorAngularRate =
             canUseHorizontalSeed

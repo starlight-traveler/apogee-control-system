@@ -8,18 +8,22 @@ import sys
 from pathlib import Path
 
 
-ROOT = Path(__file__).resolve().parents[2]
+SCRIPT_DIR = Path(__file__).resolve().parent
+REPLAY_DIR = SCRIPT_DIR.parent
+ROOT = REPLAY_DIR.parents[1]
+DATA_DIR = REPLAY_DIR / "data"
+PLOTS_DIR = REPLAY_DIR / "plots"
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from python.apogee_predictor_sim import compute_actual_apogee, load_force_table, parse_replay_rows, simulate_predictions
 
 
-INPUT_CSV = ROOT / "tools" / "replay" / "output.csv"
+INPUT_CSV = DATA_DIR / "output.csv"
 CFD_CSV = ROOT / "lib" / "cfd.csv"
-OUTPUT_CSV = ROOT / "tools" / "replay" / "predictor_sim_trace.csv"
-OUTPUT_APOGEE_SVG = ROOT / "tools" / "replay" / "predictor_sim_apogee.svg"
-OUTPUT_SPEED_SVG = ROOT / "tools" / "replay" / "predictor_sim_horizontal_speed.svg"
+OUTPUT_CSV = DATA_DIR / "predictor_sim_trace.csv"
+OUTPUT_APOGEE_SVG = PLOTS_DIR / "predictor_sim_apogee_comparison.svg"
+OUTPUT_SPEED_SVG = PLOTS_DIR / "predictor_sim_seed_speed.svg"
 
 
 def _polyline_points(xs, ys, x_min, x_max, y_min, y_max, left, top, width, height) -> str:
