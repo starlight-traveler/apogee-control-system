@@ -10,15 +10,34 @@
 
 /// Raw sensor/control sample written to logs and consumed by the estimator.
 
+enum class MainQuaternionSource : uint8_t {
+    None = 0,
+    Bno = 1,
+    Icm = 2,
+    Lsm = 3,
+    Blended = 4,
+};
+
 struct SensorData {
     float timestamp = 0.0f;
     float altitudeFeet = 0.0f;
     float accelBNO[3] = {0.0f, 0.0f, 0.0f};
+    float gyroBNO[3] = {0.0f, 0.0f, 0.0f};
+    float quaternionBNO[4] = {1.0f, 0.0f, 0.0f, 0.0f};
     float accelICM[3] = {0.0f, 0.0f, 0.0f};
     float quaternion[4] = {1.0f, 0.0f, 0.0f, 0.0f};
     float gyro[3] = {0.0f, 0.0f, 0.0f};
     float icmQuaternion[4] = {1.0f, 0.0f, 0.0f, 0.0f};
     float icmYprDeg[3] = {0.0f, 0.0f, 0.0f};
+    float accelLSM[3] = {0.0f, 0.0f, 0.0f};
+    float gyroLSM[3] = {0.0f, 0.0f, 0.0f};
+    float quaternionLSM[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+    float lsmYprDeg[3] = {0.0f, 0.0f, 0.0f};
+    float icmTemperatureC = 0.0f;
+    float icmAhrsDt = 0.0f;
+    float icmAccelTrust = 0.0f;
+    float icmMagTrust = 0.0f;
+    float icmGyroBias[3] = {0.0f, 0.0f, 0.0f};
     float altimeterSigmaScale = 1.0f;
     float altimeterGateSigma = 3.5f;
     float autoCommandDeg = 0.0f;
@@ -30,9 +49,16 @@ struct SensorData {
     float predictorSeedClampedZenithRad = 0.0f;
     float predictorSeedClampedAngularRateRadPerSec = 0.0f;
     float predictorSeedConfidenceFlags = 0.0f;
+    uint8_t mainQuaternionSource = static_cast<uint8_t>(MainQuaternionSource::None);
+    bool hasBnoQuaternion = false;
     bool hasQuaternion = false;
     bool hasIcmQuaternion = false;
     bool hasIcmYpr = false;
+    bool hasLsmQuaternion = false;
+    bool hasLsmYpr = false;
+    bool icmAccelSaturated = false;
+    bool icmGyroSaturated = false;
+    bool icmRailConstrained = false;
 };
 
 /// Published estimator state used by telemetry, replay, and actuation logic.
@@ -94,6 +120,8 @@ class FlightComputer {
     double BurnoutTime() const { return burnoutTimestamp_; }
     /// Returns the apogee timestamp in seconds.
     double ApogeeTime() const { return apogeeTimestamp_; }
+    /// Returns the current adaptive axial drag scale used by the predictor.
+    double AdaptiveAxialDragScale() const { return apogeePredictor_.AxialDragScale(); }
 
   private:
     /// Resets filter state, phase counters, and predictor-side caches.
@@ -104,6 +132,8 @@ class FlightComputer {
     math_utils::Quaternion TeasleyFilter(const math_utils::Quaternion &quat, const float gyro[3], float dt);
     /// Converts a raw quaternion array into the internal math type.
     math_utils::Quaternion ArrayToQuaternion(const float values[4]) const;
+    /// Updates the predictor's adaptive axial drag scale from measured/model accel mismatch.
+    void UpdateAdaptiveDragScale(const ApogeeState &predictorState, double measuredVerticalAcceleration, double dtSeconds);
 
     KalmanFilterAccel kalmanX_;
     KalmanFilterAccel kalmanY_;
@@ -116,6 +146,10 @@ class FlightComputer {
     FlightStatus status_ = FlightStatus::Ground;
     bool initialized_ = false;
     double lastTimestamp_ = 0.0;
+    bool altitudeReferenceInitialized_ = false;
+    double altitudeReferenceMeters_ = 0.0;
+    double lastGroundRelativeAltitudeMeters_ = 0.0;
+    double groundRelativeVelocityMps_ = 0.0;
     double zenithRadians_ = 0.0;
     double lastZenith_ = 0.0;
     bool quaternionValid_ = false;
@@ -138,6 +172,11 @@ class FlightComputer {
     double smoothedVelocity_[3] = {0.0, 0.0, 0.0};
     double smoothedAcceleration_[3] = {0.0, 0.0, 0.0};
     PredictorHorizontalVelocityTracker predictorHorizontalVelocity_;
+
+    // Wind estimation state (real-time horizontal acceleration residual tracking).
+    double windEstimateHorizontalMps_ = 0.0;
+    double coastStartTime_ = 0.0;
+    bool windEstimationActive_ = false;
 
 };
 

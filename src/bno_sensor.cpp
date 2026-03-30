@@ -29,14 +29,23 @@ const char *TransportName(settings::sensors::bno::Transport transport) {
 }  // namespace
 
 const char *BnoSensorModelName() {
+    if (!settings::sensors::bno::kEnabled) {
+        return "Disabled";
+    }
     return ModelName(settings::sensors::bno::kModel);
 }
 
 const char *BnoSensorTransportName() {
+    if (!settings::sensors::bno::kEnabled) {
+        return "Disabled";
+    }
     return TransportName(settings::sensors::bno::kTransport);
 }
 
 bool BnoSensorBegin() {
+    if (!settings::sensors::bno::kEnabled) {
+        return false;
+    }
     switch (settings::sensors::bno::kModel) {
         case settings::sensors::bno::Model::Bno055:
             return Bno055SensorBegin();
@@ -47,6 +56,9 @@ bool BnoSensorBegin() {
 }
 
 bool BnoSensorAcquire(SensorData &out) {
+    if (!settings::sensors::bno::kEnabled) {
+        return false;
+    }
     switch (settings::sensors::bno::kModel) {
         case settings::sensors::bno::Model::Bno055:
             return Bno055SensorAcquire(out);
@@ -57,6 +69,9 @@ bool BnoSensorAcquire(SensorData &out) {
 }
 
 bool BnoSensorIsInitialized() {
+    if (!settings::sensors::bno::kEnabled) {
+        return false;
+    }
     switch (settings::sensors::bno::kModel) {
         case settings::sensors::bno::Model::Bno055:
             return Bno055SensorIsInitialized();

@@ -17,7 +17,7 @@ class SyncedFlapActuator {
 
   private:
     void ApplyPwm(uint32_t nowMs, int topPwmUs, int bottomPwmUs);
-    static settings::actuation::ServoCalibrationPoint LookupNearestPoint(float angleDeg);
+    static int InterpolateServoPwmUs(float angleDeg, int closedPwmUs, int openPwmUs);
     static float ComputeSmoothingAlpha(float dtSeconds, float tauSeconds);
 
     bool attached_ = false;

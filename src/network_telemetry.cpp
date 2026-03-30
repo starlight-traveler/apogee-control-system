@@ -121,6 +121,19 @@ void FillPacket(const TelemetrySnapshot &snapshot, telemetry::PacketV1 &packet) 
         for (int i = 0; i < 3; ++i) {
             packet.sensorIcmYprDeg[i] = snapshot.sensor->icmYprDeg[i];
         }
+        packet.sensorAltimeterSigmaScale = snapshot.sensor->altimeterSigmaScale;
+        packet.sensorAltimeterGateSigma = snapshot.sensor->altimeterGateSigma;
+        packet.sensorAutoCommandDeg = snapshot.sensor->autoCommandDeg;
+        packet.sensorOptimizerBestPredictedApogeeM = snapshot.sensor->optimizerBestPredictedApogeeM;
+        packet.sensorOptimizerBestCost = snapshot.sensor->optimizerBestCost;
+        packet.sensorOptimizerTimeToApogeeS = snapshot.sensor->optimizerTimeToApogeeS;
+        packet.sensorActuationIsSettling = snapshot.sensor->actuationIsSettling;
+        packet.sensorPredictorSeedHorizontalSpeedMps = snapshot.sensor->predictorSeedHorizontalSpeedMps;
+        packet.sensorPredictorSeedClampedZenithRad = snapshot.sensor->predictorSeedClampedZenithRad;
+        packet.sensorPredictorSeedClampedAngularRateRadPerSec =
+            snapshot.sensor->predictorSeedClampedAngularRateRadPerSec;
+        packet.sensorPredictorSeedConfidenceFlags = snapshot.sensor->predictorSeedConfidenceFlags;
+        packet.sensorMainQuaternionSource = snapshot.sensor->mainQuaternionSource;
         packet.sensorHasQuaternion = snapshot.sensor->hasQuaternion ? 1u : 0u;
         packet.sensorHasIcmQuaternion = snapshot.sensor->hasIcmQuaternion ? 1u : 0u;
         packet.sensorHasIcmYpr = snapshot.sensor->hasIcmYpr ? 1u : 0u;

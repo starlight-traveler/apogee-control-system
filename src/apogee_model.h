@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <cmath>
 
 #include "constants.h"
@@ -17,6 +18,83 @@ struct ApogeeVehicleParameters {
     double centerOfPressureOffsetMeters = 0.0;  // cp_cg in Python (m)
     double momentOfInertia = 1.0;               // kg*m^2
     double dryMass = 1.0;                       // kg
+};
+
+/// Mach-dependent drag scale storage for adaptive predictor.
+/// Each bin tracks an independent scale factor learned during coast.
+struct MachDependentDragScale {
+    static constexpr int kMaxBins = 4;
+    float scales[kMaxBins] = {1.0f, 1.0f, 1.0f, 1.0f};
+
+    /// Interpolates the drag scale at the given Mach number.
+    float InterpolateScale(float mach) const {
+        if (!settings::predictor::kEnableMachDependentDrag) {
+            return scales[0];  // Use first bin as fallback scalar
+        }
+        const int binCount = settings::predictor::kMachBinCount;
+        if (binCount <= 1) {
+            return scales[0];
+        }
+        // Find bracketing bins
+        int lowerIdx = 0;
+        for (int i = 0; i < binCount - 1; ++i) {
+            if (mach >= settings::predictor::kMachBinEdges[i]) {
+                lowerIdx = i;
+            }
+        }
+        int upperIdx = std::min(lowerIdx + 1, binCount - 1);
+        if (lowerIdx == upperIdx) {
+            return scales[lowerIdx];
+        }
+        // Linear interpolation between bins
+        const float lowerMach = settings::predictor::kMachBinEdges[lowerIdx];
+        const float upperMach = settings::predictor::kMachBinEdges[upperIdx];
+        const float denom = upperMach - lowerMach;
+        if (denom <= 0.0f) {
+            return scales[lowerIdx];
+        }
+        const float t = std::clamp((mach - lowerMach) / denom, 0.0f, 1.0f);
+        return scales[lowerIdx] + t * (scales[upperIdx] - scales[lowerIdx]);
+    }
+
+    /// Updates the scale for the bin closest to the given Mach number.
+    void AdaptScale(float mach, float targetScale, float alpha) {
+        if (!settings::predictor::kEnableMachDependentDrag) {
+            scales[0] = std::clamp(scales[0] + alpha * (targetScale - scales[0]),
+                                   settings::predictor::kMachDragScaleMin,
+                                   settings::predictor::kMachDragScaleMax);
+            return;
+        }
+        // Find closest bin to adapt
+        const int binCount = settings::predictor::kMachBinCount;
+        int bestIdx = 0;
+        float bestDist = std::fabs(mach - settings::predictor::kMachBinEdges[0]);
+        for (int i = 1; i < binCount; ++i) {
+            const float dist = std::fabs(mach - settings::predictor::kMachBinEdges[i]);
+            if (dist < bestDist) {
+                bestDist = dist;
+                bestIdx = i;
+            }
+        }
+        scales[bestIdx] = std::clamp(scales[bestIdx] + alpha * (targetScale - scales[bestIdx]),
+                                     settings::predictor::kMachDragScaleMin,
+                                     settings::predictor::kMachDragScaleMax);
+    }
+
+    /// Resets all bins to nominal (1.0).
+    void Reset() {
+        for (int i = 0; i < kMaxBins; ++i) {
+            scales[i] = 1.0f;
+        }
+    }
+};
+
+/// Result of apogee prediction with uncertainty bounds.
+struct ApogeePredictionResult {
+    double nominal = 0.0;        // Best estimate
+    double lower = 0.0;          // Lower bound (high drag scenario)
+    double upper = 0.0;          // Upper bound (low drag scenario)
+    double timeToApogee = 0.0;   // Estimated time to apogee (seconds)
 };
 
 /// Trilinear CFD force table used when aerodynamic prediction is enabled.
@@ -88,6 +166,48 @@ class ApogeePredictor {
     /// Sets the optional CFD force table. A null table falls back to ballistic-only motion.
     void SetForceTable(const ApogeeForceTable *table) { forceTable_ = table; }
 
+    /// Sets the runtime axial drag correction scale (legacy single-value API).
+    void SetAxialDragScale(double scale) {
+        axialDragScale_ = std::clamp(scale,
+                                     static_cast<double>(settings::flight::kAdaptiveAxialDragScaleMin),
+                                     static_cast<double>(settings::flight::kAdaptiveAxialDragScaleMax));
+    }
+
+    /// Restores the predictor to its nominal unadapted drag scale.
+    void ResetAxialDragScale() {
+        axialDragScale_ = 1.0;
+        machDragScale_.Reset();
+    }
+
+    /// Returns the active runtime axial drag correction scale.
+    double AxialDragScale() const { return axialDragScale_; }
+
+    /// Returns reference to the Mach-dependent drag scale for adaptation.
+    MachDependentDragScale &MachDragScale() { return machDragScale_; }
+    const MachDependentDragScale &MachDragScale() const { return machDragScale_; }
+
+    /// Adapts the Mach-dependent drag scale at the given Mach number.
+    void AdaptMachDragScale(double mach, double residualAccel, double modelAxialAccel, double dtSeconds) {
+        if (!settings::predictor::kEnableMachDependentDrag) {
+            return;
+        }
+        const double minAxialAccel = static_cast<double>(settings::flight::kAdaptiveAxialAccelMinAbsMps2);
+        if (std::fabs(modelAxialAccel) < minAxialAccel) {
+            return;
+        }
+        // Compute target scale adjustment from residual
+        const float currentScale = machDragScale_.InterpolateScale(static_cast<float>(mach));
+        const double targetScale = currentScale + (residualAccel / modelAxialAccel);
+        // Compute blend alpha from time constant
+        const double tauSeconds = static_cast<double>(settings::predictor::kMachDragAdaptTauSeconds);
+        const double alpha = (dtSeconds > 0.0 && tauSeconds > 0.0)
+                                 ? (1.0 - std::exp(-dtSeconds / tauSeconds))
+                                 : 0.0;
+        machDragScale_.AdaptScale(static_cast<float>(mach),
+                                  static_cast<float>(targetScale),
+                                  static_cast<float>(alpha));
+    }
+
     /// Sets the fixed integration step in seconds.
     void SetTimeStep(double dt) { timeStep_ = dt; }
 
@@ -128,6 +248,82 @@ class ApogeePredictor {
             }
         }
         return state.altitudeMeters;
+    }
+
+    /// Predicts apogee with uncertainty bounds by perturbing drag and wind.
+    /// Returns nominal prediction plus lower/upper confidence bounds.
+    ApogeePredictionResult PredictApogeeWithBounds(const ApogeeState &initialState) {
+        ApogeePredictionResult result;
+        result.nominal = PredictApogee(initialState);
+
+        if (!settings::predictor::kEnableUncertaintyBounds) {
+            result.lower = result.nominal;
+            result.upper = result.nominal;
+            result.timeToApogee = EstimateTimeToApogee(initialState);
+            return result;
+        }
+
+        // Store original scales
+        const double originalAxialScale = axialDragScale_;
+        MachDependentDragScale originalMachScale = machDragScale_;
+
+        // High drag scenario -> lower apogee
+        const float dragPerturbHigh = 1.0f + settings::predictor::kUncertaintyDragPerturbFraction;
+        axialDragScale_ = originalAxialScale * dragPerturbHigh;
+        for (int i = 0; i < MachDependentDragScale::kMaxBins; ++i) {
+            machDragScale_.scales[i] = originalMachScale.scales[i] * dragPerturbHigh;
+        }
+        result.lower = PredictApogee(initialState);
+
+        // Low drag scenario -> higher apogee
+        const float dragPerturbLow = 1.0f - settings::predictor::kUncertaintyDragPerturbFraction;
+        axialDragScale_ = originalAxialScale * dragPerturbLow;
+        for (int i = 0; i < MachDependentDragScale::kMaxBins; ++i) {
+            machDragScale_.scales[i] = originalMachScale.scales[i] * dragPerturbLow;
+        }
+        result.upper = PredictApogee(initialState);
+
+        // Restore original scales
+        axialDragScale_ = originalAxialScale;
+        machDragScale_ = originalMachScale;
+
+        // Estimate time to apogee
+        result.timeToApogee = EstimateTimeToApogee(initialState);
+
+        return result;
+    }
+
+    /// Estimates time to apogee in seconds using simplified ballistic approximation.
+    double EstimateTimeToApogee(const ApogeeState &state) const {
+        if (state.verticalVelocity <= 0.0) {
+            return 0.0;
+        }
+        // Simple estimate: t ≈ v / g (ignoring drag)
+        // More accurate: integrate with drag but use faster midpoint method
+        ApogeeState simState = state;
+        InterpHintSet hints;
+        double time = 0.0;
+        int steps = 0;
+        while (simState.verticalVelocity > 0.0 && steps < maxIntegrationSteps_) {
+            simState = const_cast<ApogeePredictor*>(this)->IntegrateStep(
+                simState, timeStep_, hints, IntegrationMethod::Midpoint);
+            time += timeStep_;
+            ++steps;
+        }
+        return time;
+    }
+
+    /// Evaluates the current model vertical acceleration at one predictor seed.
+    ///
+    /// This exists for the adaptive drag update and intentionally avoids a full
+    /// apogee integration when only the local model residual is needed.
+    double ComputeVerticalAcceleration(const ApogeeState &state, double *axialVerticalAcceleration = nullptr) {
+        InterpHintSet hints;
+        const AccelResult accel = ComputeAcceleration(state, hints);
+        if (axialVerticalAcceleration != nullptr) {
+            *axialVerticalAcceleration = accel.axialLinearX;
+        }
+        return accel.linearX;
     }
 
   private:
@@ -227,6 +423,7 @@ class ApogeePredictor {
         double linearY;
         double linearZ;
         double angular;
+        double axialLinearX;
     };
 
     /// Advances the predictor by one fixed step using the selected integrator.
@@ -448,12 +645,16 @@ class ApogeePredictor {
         double relY = velY;
         double relZ = 0.0;
         double temperature = 288.15;
+        double densityRatio = 1.0;
         if (environment_ != nullptr) {
-            const math_utils::Vec3 wind = environment_->GradientWind();
+            // Use effective wind (includes runtime estimation offset)
+            const math_utils::Vec3 wind = environment_->EffectiveWind();
             relX -= static_cast<double>(wind.x);
             relY -= static_cast<double>(wind.y);
             relZ -= static_cast<double>(wind.z);
             temperature = environment_->TemperatureKelvin(state.altitudeMeters);
+            // Get density ratio for force scaling
+            densityRatio = environment_->DensityRatio(state.altitudeMeters);
         }
         float speedOfSound = 0.0f;
         if (temperature > 0.0) {
@@ -496,8 +697,16 @@ class ApogeePredictor {
             const double acsDeg = state.acsAngleDeg;
 
             const InterpolatedForces forces = InterpolateForces(*table, acsDeg, atkDeg, mach, &hints);
-            const double axialForceMag = forces.axial;
-            const double normalForceMag = forces.normal;
+
+            // Apply Mach-dependent drag scale if enabled, otherwise use legacy single scale
+            double effectiveDragScale = axialDragScale_;
+            if (settings::predictor::kEnableMachDependentDrag) {
+                effectiveDragScale *= machDragScale_.InterpolateScale(static_cast<float>(mach));
+            }
+
+            // Apply density scaling: forces scale with density ratio
+            const double axialForceMag = forces.axial * effectiveDragScale * densityRatio;
+            const double normalForceMag = forces.normal * densityRatio;
 
             float sinZf = 0.0f;
             float cosZf = 1.0f;
@@ -521,11 +730,13 @@ class ApogeePredictor {
 
             const double aeroAccelX = (axialForceX + normalForceX) * invDryMass_;
             const double aeroAccelY = (axialForceY + normalForceY) * invDryMass_;
+            const double axialAccelX = axialForceX * invDryMass_;
             linearAccelX = gravityX + aeroAccelX;
             linearAccelY = gravityY + aeroAccelY;
+            return AccelResult{linearAccelX, linearAccelY, linearAccelZ, angularAccel, axialAccelX};
         }
 
-        return AccelResult{linearAccelX, linearAccelY, linearAccelZ, angularAccel};
+        return AccelResult{linearAccelX, linearAccelY, linearAccelZ, angularAccel, 0.0};
     }
 
     const EnvironmentModel *environment_ = nullptr;
@@ -534,6 +745,8 @@ class ApogeePredictor {
     double invDryMass_ = 1.0;
     double invMomentOfInertia_ = 1.0;
     double aeroMomentScale_ = 0.0;
+    double axialDragScale_ = 1.0;
+    MachDependentDragScale machDragScale_;
     double timeStep_ = 0.1;
     int maxIntegrationSteps_ = settings::flight::kApogeePredictorMaxSteps;
     double minVerticalVelocityForPrediction_ = 0.0;

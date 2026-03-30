@@ -21,15 +21,19 @@ uint32_t g_lastFlushMicros = 0;
 uint32_t g_lastSyncMicros = 0;
 bool g_loggerInitialized = false;
 bool g_syncPending = false;
+bool g_highPriorityFlushPending = false;
 DataLoggerDiagnostics g_diagnostics;
 
 constexpr uint32_t kFlushIntervalMicros = settings::build::kDataLoggerFlushIntervalUs;
 constexpr uint32_t kSyncIntervalMicros = settings::build::kDataLoggerSyncIntervalUs;
+constexpr size_t kMinFlushBytes = settings::build::kDataLoggerMinFlushBytes;
+constexpr uint32_t kPreallocateBytes = settings::build::kDataLoggerPreallocateBytes;
+constexpr uint32_t kHardFlushIntervalMicros = kFlushIntervalMicros * 4u;
 
 constexpr const char *kLogPrefix = "SENS";
 constexpr const char *kLogExtension = "BIN";
 constexpr uint16_t kLogFileFormatVersion = 1;
-constexpr uint16_t kLogSchemaVersion = 4;
+constexpr uint16_t kLogSchemaVersion = 6;
 constexpr uint8_t kLogMagic[8] = {'A', 'C', 'S', 'N', 'D', 'R', 'T', '1'};
 
 #if defined(ACS_FIRMWARE_GIT_HASH)
@@ -41,9 +45,9 @@ constexpr const char *kFirmwareGitHash = "unknown";
 // These static asserts are the first line of defense for the binary schema.
 // If any of them changes, the decoder table in tools/decode/native must be
 // updated in lockstep before new logs are trusted.
-static_assert(sizeof(SensorData) == 136, "SensorData size mismatch.");
+static_assert(sizeof(SensorData) == 252, "SensorData size mismatch.");
 static_assert(sizeof(FilteredState) == 60, "FilteredState size mismatch.");
-static_assert(sizeof(TelemetryLogRecord) == 200, "TelemetryLogRecord size mismatch.");
+static_assert(sizeof(TelemetryLogRecord) == 316, "TelemetryLogRecord size mismatch.");
 static_assert(sizeof(EventLogRecord) == 20, "EventLogRecord size mismatch.");
 static_assert(sizeof(LogFilePreamble) == 64, "LogFilePreamble size mismatch.");
 
@@ -66,6 +70,7 @@ void FailLogger() {
     g_logFile.close();
     g_loggerInitialized = false;
     g_syncPending = false;
+    g_highPriorityFlushPending = false;
     g_bufferPosition = 0;
     g_diagnostics.initialized = false;
     g_diagnostics.syncPending = false;
@@ -96,6 +101,7 @@ bool SyncFile() {
 /// Telemetry writes are buffered to reduce loop latency; high-priority event
 /// records request a later sync so flight-critical control work can continue.
 bool FlushBuffer(bool requestSync) {
+    
     if (!g_loggerInitialized || g_bufferPosition == 0) {
         if (requestSync) {
             g_syncPending = true;
@@ -117,6 +123,7 @@ bool FlushBuffer(bool requestSync) {
     g_bufferPosition = 0;
     g_lastFlushMicros = micros();
     g_syncPending = g_syncPending || requestSync;
+    g_highPriorityFlushPending = false;
     g_diagnostics.syncPending = g_syncPending;
     g_diagnostics.bufferedBytes = 0;
     return true;
@@ -210,6 +217,10 @@ bool DataLoggerBegin() {
         return false;
     }
 
+    if (kPreallocateBytes > 0 && !g_logFile.preAllocate(kPreallocateBytes)) {
+        LOG_PRINTLN("SD preallocation skipped.");
+    }
+
     if (!WriteLogPreamble()) {
         g_logFile.close();
         LOG_PRINTLN("Failed to write log preamble.");
@@ -220,6 +231,7 @@ bool DataLoggerBegin() {
     g_lastFlushMicros = micros();
     g_lastSyncMicros = g_lastFlushMicros;
     g_syncPending = false;
+    g_highPriorityFlushPending = false;
     g_diagnostics = DataLoggerDiagnostics{};
 
     g_loggerInitialized = true;
@@ -273,9 +285,9 @@ void DataLoggerLogEvent(FlightEventType type,
         LOG_PRINTLN("Failed to append event record to log.");
         return;
     }
-    if (!FlushBuffer(true)) {
-        LOG_PRINTLN("Failed to flush event record to log.");
-    }
+    g_highPriorityFlushPending = true;
+    g_syncPending = true;
+    g_diagnostics.syncPending = true;
 }
 
 /// Forces an immediate flush and sync of the current log file.
@@ -303,8 +315,14 @@ void DataLoggerService() {
     }
 
     const uint32_t now = micros();
+    const uint32_t sinceLastFlush = now - g_lastFlushMicros;
+    const bool bufferFull = g_bufferPosition >= kBufferSize;
+    const bool preferredBatchReady = g_bufferPosition >= kMinFlushBytes;
+    const bool flushIntervalExpired = sinceLastFlush >= kFlushIntervalMicros;
+    const bool hardFlushExpired = sinceLastFlush >= kHardFlushIntervalMicros;
     if (g_bufferPosition > 0 &&
-        ((now - g_lastFlushMicros) >= kFlushIntervalMicros || g_bufferPosition >= kBufferSize)) {
+        (bufferFull || g_highPriorityFlushPending || hardFlushExpired ||
+         (flushIntervalExpired && preferredBatchReady))) {
         if (!FlushBuffer(false)) {
             LOG_PRINTLN("Failed to flush sensor log buffer.");
             return;

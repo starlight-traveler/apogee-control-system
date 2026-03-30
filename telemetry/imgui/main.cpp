@@ -47,6 +47,21 @@
 
 namespace {
 
+const char *MainQuaternionSourceName(uint8_t value) {
+    switch (value) {
+        case 1:
+            return "BNO";
+        case 2:
+            return "ICM";
+        case 3:
+            return "LSM";
+        case 4:
+            return "Blended";
+        default:
+            return "None";
+    }
+}
+
 struct SharedTelemetry {
     telemetry::PacketV1 latest{};
     telemetry::SettingsSnapshotV1 settings{};
@@ -1673,6 +1688,8 @@ int main(int argc, char **argv) {
                                         p.sensorQuaternion[2],
                                         p.sensorQuaternion[3]);
                             ImGui::Text("Has quaternion: %s", p.sensorHasQuaternion ? "true" : "false");
+                            ImGui::Text("Main quaternion source: %s",
+                                        MainQuaternionSourceName(p.sensorMainQuaternionSource));
                             ImGui::Text("ICM quaternion");
                             ImGui::SameLine(170.0f);
                             ImGui::Text("%.3f  %.3f  %.3f  %.3f",
@@ -1683,6 +1700,22 @@ int main(int argc, char **argv) {
                             ImGui::Text("Has ICM quaternion: %s", p.sensorHasIcmQuaternion ? "true" : "false");
                             DrawVectorRow("ICM Yaw/Pitch/Roll", p.sensorIcmYprDeg, "deg");
                             ImGui::Text("Has ICM YPR: %s", p.sensorHasIcmYpr ? "true" : "false");
+                        }
+
+                        if (ImGui::CollapsingHeader("Control Telemetry", ImGuiTreeNodeFlags_DefaultOpen)) {
+                            ImGui::Text("Auto command: %.2f deg", p.sensorAutoCommandDeg);
+                            ImGui::Text("Actuation settling: %s", p.sensorActuationIsSettling > 0.5f ? "true" : "false");
+                            ImGui::Text("Best predicted apogee: %.2f m", p.sensorOptimizerBestPredictedApogeeM);
+                            ImGui::Text("Optimizer cost: %.3f", p.sensorOptimizerBestCost);
+                            ImGui::Text("Time to apogee: %.2f s", p.sensorOptimizerTimeToApogeeS);
+                            ImGui::Text("Baro sigma scale / gate: %.2f / %.2f",
+                                        p.sensorAltimeterSigmaScale,
+                                        p.sensorAltimeterGateSigma);
+                            ImGui::Text("Predictor horiz speed: %.2f m/s", p.sensorPredictorSeedHorizontalSpeedMps);
+                            ImGui::Text("Predictor zenith: %.3f rad", p.sensorPredictorSeedClampedZenithRad);
+                            ImGui::Text("Predictor ang rate: %.3f rad/s",
+                                        p.sensorPredictorSeedClampedAngularRateRadPerSec);
+                            ImGui::Text("Predictor flags: %.0f", p.sensorPredictorSeedConfidenceFlags);
                         }
 
                         if (ImGui::CollapsingHeader("Filtered State", ImGuiTreeNodeFlags_DefaultOpen)) {

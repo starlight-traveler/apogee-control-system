@@ -11,6 +11,12 @@ namespace {
 constexpr uint8_t kTopServoPin = settings::hardware::kTopServoPin;
 constexpr uint8_t kBottomServoPin = settings::hardware::kBottomServoPin;
 constexpr float kServoMaxActuationDeg = settings::actuation::kServoMaxActuationDeg;
+constexpr int kServoAttachMinPulseUs = settings::actuation::kServoAttachMinPulseUs;
+constexpr int kServoAttachMaxPulseUs = settings::actuation::kServoAttachMaxPulseUs;
+constexpr int kTopServoClosedPwmUs = settings::actuation::kTopServoClosedPwmUs;
+constexpr int kTopServoOpenPwmUs = settings::actuation::kTopServoOpenPwmUs;
+constexpr int kBottomServoClosedPwmUs = settings::actuation::kBottomServoClosedPwmUs;
+constexpr int kBottomServoOpenPwmUs = settings::actuation::kBottomServoOpenPwmUs;
 constexpr float kServoLatencySeconds = settings::actuation::kServoLatencySeconds;
 constexpr float kCommandDeadbandDeg = settings::actuation::kAngleCommandDeadbandDeg;
 constexpr uint32_t kServoMinStepIntervalMs = settings::actuation::kServoMinStepIntervalMs;
@@ -23,8 +29,8 @@ Servo g_bottomServo;
 }  // namespace
 
 void SyncedFlapActuator::Begin() {
-    g_topServo.attach(kTopServoPin);
-    g_bottomServo.attach(kBottomServoPin);
+    g_topServo.attach(kTopServoPin, kServoAttachMinPulseUs, kServoAttachMaxPulseUs);
+    g_bottomServo.attach(kBottomServoPin, kServoAttachMinPulseUs, kServoAttachMaxPulseUs);
     attached_ = true;
     hasLastUpdateMs_ = false;
     settling_ = false;
@@ -39,8 +45,9 @@ void SyncedFlapActuator::Begin() {
     currentTopPwmUs_ = -1;
     currentBottomPwmUs_ = -1;
 
-    const auto point = LookupNearestPoint(0.0f);
-    ApplyPwm(0, point.topPwmUs, point.bottomPwmUs);
+    ApplyPwm(0,
+             InterpolateServoPwmUs(0.0f, kTopServoClosedPwmUs, kTopServoOpenPwmUs),
+             InterpolateServoPwmUs(0.0f, kBottomServoClosedPwmUs, kBottomServoOpenPwmUs));
 }
 
 void SyncedFlapActuator::Update(uint32_t nowMs, float commandedAngleDeg) {
@@ -67,11 +74,13 @@ void SyncedFlapActuator::Update(uint32_t nowMs, float commandedAngleDeg) {
     effectiveAngleDeg_ += alpha * (commandAngleDeg_ - effectiveAngleDeg_);
     effectiveAngleDeg_ = std::clamp(effectiveAngleDeg_, 0.0f, kServoMaxActuationDeg);
 
-    const auto point = LookupNearestPoint(effectiveAngleDeg_);
-    const bool pwmChanged = (point.topPwmUs != currentTopPwmUs_) || (point.bottomPwmUs != currentBottomPwmUs_);
+    const int topPwmUs = InterpolateServoPwmUs(effectiveAngleDeg_, kTopServoClosedPwmUs, kTopServoOpenPwmUs);
+    const int bottomPwmUs =
+        InterpolateServoPwmUs(effectiveAngleDeg_, kBottomServoClosedPwmUs, kBottomServoOpenPwmUs);
+    const bool pwmChanged = (topPwmUs != currentTopPwmUs_) || (bottomPwmUs != currentBottomPwmUs_);
     const bool dwellElapsed = (nowMs - lastPwmChangeMs_) >= kServoMinStepIntervalMs;
     if (pwmChanged && (lastPwmChangeMs_ == 0 || dwellElapsed)) {
-        ApplyPwm(nowMs, point.topPwmUs, point.bottomPwmUs);
+        ApplyPwm(nowMs, topPwmUs, bottomPwmUs);
     }
 
     const bool timerExpired = (settlingDeadlineMs_ != 0u) && (static_cast<int32_t>(nowMs - settlingDeadlineMs_) >= 0);
@@ -119,21 +128,14 @@ bool SyncedFlapActuator::ConsumeSettlingTimerFiredEvent() {
     return true;
 }
 
-settings::actuation::ServoCalibrationPoint SyncedFlapActuator::LookupNearestPoint(float angleDeg) {
+int SyncedFlapActuator::InterpolateServoPwmUs(float angleDeg, int closedPwmUs, int openPwmUs) {
     const float clampedAngle = std::clamp(angleDeg, 0.0f, kServoMaxActuationDeg);
-    const auto &table = settings::actuation::kServoCalibrationTable;
-    constexpr size_t kCount = settings::actuation::kServoCalibrationPointCount;
-
-    size_t bestIndex = 0;
-    float bestDistance = std::fabs(clampedAngle - table[0].angleDeg);
-    for (size_t i = 1; i < kCount; ++i) {
-        const float distance = std::fabs(clampedAngle - table[i].angleDeg);
-        if (distance < bestDistance) {
-            bestDistance = distance;
-            bestIndex = i;
-        }
+    if (kServoMaxActuationDeg <= 0.0f) {
+        return closedPwmUs;
     }
-    return table[bestIndex];
+    const float blend = clampedAngle / kServoMaxActuationDeg;
+    const float pwmUs = static_cast<float>(closedPwmUs) + blend * static_cast<float>(openPwmUs - closedPwmUs);
+    return static_cast<int>(lroundf(pwmUs));
 }
 
 float SyncedFlapActuator::ComputeSmoothingAlpha(float dtSeconds, float tauSeconds) {

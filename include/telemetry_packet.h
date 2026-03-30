@@ -60,10 +60,23 @@ struct PacketV1 {
     float sensorQuaternion[4] = {1.0f, 0.0f, 0.0f, 0.0f};
     float sensorIcmQuaternion[4] = {1.0f, 0.0f, 0.0f, 0.0f};
     float sensorIcmYprDeg[3] = {0.0f, 0.0f, 0.0f};
+    float sensorAltimeterSigmaScale = 1.0f;
+    float sensorAltimeterGateSigma = 3.5f;
+    float sensorAutoCommandDeg = 0.0f;
+    float sensorOptimizerBestPredictedApogeeM = 0.0f;
+    float sensorOptimizerBestCost = 0.0f;
+    float sensorOptimizerTimeToApogeeS = 0.0f;
+    float sensorActuationIsSettling = 0.0f;
+    float sensorPredictorSeedHorizontalSpeedMps = 0.0f;
+    float sensorPredictorSeedClampedZenithRad = 0.0f;
+    float sensorPredictorSeedClampedAngularRateRadPerSec = 0.0f;
+    float sensorPredictorSeedConfidenceFlags = 0.0f;
+    uint8_t sensorMainQuaternionSource = 0;
+    uint8_t sensorReserved = 0;
     uint8_t sensorHasQuaternion = 0;
     uint8_t sensorHasIcmQuaternion = 0;
     uint8_t sensorHasIcmYpr = 0;
-    uint8_t sensorReserved = 0;
+    uint8_t sensorReserved2 = 0;
 
     float stateTime = 0.0f;
     float statePosition[3] = {0.0f, 0.0f, 0.0f};
@@ -79,7 +92,7 @@ struct PacketV1 {
 };
 #pragma pack(pop)
 
-static_assert(sizeof(PacketV1) == 184, "PacketV1 size changed; update desktop parser and firmware together.");
+static_assert(sizeof(PacketV1) == 230, "PacketV1 size changed; update desktop parser and firmware together.");
 
 #pragma pack(push, 1)
 struct HeartbeatV1 {

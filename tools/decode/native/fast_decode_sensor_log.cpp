@@ -49,7 +49,7 @@ namespace {
 // `src/data_logger.h` and `src/data_logger.cpp`. The native decoder is strict
 // about record sizes because it decodes directly from raw bytes.
 constexpr std::size_t kHeaderSize = 4;
-constexpr std::size_t kSensorSize = 136;
+constexpr std::size_t kSensorSize = 252;
 constexpr std::size_t kFilteredSize = 60;
 constexpr std::size_t kTelemetryPayloadSize = kSensorSize + kFilteredSize;
 constexpr std::size_t kEventPayloadSize = 16;
@@ -62,8 +62,9 @@ constexpr std::array<const char *, 3> kEventNames = {
     "stage_change", "flap_actuated", "flap_settling_timer_fired"};
 
 constexpr std::array<uint8_t, 8> kLogMagic = {'A', 'C', 'S', 'N', 'D', 'R', 'T', '1'};
-constexpr int kSensorFloatCount = 33;
-constexpr int kSensorBoolCount = 3;
+constexpr int kSensorFloatCount = 60;
+constexpr int kSensorU8Count = 1;
+constexpr int kSensorBoolCount = 9;
 constexpr int kStateFloatCount = 15;
 
 enum class ColumnClass {
@@ -96,6 +97,7 @@ enum class TelemetryFieldSource {
     StatusRaw,
     HasFilteredState,
     SensorFloat,
+    SensorU8,
     SensorBool,
     StateFloat
 };
@@ -110,7 +112,7 @@ struct TelemetryFieldDescriptor {
 // Single source of truth for the binary telemetry schema used by the decoder.
 // Each entry corresponds to one CSV column / GUI series and is kept in lockstep
 // with the firmware's `SensorData` + `FilteredState` layout.
-constexpr std::array<TelemetryFieldDescriptor, 53> kTelemetryFields = {{
+constexpr std::array<TelemetryFieldDescriptor, 87> kTelemetryFields = {{
     {"flight_status_raw", TelemetryFieldSource::StatusRaw, 0, {"enum", ColumnClass::State, 0.0f, 4.0f}},
     {"has_filtered_state", TelemetryFieldSource::HasFilteredState, 0, {"bool", ColumnClass::State, 0.0f, 1.0f}},
     {"sensor_timestamp", TelemetryFieldSource::SensorFloat, 0, {"s", ColumnClass::Sensor}},
@@ -118,37 +120,71 @@ constexpr std::array<TelemetryFieldDescriptor, 53> kTelemetryFields = {{
     {"sensor_accel_bno_x", TelemetryFieldSource::SensorFloat, 2, {"m/s^2", ColumnClass::Sensor}},
     {"sensor_accel_bno_y", TelemetryFieldSource::SensorFloat, 3, {"m/s^2", ColumnClass::Sensor}},
     {"sensor_accel_bno_z", TelemetryFieldSource::SensorFloat, 4, {"m/s^2", ColumnClass::Sensor}},
-    {"sensor_accel_icm_x", TelemetryFieldSource::SensorFloat, 5, {"m/s^2", ColumnClass::Sensor}},
-    {"sensor_accel_icm_y", TelemetryFieldSource::SensorFloat, 6, {"m/s^2", ColumnClass::Sensor}},
-    {"sensor_accel_icm_z", TelemetryFieldSource::SensorFloat, 7, {"m/s^2", ColumnClass::Sensor}},
-    {"sensor_quat_w", TelemetryFieldSource::SensorFloat, 8, {"quat", ColumnClass::Sensor, -1.0f, 1.0f}},
-    {"sensor_quat_x", TelemetryFieldSource::SensorFloat, 9, {"quat", ColumnClass::Sensor, -1.0f, 1.0f}},
-    {"sensor_quat_y", TelemetryFieldSource::SensorFloat, 10, {"quat", ColumnClass::Sensor, -1.0f, 1.0f}},
-    {"sensor_quat_z", TelemetryFieldSource::SensorFloat, 11, {"quat", ColumnClass::Sensor, -1.0f, 1.0f}},
-    {"sensor_gyro_x", TelemetryFieldSource::SensorFloat, 12, {"rad/s", ColumnClass::Sensor}},
-    {"sensor_gyro_y", TelemetryFieldSource::SensorFloat, 13, {"rad/s", ColumnClass::Sensor}},
-    {"sensor_gyro_z", TelemetryFieldSource::SensorFloat, 14, {"rad/s", ColumnClass::Sensor}},
-    {"sensor_icm_quat_w", TelemetryFieldSource::SensorFloat, 15, {"quat", ColumnClass::Sensor, -1.0f, 1.0f}},
-    {"sensor_icm_quat_x", TelemetryFieldSource::SensorFloat, 16, {"quat", ColumnClass::Sensor, -1.0f, 1.0f}},
-    {"sensor_icm_quat_y", TelemetryFieldSource::SensorFloat, 17, {"quat", ColumnClass::Sensor, -1.0f, 1.0f}},
-    {"sensor_icm_quat_z", TelemetryFieldSource::SensorFloat, 18, {"quat", ColumnClass::Sensor, -1.0f, 1.0f}},
-    {"sensor_icm_yaw_deg", TelemetryFieldSource::SensorFloat, 19, {"deg", ColumnClass::Sensor}},
-    {"sensor_icm_pitch_deg", TelemetryFieldSource::SensorFloat, 20, {"deg", ColumnClass::Sensor}},
-    {"sensor_icm_roll_deg", TelemetryFieldSource::SensorFloat, 21, {"deg", ColumnClass::Sensor}},
-    {"sensor_altimeter_sigma_scale", TelemetryFieldSource::SensorFloat, 22, {"scale", ColumnClass::Sensor}},
-    {"sensor_altimeter_gate_sigma", TelemetryFieldSource::SensorFloat, 23, {"sigma", ColumnClass::Sensor}},
-    {"sensor_auto_cmd_deg", TelemetryFieldSource::SensorFloat, 24, {"deg", ColumnClass::Control}},
-    {"sensor_optimizer_best_predicted_apogee_m", TelemetryFieldSource::SensorFloat, 25, {"m", ColumnClass::Control}},
-    {"sensor_optimizer_best_cost", TelemetryFieldSource::SensorFloat, 26, {"cost", ColumnClass::Control}},
-    {"sensor_optimizer_time_to_apogee_s", TelemetryFieldSource::SensorFloat, 27, {"s", ColumnClass::Control}},
-    {"sensor_actuation_is_settling", TelemetryFieldSource::SensorFloat, 28, {"bool", ColumnClass::Control, 0.0f, 1.0f}},
-    {"sensor_predictor_seed_horizontal_speed_mps", TelemetryFieldSource::SensorFloat, 29, {"m/s", ColumnClass::Control}},
-    {"sensor_predictor_seed_clamped_zenith_rad", TelemetryFieldSource::SensorFloat, 30, {"rad", ColumnClass::Control}},
-    {"sensor_predictor_seed_clamped_angular_rate_rad_per_sec", TelemetryFieldSource::SensorFloat, 31, {"rad/s", ColumnClass::Control}},
-    {"sensor_predictor_seed_confidence_flags", TelemetryFieldSource::SensorFloat, 32, {"bits", ColumnClass::Control}},
-    {"sensor_has_quaternion", TelemetryFieldSource::SensorBool, 0, {"bool", ColumnClass::Sensor, 0.0f, 1.0f}},
-    {"sensor_has_icm_quaternion", TelemetryFieldSource::SensorBool, 1, {"bool", ColumnClass::Sensor, 0.0f, 1.0f}},
-    {"sensor_has_icm_ypr", TelemetryFieldSource::SensorBool, 2, {"bool", ColumnClass::Sensor, 0.0f, 1.0f}},
+    {"sensor_bno_gyro_x", TelemetryFieldSource::SensorFloat, 5, {"rad/s", ColumnClass::Sensor}},
+    {"sensor_bno_gyro_y", TelemetryFieldSource::SensorFloat, 6, {"rad/s", ColumnClass::Sensor}},
+    {"sensor_bno_gyro_z", TelemetryFieldSource::SensorFloat, 7, {"rad/s", ColumnClass::Sensor}},
+    {"sensor_bno_quat_w", TelemetryFieldSource::SensorFloat, 8, {"quat", ColumnClass::Sensor, -1.0f, 1.0f}},
+    {"sensor_bno_quat_x", TelemetryFieldSource::SensorFloat, 9, {"quat", ColumnClass::Sensor, -1.0f, 1.0f}},
+    {"sensor_bno_quat_y", TelemetryFieldSource::SensorFloat, 10, {"quat", ColumnClass::Sensor, -1.0f, 1.0f}},
+    {"sensor_bno_quat_z", TelemetryFieldSource::SensorFloat, 11, {"quat", ColumnClass::Sensor, -1.0f, 1.0f}},
+    {"sensor_accel_icm_x", TelemetryFieldSource::SensorFloat, 12, {"m/s^2", ColumnClass::Sensor}},
+    {"sensor_accel_icm_y", TelemetryFieldSource::SensorFloat, 13, {"m/s^2", ColumnClass::Sensor}},
+    {"sensor_accel_icm_z", TelemetryFieldSource::SensorFloat, 14, {"m/s^2", ColumnClass::Sensor}},
+    {"sensor_quat_w", TelemetryFieldSource::SensorFloat, 15, {"quat", ColumnClass::Sensor, -1.0f, 1.0f}},
+    {"sensor_quat_x", TelemetryFieldSource::SensorFloat, 16, {"quat", ColumnClass::Sensor, -1.0f, 1.0f}},
+    {"sensor_quat_y", TelemetryFieldSource::SensorFloat, 17, {"quat", ColumnClass::Sensor, -1.0f, 1.0f}},
+    {"sensor_quat_z", TelemetryFieldSource::SensorFloat, 18, {"quat", ColumnClass::Sensor, -1.0f, 1.0f}},
+    {"sensor_gyro_x", TelemetryFieldSource::SensorFloat, 19, {"rad/s", ColumnClass::Sensor}},
+    {"sensor_gyro_y", TelemetryFieldSource::SensorFloat, 20, {"rad/s", ColumnClass::Sensor}},
+    {"sensor_gyro_z", TelemetryFieldSource::SensorFloat, 21, {"rad/s", ColumnClass::Sensor}},
+    {"sensor_icm_quat_w", TelemetryFieldSource::SensorFloat, 22, {"quat", ColumnClass::Sensor, -1.0f, 1.0f}},
+    {"sensor_icm_quat_x", TelemetryFieldSource::SensorFloat, 23, {"quat", ColumnClass::Sensor, -1.0f, 1.0f}},
+    {"sensor_icm_quat_y", TelemetryFieldSource::SensorFloat, 24, {"quat", ColumnClass::Sensor, -1.0f, 1.0f}},
+    {"sensor_icm_quat_z", TelemetryFieldSource::SensorFloat, 25, {"quat", ColumnClass::Sensor, -1.0f, 1.0f}},
+    {"sensor_icm_yaw_deg", TelemetryFieldSource::SensorFloat, 26, {"deg", ColumnClass::Sensor}},
+    {"sensor_icm_pitch_deg", TelemetryFieldSource::SensorFloat, 27, {"deg", ColumnClass::Sensor}},
+    {"sensor_icm_roll_deg", TelemetryFieldSource::SensorFloat, 28, {"deg", ColumnClass::Sensor}},
+    {"sensor_accel_lsm_x", TelemetryFieldSource::SensorFloat, 29, {"m/s^2", ColumnClass::Sensor}},
+    {"sensor_accel_lsm_y", TelemetryFieldSource::SensorFloat, 30, {"m/s^2", ColumnClass::Sensor}},
+    {"sensor_accel_lsm_z", TelemetryFieldSource::SensorFloat, 31, {"m/s^2", ColumnClass::Sensor}},
+    {"sensor_gyro_lsm_x", TelemetryFieldSource::SensorFloat, 32, {"rad/s", ColumnClass::Sensor}},
+    {"sensor_gyro_lsm_y", TelemetryFieldSource::SensorFloat, 33, {"rad/s", ColumnClass::Sensor}},
+    {"sensor_gyro_lsm_z", TelemetryFieldSource::SensorFloat, 34, {"rad/s", ColumnClass::Sensor}},
+    {"sensor_lsm_quat_w", TelemetryFieldSource::SensorFloat, 35, {"quat", ColumnClass::Sensor, -1.0f, 1.0f}},
+    {"sensor_lsm_quat_x", TelemetryFieldSource::SensorFloat, 36, {"quat", ColumnClass::Sensor, -1.0f, 1.0f}},
+    {"sensor_lsm_quat_y", TelemetryFieldSource::SensorFloat, 37, {"quat", ColumnClass::Sensor, -1.0f, 1.0f}},
+    {"sensor_lsm_quat_z", TelemetryFieldSource::SensorFloat, 38, {"quat", ColumnClass::Sensor, -1.0f, 1.0f}},
+    {"sensor_lsm_yaw_deg", TelemetryFieldSource::SensorFloat, 39, {"deg", ColumnClass::Sensor}},
+    {"sensor_lsm_pitch_deg", TelemetryFieldSource::SensorFloat, 40, {"deg", ColumnClass::Sensor}},
+    {"sensor_lsm_roll_deg", TelemetryFieldSource::SensorFloat, 41, {"deg", ColumnClass::Sensor}},
+    {"sensor_icm_temperature_c", TelemetryFieldSource::SensorFloat, 42, {"C", ColumnClass::Sensor}},
+    {"sensor_icm_ahrs_dt_s", TelemetryFieldSource::SensorFloat, 43, {"s", ColumnClass::Sensor}},
+    {"sensor_icm_accel_trust", TelemetryFieldSource::SensorFloat, 44, {"unitless", ColumnClass::Sensor, 0.0f, 1.0f}},
+    {"sensor_icm_mag_trust", TelemetryFieldSource::SensorFloat, 45, {"unitless", ColumnClass::Sensor, 0.0f, 1.0f}},
+    {"sensor_icm_gyro_bias_x", TelemetryFieldSource::SensorFloat, 46, {"rad/s", ColumnClass::Sensor}},
+    {"sensor_icm_gyro_bias_y", TelemetryFieldSource::SensorFloat, 47, {"rad/s", ColumnClass::Sensor}},
+    {"sensor_icm_gyro_bias_z", TelemetryFieldSource::SensorFloat, 48, {"rad/s", ColumnClass::Sensor}},
+    {"sensor_altimeter_sigma_scale", TelemetryFieldSource::SensorFloat, 49, {"scale", ColumnClass::Sensor}},
+    {"sensor_altimeter_gate_sigma", TelemetryFieldSource::SensorFloat, 50, {"sigma", ColumnClass::Sensor}},
+    {"sensor_auto_cmd_deg", TelemetryFieldSource::SensorFloat, 51, {"deg", ColumnClass::Control}},
+    {"sensor_optimizer_best_predicted_apogee_m", TelemetryFieldSource::SensorFloat, 52, {"m", ColumnClass::Control}},
+    {"sensor_optimizer_best_cost", TelemetryFieldSource::SensorFloat, 53, {"cost", ColumnClass::Control}},
+    {"sensor_optimizer_time_to_apogee_s", TelemetryFieldSource::SensorFloat, 54, {"s", ColumnClass::Control}},
+    {"sensor_actuation_is_settling", TelemetryFieldSource::SensorFloat, 55, {"bool", ColumnClass::Control, 0.0f, 1.0f}},
+    {"sensor_predictor_seed_horizontal_speed_mps", TelemetryFieldSource::SensorFloat, 56, {"m/s", ColumnClass::Control}},
+    {"sensor_predictor_seed_clamped_zenith_rad", TelemetryFieldSource::SensorFloat, 57, {"rad", ColumnClass::Control}},
+    {"sensor_predictor_seed_clamped_angular_rate_rad_per_sec", TelemetryFieldSource::SensorFloat, 58, {"rad/s", ColumnClass::Control}},
+    {"sensor_predictor_seed_confidence_flags", TelemetryFieldSource::SensorFloat, 59, {"bits", ColumnClass::Control}},
+    {"sensor_main_quaternion_source", TelemetryFieldSource::SensorU8, 0, {"enum", ColumnClass::Sensor, 0.0f, 4.0f}},
+    {"sensor_has_bno_quaternion", TelemetryFieldSource::SensorBool, 0, {"bool", ColumnClass::Sensor, 0.0f, 1.0f}},
+    {"sensor_has_quaternion", TelemetryFieldSource::SensorBool, 1, {"bool", ColumnClass::Sensor, 0.0f, 1.0f}},
+    {"sensor_has_icm_quaternion", TelemetryFieldSource::SensorBool, 2, {"bool", ColumnClass::Sensor, 0.0f, 1.0f}},
+    {"sensor_has_icm_ypr", TelemetryFieldSource::SensorBool, 3, {"bool", ColumnClass::Sensor, 0.0f, 1.0f}},
+    {"sensor_has_lsm_quaternion", TelemetryFieldSource::SensorBool, 4, {"bool", ColumnClass::Sensor, 0.0f, 1.0f}},
+    {"sensor_has_lsm_ypr", TelemetryFieldSource::SensorBool, 5, {"bool", ColumnClass::Sensor, 0.0f, 1.0f}},
+    {"sensor_icm_accel_saturated", TelemetryFieldSource::SensorBool, 6, {"bool", ColumnClass::Sensor, 0.0f, 1.0f}},
+    {"sensor_icm_gyro_saturated", TelemetryFieldSource::SensorBool, 7, {"bool", ColumnClass::Sensor, 0.0f, 1.0f}},
+    {"sensor_icm_rail_constrained", TelemetryFieldSource::SensorBool, 8, {"bool", ColumnClass::Sensor, 0.0f, 1.0f}},
     {"state_time", TelemetryFieldSource::StateFloat, 0, {"s", ColumnClass::State}},
     {"state_position_x", TelemetryFieldSource::StateFloat, 1, {"m", ColumnClass::State}},
     {"state_position_y", TelemetryFieldSource::StateFloat, 2, {"m", ColumnClass::State}},
@@ -166,7 +202,7 @@ constexpr std::array<TelemetryFieldDescriptor, 53> kTelemetryFields = {{
     {"state_apogee_estimate", TelemetryFieldSource::StateFloat, 14, {"m", ColumnClass::State}},
 }};
 
-constexpr int kLogSchemaVersion = 4;
+constexpr int kLogSchemaVersion = 6;
 #if defined(ACS_FIRMWARE_GIT_HASH)
 constexpr const char *kExpectedFirmwareGitHash = ACS_FIRMWARE_GIT_HASH;
 #else
@@ -254,11 +290,20 @@ bool ReadTelemetryFieldValue(const TelemetryRecordRef &rec, const TelemetryField
             }
             outValue = ReadLE<float>(rec.payload + static_cast<std::size_t>(field.index) * sizeof(float));
             return true;
+        case TelemetryFieldSource::SensorU8: {
+            if (field.index < 0 || field.index >= kSensorU8Count) {
+                return false;
+            }
+            const std::size_t u8Offset = static_cast<std::size_t>(kSensorFloatCount) * sizeof(float);
+            outValue = static_cast<float>(rec.payload[u8Offset + static_cast<std::size_t>(field.index)]);
+            return true;
+        }
         case TelemetryFieldSource::SensorBool: {
             if (field.index < 0 || field.index >= kSensorBoolCount) {
                 return false;
             }
-            const std::size_t boolOffset = static_cast<std::size_t>(kSensorFloatCount) * sizeof(float);
+            const std::size_t boolOffset =
+                static_cast<std::size_t>(kSensorFloatCount) * sizeof(float) + static_cast<std::size_t>(kSensorU8Count);
             outValue = (rec.payload[boolOffset + static_cast<std::size_t>(field.index)] != 0u) ? 1.0f : 0.0f;
             return true;
         }
@@ -287,6 +332,9 @@ void BuildTelemetryLine(const TelemetryRecordRef &rec, std::string &line) {
         if (field.source == TelemetryFieldSource::SensorBool ||
             field.source == TelemetryFieldSource::HasFilteredState) {
             AppendBoolWord(line, v > 0.5f);
+        } else if (field.source == TelemetryFieldSource::SensorU8 ||
+                   field.source == TelemetryFieldSource::StatusRaw) {
+            AppendInt(line, static_cast<int>(std::lround(v)));
         } else {
             AppendFloat(line, v);
         }

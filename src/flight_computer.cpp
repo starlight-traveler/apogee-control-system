@@ -92,6 +92,7 @@ void FlightComputer::ReconfigurePredictor(const EnvironmentModel::Config &enviro
     apogeePredictor_.SetEnvironment(environment_);
     apogeePredictor_.SetVehicleParameters(vehicleParameters);
     apogeePredictor_.SetForceTable(forceTable);
+    apogeePredictor_.ResetAxialDragScale();
 }
 
 /// Processes one sensor sample and updates the filtered flight state.
@@ -115,6 +116,14 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
     }
     lastTimestamp_ = static_cast<double>(data.timestamp);
     const double altitudeMeters = static_cast<double>(data.altitudeFeet) * constants::kFeetToMeters;
+    if (!altitudeReferenceInitialized_ && std::isfinite(altitudeMeters)) {
+        altitudeReferenceMeters_ = altitudeMeters;
+        altitudeReferenceInitialized_ = true;
+        lastGroundRelativeAltitudeMeters_ = 0.0;
+        groundRelativeVelocityMps_ = 0.0;
+    }
+    const double relativeAltitudeMeters =
+        altitudeReferenceInitialized_ ? (altitudeMeters - altitudeReferenceMeters_) : 0.0;
 
     float accelBody[3];
     // Prefer the ICM path during the higher-dynamic ground/burn phases when it
@@ -139,6 +148,25 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
         // Propagate attitude through ascent with gyro-only integration so brief
         // quaternion dropouts do not immediately collapse the predictor seed.
         orientation = TeasleyFilter(previousQuaternion_, data.gyro, static_cast<float>(dt));
+
+        // When the runtime source selector marks the main quaternion as BNO-led
+        // or blended, treat it as a slow external reference and trim the
+        // propagated attitude back toward it instead of hard-switching.
+        const MainQuaternionSource correctionSource =
+            static_cast<MainQuaternionSource>(data.mainQuaternionSource);
+        if (settings::ahrs::kEnableBnoReferenceCorrection &&
+            (status_ == FlightStatus::Burn || status_ == FlightStatus::Coast) &&
+            data.hasQuaternion &&
+            (correctionSource == MainQuaternionSource::Bno ||
+             correctionSource == MainQuaternionSource::Blended)) {
+            const math_utils::Quaternion referenceQuat = ArrayToQuaternion(data.quaternion);
+            const float blendFactor = settings::ahrs::kBnoReferenceCorrectionBlendFactor *
+                                      std::max(0.0f, data.icmAccelTrust);
+            if (blendFactor > 0.0f) {
+                orientation = math_utils::Slerp(orientation, referenceQuat, blendFactor);
+            }
+        }
+
         previousQuaternion_ = orientation;
     } else if (data.hasQuaternion) {
         orientation = ArrayToQuaternion(data.quaternion);
@@ -165,23 +193,32 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
     kalmanX_.Update(inertialAcceleration.x);
     kalmanY_.Update(inertialAcceleration.y);
     kalmanZ_.Update(static_cast<float>(inertialAcceleration.z),
-                    static_cast<float>(altitudeMeters),
+                    static_cast<float>(relativeAltitudeMeters),
                     static_cast<double>(data.altimeterSigmaScale),
                     static_cast<double>(data.altimeterGateSigma));
 
-    const double posZ = kalmanZ_.Position();
-    const double velZ = kalmanZ_.Velocity();
+    const double rawPosZ = kalmanZ_.Position();
+    const double rawVelZ = kalmanZ_.Velocity();
     const double accX = kalmanX_.Acceleration();
     const double accY = kalmanY_.Acceleration();
     const double accZ = kalmanZ_.Acceleration();
+    double publishedPosZ = rawPosZ;
+    double publishedVelZ = rawVelZ;
 
     if (status_ == FlightStatus::Ground) {
+        const double rawGroundVelocityMps =
+            (dt > 0.0) ? ((relativeAltitudeMeters - lastGroundRelativeAltitudeMeters_) / dt) : 0.0;
+        constexpr double kGroundVelocityBlend = 0.2;
+        groundRelativeVelocityMps_ +=
+            kGroundVelocityBlend * (rawGroundVelocityMps - groundRelativeVelocityMps_);
+        lastGroundRelativeAltitudeMeters_ = relativeAltitudeMeters;
+
         const bool accelerationSuggestsLiftoff =
             accZ > settings::flight::kLiftoffAccelerationThresholdMps2;
         const bool altitudeSuggestsLiftoff =
-            std::fabs(posZ) > settings::flight::kLiftoffAltitudeThresholdM;
+            std::fabs(relativeAltitudeMeters) > settings::flight::kLiftoffAltitudeThresholdM;
         const bool velocitySuggestsLiftoff =
-            velZ > settings::flight::kLiftoffVelocityThresholdMps;
+            groundRelativeVelocityMps_ > settings::flight::kLiftoffVelocityThresholdMps;
 
         if (accelerationSuggestsLiftoff && altitudeSuggestsLiftoff && velocitySuggestsLiftoff) {
             if (liftoffCandidateCount_ < 255) {
@@ -197,6 +234,14 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
             liftoffCandidateCount_ = 0;
             burnoutCandidateCount_ = 0;
             ReportEvent(false, data.timestamp, "Engine burn");
+            groundRelativeVelocityMps_ = 0.0;
+        } else {
+            // Hold the vertical filter at the pad while grounded so z/vz
+            // cannot drift away from zero before liftoff is confirmed.
+            kalmanZ_.Reset();
+            publishedPosZ = 0.0;
+            publishedVelZ = 0.0;
+            smoothedVelocity_[2] = 0.0;
         }
     }
 
@@ -204,8 +249,8 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
         const double timeSinceBurn = static_cast<double>(data.timestamp) - burnTimestamp_;
         const bool afterMinimumBurn = timeSinceBurn >= settings::flight::kBurnoutMinDurationSeconds;
         const bool accelerationSuggestsBurnout = accZ < settings::flight::kBurnoutAccelerationThresholdMps2;
-        const bool stillAscending = velZ > settings::flight::kBurnoutVelocityThresholdMps;
-        const bool belowTarget = posZ < apogeeTargetMeters_;
+        const bool stillAscending = rawVelZ > settings::flight::kBurnoutVelocityThresholdMps;
+        const bool belowTarget = rawPosZ < apogeeTargetMeters_;
 
         if (afterMinimumBurn && accelerationSuggestsBurnout && stillAscending && belowTarget) {
             if (burnoutCandidateCount_ < 255) {
@@ -219,12 +264,15 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
             status_ = FlightStatus::Coast;
             burnoutTimestamp_ = static_cast<double>(data.timestamp);
             burnoutCandidateCount_ = 0;
+            // Initialize wind estimation at coast start.
+            coastStartTime_ = static_cast<double>(data.timestamp);
+            windEstimationActive_ = settings::predictor::kEnableWindEstimation;
             ReportEvent(false, data.timestamp, "Engine burnout");
         }
     }
 
     if (status_ == FlightStatus::Coast) {
-        if (accZ < settings::flight::kBurnoutAccelerationThresholdMps2 && posZ >= apogeeTargetMeters_) {
+        if (accZ < settings::flight::kBurnoutAccelerationThresholdMps2 && rawPosZ >= apogeeTargetMeters_) {
             status_ = FlightStatus::Overshoot;
             ReportEvent(false, data.timestamp, "Overshoot");
         }
@@ -232,9 +280,9 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
 
     if (status_ == FlightStatus::Overshoot || status_ == FlightStatus::Coast) {
         if (accZ < settings::flight::kDescentAccelerationThresholdMps2 &&
-            velZ <= settings::flight::kDescentVelocityThresholdMps) {
+            rawVelZ <= settings::flight::kDescentVelocityThresholdMps) {
             status_ = FlightStatus::Descent;
-            apogeeAltitude_ = posZ;
+            apogeeAltitude_ = rawPosZ;
             apogeeTimestamp_ = static_cast<double>(data.timestamp);
             apogeeRecorded_ = true;
             ReportEvent(true, data.timestamp, "Apogee reached");
@@ -242,7 +290,7 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
     }
 
     const bool shouldPredictApogee =
-        (status_ == FlightStatus::Burn || status_ == FlightStatus::Coast) && velZ > 0.0;
+        (status_ == FlightStatus::Burn || status_ == FlightStatus::Coast) && rawVelZ > 0.0;
     if (shouldPredictApogee) {
         // Deliberately degrade to a simpler predictor seed whenever attitude
         // freshness is questionable rather than integrating unstable XY terms.
@@ -259,12 +307,12 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
                                                  inertialAcceleration.y,
                                                  dt,
                                                  true,
-                                                 velZ,
+                                                 rawVelZ,
                                                  seedZenith)
                 : 0.0;
         const double predictorHorizontalVelocity =
             canUseHorizontalSeed
-                ? ResolvePredictorHorizontalSpeed(trackedHorizontalVelocity, velZ, seedZenith)
+                ? ResolvePredictorHorizontalSpeed(trackedHorizontalVelocity, rawVelZ, seedZenith)
                 : 0.0;
         const double predictorAngularRate =
             canUseHorizontalSeed
@@ -272,12 +320,13 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
                 : 0.0;
 
         ApogeeState predictorState;
-        predictorState.altitudeMeters = posZ;
+        predictorState.altitudeMeters = rawPosZ;
         predictorState.horizontalDistanceMeters = 0.0;
-        predictorState.verticalVelocity = velZ;
+        predictorState.verticalVelocity = rawVelZ;
         predictorState.horizontalVelocity = predictorHorizontalVelocity;
         predictorState.zenith = seedZenith;
         predictorState.angularVelocity = predictorAngularRate;
+        UpdateAdaptiveDragScale(predictorState, accZ, dt);
         lastApogeePrediction_ = apogeePredictor_.PredictApogee(predictorState);
     } else {
         ResetPredictorHorizontalVelocityTracker(predictorHorizontalVelocity_);
@@ -294,7 +343,7 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
     if (!outputFilterInitialized_) {
         smoothedVelocity_[0] = 0.0;
         smoothedVelocity_[1] = 0.0;
-        smoothedVelocity_[2] = velZ;
+        smoothedVelocity_[2] = publishedVelZ;
         smoothedAcceleration_[0] = accX;
         smoothedAcceleration_[1] = accY;
         smoothedAcceleration_[2] = accZ;
@@ -303,7 +352,8 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
         const double maxDv = kMaxOutputAccelMps2 * dt;
         const double targetVx = 0.0;
         const double targetVy = 0.0;
-        const double targetVz = smoothedVelocity_[2] + alphaVel * (velZ - smoothedVelocity_[2]);
+        const double targetVz =
+            smoothedVelocity_[2] + alphaVel * (publishedVelZ - smoothedVelocity_[2]);
         smoothedVelocity_[0] = ApplySlewLimit(smoothedVelocity_[0], targetVx, maxDv);
         smoothedVelocity_[1] = ApplySlewLimit(smoothedVelocity_[1], targetVy, maxDv);
         smoothedVelocity_[2] = ApplySlewLimit(smoothedVelocity_[2], targetVz, maxDv);
@@ -320,7 +370,7 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
     output.time = data.timestamp;
     output.position[0] = static_cast<float>(kPublishedPosX);
     output.position[1] = static_cast<float>(kPublishedPosY);
-    output.position[2] = static_cast<float>(posZ);
+    output.position[2] = static_cast<float>(publishedPosZ);
     output.velocity[0] = static_cast<float>(smoothedVelocity_[0]);
     output.velocity[1] = static_cast<float>(smoothedVelocity_[1]);
     output.velocity[2] = static_cast<float>(smoothedVelocity_[2]);
@@ -338,6 +388,98 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
     return true;
 }
 
+/// Updates the adaptive axial drag correction during coast.
+/// Now supports both legacy single-scale and Mach-dependent adaptation.
+void FlightComputer::UpdateAdaptiveDragScale(const ApogeeState &predictorState,
+                                             double measuredVerticalAcceleration,
+                                             double dtSeconds) {
+    if (status_ != FlightStatus::Coast ||
+        predictorState.verticalVelocity <= 0.0 ||
+        !quaternionValid_ ||
+        !PredictorSeedHasFreshSample(dtSeconds) ||
+        !std::isfinite(measuredVerticalAcceleration) ||
+        !std::isfinite(predictorState.zenith)) {
+        return;
+    }
+
+    double axialModelAcceleration = 0.0;
+    const double predictedVerticalAcceleration =
+        apogeePredictor_.ComputeVerticalAcceleration(predictorState, &axialModelAcceleration);
+    if (!std::isfinite(predictedVerticalAcceleration) || !std::isfinite(axialModelAcceleration)) {
+        return;
+    }
+
+    const double minAxialAccel =
+        static_cast<double>(settings::flight::kAdaptiveAxialAccelMinAbsMps2);
+    if (std::fabs(axialModelAcceleration) < minAxialAccel) {
+        return;
+    }
+
+    const double residualClamp =
+        static_cast<double>(settings::flight::kAdaptiveAxialDragResidualClampMps2);
+    const double residual =
+        std::clamp(measuredVerticalAcceleration - predictedVerticalAcceleration,
+                   -residualClamp,
+                   residualClamp);
+
+    // Compute Mach number for Mach-dependent adaptation.
+    double mach = 0.0;
+    const double temperature = environment_.TemperatureKelvin(predictorState.altitudeMeters);
+    if (temperature > 0.0) {
+        const double speedOfSound = std::sqrt(constants::kGamma * constants::kGasConstant * temperature);
+        const double totalSpeed = std::sqrt(predictorState.verticalVelocity * predictorState.verticalVelocity +
+                                            predictorState.horizontalVelocity * predictorState.horizontalVelocity);
+        if (speedOfSound > 0.0) {
+            mach = totalSpeed / speedOfSound;
+        }
+    }
+
+    // Update Mach-dependent drag scale if enabled.
+    if (settings::predictor::kEnableMachDependentDrag) {
+        apogeePredictor_.AdaptMachDragScale(mach, residual, axialModelAcceleration, dtSeconds);
+    }
+
+    // Legacy single-scale adaptation (still useful as overall bias correction).
+    const double currentScale = apogeePredictor_.AxialDragScale();
+    const double minScale =
+        static_cast<double>(settings::flight::kAdaptiveAxialDragScaleMin);
+    const double maxScale =
+        static_cast<double>(settings::flight::kAdaptiveAxialDragScaleMax);
+    const double targetScale =
+        std::clamp(currentScale + (residual / axialModelAcceleration), minScale, maxScale);
+
+    const double tauSeconds =
+        static_cast<double>(settings::flight::kAdaptiveAxialDragTauSeconds);
+    const double alpha = (dtSeconds > 0.0 && tauSeconds > 0.0)
+                             ? (1.0 - std::exp(-dtSeconds / tauSeconds))
+                             : 0.0;
+    const double updatedScale =
+        std::clamp(currentScale + alpha * (targetScale - currentScale), minScale, maxScale);
+    apogeePredictor_.SetAxialDragScale(updatedScale);
+
+    // Wind estimation: track horizontal acceleration residual.
+    if (settings::predictor::kEnableWindEstimation && windEstimationActive_) {
+        // Horizontal acceleration residual suggests wind offset.
+        // This is a simplified estimation - assumes horizontal accel mismatch is wind-induced.
+        const double timeSinceCoast = lastTimestamp_ - coastStartTime_;
+        if (timeSinceCoast >= settings::predictor::kWindEstimateMinCoastTimeSec) {
+            // Low-pass filter the wind estimate based on horizontal accel.
+            // For simplicity, we estimate wind as affecting the horizontal velocity seed.
+            const double blendRate = settings::predictor::kWindEstimateBlendRate;
+            const double maxWind = settings::predictor::kWindEstimateMaxMps;
+            // Update the environment model's wind offset.
+            math_utils::Vec3 currentOffset = environment_.WindOffset();
+            // Use horizontal accel residual as proxy for wind effect.
+            // This is an approximation - true wind estimation would require more state.
+            const double horizAccelResidual = 0.0;  // Placeholder for future horizontal accel model comparison
+            currentOffset.y = static_cast<float>(std::clamp(
+                static_cast<double>(currentOffset.y) + blendRate * horizAccelResidual,
+                -maxWind, maxWind));
+            environment_.SetWindOffset(currentOffset);
+        }
+    }
+}
+
 /// Resets filters, phase latches, and predictor-side history.
 void FlightComputer::ResetInternalState() {
     kalmanX_.Reset();
@@ -347,6 +489,10 @@ void FlightComputer::ResetInternalState() {
     initialized_ = false;
     zenithRadians_ = 0.0;
     lastZenith_ = 0.0;
+    altitudeReferenceInitialized_ = false;
+    altitudeReferenceMeters_ = 0.0;
+    lastGroundRelativeAltitudeMeters_ = 0.0;
+    groundRelativeVelocityMps_ = 0.0;
     quaternionValid_ = false;
     previousQuaternion_ = math_utils::MakeQuaternion(1.0f, 0.0f, 0.0f, 0.0f);
     lastApogeePrediction_ = 0.0;
@@ -365,6 +511,12 @@ void FlightComputer::ResetInternalState() {
     smoothedAcceleration_[1] = 0.0;
     smoothedAcceleration_[2] = 0.0;
     ResetPredictorHorizontalVelocityTracker(predictorHorizontalVelocity_);
+    apogeePredictor_.ResetAxialDragScale();
+    // Reset wind estimation state.
+    windEstimateHorizontalMps_ = 0.0;
+    coastStartTime_ = 0.0;
+    windEstimationActive_ = false;
+    environment_.SetWindOffset(math_utils::MakeVec3(0.0f, 0.0f, 0.0f));
 }
 
 /// Emits a human-readable flight event to the serial logger.
@@ -382,7 +534,15 @@ void FlightComputer::ReportEvent(bool includeAltitude, float timeSeconds, const 
 }
 
 /// Integrates quaternion attitude one sample forward using gyro data only.
+/// Uses exponential map when enabled for reduced integration error.
 math_utils::Quaternion FlightComputer::TeasleyFilter(const math_utils::Quaternion &quat, const float gyro[3], float dt) {
+    if (settings::ahrs::kEnableExponentialMap) {
+        // Exponential map integration using Rodrigues formula.
+        // More accurate than first-order Euler: reduces O(dt^2) error per step.
+        return math_utils::ExponentialMapUpdate(quat, gyro[0], gyro[1], gyro[2], dt);
+    }
+
+    // Legacy first-order Euler integration.
     const float half_dt = 0.5f * dt;
     const float qw = quat.w;
     const float qx = quat.x;

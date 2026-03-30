@@ -19,7 +19,7 @@ namespace {
 Adafruit_BMP5xx g_pressureSensor;
 
 constexpr uint8_t kChipSelectPin = 35;
-constexpr uint32_t kSampleIntervalUs = 20000UL;
+constexpr uint32_t kSampleIntervalUs = 10000UL;
 
 constexpr float kSeaLevelPressureHpa = settings::sensors::bmp585::kSeaLevelPressureHpa;
 constexpr float kSeaLevelPressureInv = 1.0f / kSeaLevelPressureHpa;
@@ -54,9 +54,9 @@ void UpdateAverage(uint32_t sample, uint32_t &average) {
 /// Applies the BMP585 oversampling/filter/output-rate configuration.
 bool ConfigureSensor() {
     return g_pressureSensor.setTemperatureOversampling(BMP5XX_OVERSAMPLING_2X) &&
-           g_pressureSensor.setPressureOversampling(BMP5XX_OVERSAMPLING_16X) &&
+           g_pressureSensor.setPressureOversampling(BMP5XX_OVERSAMPLING_8X) &&
            g_pressureSensor.setIIRFilterCoeff(BMP5XX_IIR_FILTER_COEFF_3) &&
-           g_pressureSensor.setOutputDataRate(BMP5XX_ODR_50_HZ) &&
+           g_pressureSensor.setOutputDataRate(BMP5XX_ODR_100_2_HZ) &&
            g_pressureSensor.setPowerMode(BMP5XX_POWERMODE_NORMAL);
 }
 

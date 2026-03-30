@@ -1,0 +1,5 @@
+[
+  {"event_type":"stage_change","event_type_raw":0,"flight_status":"ground","flight_status_raw":0,"timestamp":19.165,"altitude_meters":0.000159331,"vertical_velocity":0.0106221,"apogee_estimate":0},
+  {"event_type":"flap_actuated","event_type_raw":1,"flight_status":"ground","flight_status_raw":0,"timestamp":19.165,"altitude_meters":0.000159331,"vertical_velocity":0.0106221,"apogee_estimate":0},
+  {"event_type":"flap_settling_timer_fired","event_type_raw":2,"flight_status":"ground","flight_status_raw":0,"timestamp":19.165,"altitude_meters":0.000159331,"vertical_velocity":0.0106221,"apogee_estimate":0}
+]

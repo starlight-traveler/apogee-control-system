@@ -35,8 +35,58 @@ class EnvironmentModel {
         return (temperatureF - 32.0) / 1.8 + 273.15;
     }
 
+    // Atmospheric pressure at altitude using barometric formula (Pa).
+    double PressurePa(double altitudeMeters) const {
+        if (!settings::predictor::kEnableDensityScaling) {
+            return static_cast<double>(settings::predictor::kSeaLevelPressurePa);
+        }
+        const double T = TemperatureKelvin(altitudeMeters);
+        const double T0 = static_cast<double>(settings::predictor::kSeaLevelTemperatureK);
+        const double P0 = static_cast<double>(settings::predictor::kSeaLevelPressurePa);
+        // Barometric formula: P = P0 * (T / T0)^(g / (L * R))
+        // With g = 9.80665, R = 287.05, L = 0.0065, exponent ≈ 5.2561 for ISA
+        constexpr double kBarometricExponent = 5.2561;
+        if (T <= 0.0 || T0 <= 0.0) {
+            return P0;
+        }
+        return P0 * std::pow(T / T0, kBarometricExponent);
+    }
+
+    // Atmospheric density at altitude using ideal gas law (kg/m³).
+    double DensityKgPerM3(double altitudeMeters) const {
+        if (!settings::predictor::kEnableDensityScaling) {
+            return static_cast<double>(settings::predictor::kReferenceDensityKgPerM3);
+        }
+        const double T = TemperatureKelvin(altitudeMeters);
+        const double P = PressurePa(altitudeMeters);
+        constexpr double kGasConstant = 287.05;  // J/(kg·K) for dry air
+        if (T <= 0.0) {
+            return static_cast<double>(settings::predictor::kReferenceDensityKgPerM3);
+        }
+        return P / (kGasConstant * T);
+    }
+
+    // Density ratio relative to sea-level reference (dimensionless).
+    double DensityRatio(double altitudeMeters) const {
+        const double density = DensityKgPerM3(altitudeMeters);
+        const double refDensity = static_cast<double>(settings::predictor::kReferenceDensityKgPerM3);
+        return (refDensity > 0.0) ? (density / refDensity) : 1.0;
+    }
+
     // Gradient wind experienced above the boundary layer (m/s).
     math_utils::Vec3 GradientWind() const { return gradientWind_; }
+
+    // Runtime-adjustable wind offset for wind estimation feedback.
+    void SetWindOffset(const math_utils::Vec3 &offset) { windOffset_ = offset; }
+    math_utils::Vec3 WindOffset() const { return windOffset_; }
+
+    // Total effective wind including runtime offset.
+    math_utils::Vec3 EffectiveWind() const {
+        return math_utils::MakeVec3(
+            gradientWind_.x + windOffset_.x,
+            gradientWind_.y + windOffset_.y,
+            gradientWind_.z + windOffset_.z);
+    }
 
   private:
     void initialiseWind() {
@@ -72,4 +122,5 @@ class EnvironmentModel {
 
     Config config_;
     math_utils::Vec3 gradientWind_ = math_utils::MakeVec3(0.0f, 0.0f, 0.0f);
+    math_utils::Vec3 windOffset_ = math_utils::MakeVec3(0.0f, 0.0f, 0.0f);
 };

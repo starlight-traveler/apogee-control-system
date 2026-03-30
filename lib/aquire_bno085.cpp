@@ -1,13 +1,14 @@
 #include <Arduino.h>
-#include <Wire.h>
+#include <SPI.h>
 
-#include <Adafruit_BNO08x.h>
-#include <sh2.h>
+#include "SparkFun_BNO080_Arduino_Library.h"
 
 namespace {
 
-constexpr uint8_t kBnoI2cAddress = 0x28;
-Adafruit_BNO08x g_bno(-1);
+constexpr uint8_t kBnoChipSelectPin = 4;
+constexpr uint8_t kBnoInterruptPin = 2;
+constexpr uint8_t kBnoResetPin = 3;
+BNO08x g_bno;
 
 }
 
@@ -18,29 +19,32 @@ void setup() {
     }
 
     Serial.println();
-    Serial.println("BNO085 I2C Example (Teensy)");
+    Serial.println("BNO085 SPI Example (Teensy)");
 
-    Wire.begin();
-    if (!g_bno.begin_I2C(kBnoI2cAddress, &Wire)) {
-        Serial.println("BNO085 not detected. Check wiring/address. Freezing...");
+    SPI.begin();
+    if (!g_bno.beginSPI(kBnoChipSelectPin, kBnoInterruptPin, kBnoResetPin)) {
+        Serial.println("BNO085 not detected. Check wiring/pins. Freezing...");
         while (true) {
         }
     }
 
     delay(10);
-    g_bno.enableReport(SH2_ROTATION_VECTOR, 20000);
+    g_bno.enableRotationVector();
 }
 
 void loop() {
-    sh2_SensorValue_t sensorValue;
-    if (g_bno.getSensorEvent(&sensorValue) && sensorValue.sensorId == SH2_ROTATION_VECTOR) {
-        Serial.print(sensorValue.un.rotationVector.real, 4);
+    if (g_bno.wasReset()) {
+        g_bno.enableRotationVector();
+    }
+
+    if (g_bno.getSensorEvent() && g_bno.getSensorEventID() == SENSOR_REPORTID_ROTATION_VECTOR) {
+        Serial.print(g_bno.getQuatReal(), 4);
         Serial.print(',');
-        Serial.print(sensorValue.un.rotationVector.i, 4);
+        Serial.print(g_bno.getQuatI(), 4);
         Serial.print(',');
-        Serial.print(sensorValue.un.rotationVector.j, 4);
+        Serial.print(g_bno.getQuatJ(), 4);
         Serial.print(',');
-        Serial.println(sensorValue.un.rotationVector.k, 4);
+        Serial.println(g_bno.getQuatK(), 4);
     }
 
     delay(50);
