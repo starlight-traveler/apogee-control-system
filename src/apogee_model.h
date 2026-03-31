@@ -57,7 +57,9 @@ struct MachDependentDragScale {
         return scales[lowerIdx] + t * (scales[upperIdx] - scales[lowerIdx]);
     }
 
-    /// Updates the scale for the bin closest to the given Mach number.
+    /// Updates neighboring bins with distance-weighted contributions.
+    /// This ensures smooth learning across Mach transitions by updating both
+    /// bracketing bins proportionally to their interpolation weights.
     void AdaptScale(float mach, float targetScale, float alpha) {
         if (!settings::predictor::kEnableMachDependentDrag) {
             scales[0] = std::clamp(scales[0] + alpha * (targetScale - scales[0]),
@@ -65,20 +67,42 @@ struct MachDependentDragScale {
                                    settings::predictor::kMachDragScaleMax);
             return;
         }
-        // Find closest bin to adapt
+
         const int binCount = settings::predictor::kMachBinCount;
-        int bestIdx = 0;
-        float bestDist = std::fabs(mach - settings::predictor::kMachBinEdges[0]);
-        for (int i = 1; i < binCount; ++i) {
-            const float dist = std::fabs(mach - settings::predictor::kMachBinEdges[i]);
-            if (dist < bestDist) {
-                bestDist = dist;
-                bestIdx = i;
+
+        // Find bracketing bins (same logic as InterpolateScale)
+        int lowerIdx = 0;
+        for (int i = 0; i < binCount - 1; ++i) {
+            if (mach >= settings::predictor::kMachBinEdges[i]) {
+                lowerIdx = i;
             }
         }
-        scales[bestIdx] = std::clamp(scales[bestIdx] + alpha * (targetScale - scales[bestIdx]),
-                                     settings::predictor::kMachDragScaleMin,
-                                     settings::predictor::kMachDragScaleMax);
+        int upperIdx = std::min(lowerIdx + 1, binCount - 1);
+
+        // Compute interpolation weight
+        const float lowerMach = settings::predictor::kMachBinEdges[lowerIdx];
+        const float upperMach = settings::predictor::kMachBinEdges[upperIdx];
+        const float denom = upperMach - lowerMach;
+
+        if (lowerIdx == upperIdx || denom <= 0.0f) {
+            // Edge case: at or beyond bin boundaries, update single bin
+            scales[lowerIdx] = std::clamp(scales[lowerIdx] + alpha * (targetScale - scales[lowerIdx]),
+                                          settings::predictor::kMachDragScaleMin,
+                                          settings::predictor::kMachDragScaleMax);
+            return;
+        }
+
+        const float t = std::clamp((mach - lowerMach) / denom, 0.0f, 1.0f);
+        const float wLower = 1.0f - t;  // Weight for lower bin
+        const float wUpper = t;          // Weight for upper bin
+
+        // Update both bins proportionally to their interpolation weights
+        scales[lowerIdx] = std::clamp(scales[lowerIdx] + alpha * wLower * (targetScale - scales[lowerIdx]),
+                                      settings::predictor::kMachDragScaleMin,
+                                      settings::predictor::kMachDragScaleMax);
+        scales[upperIdx] = std::clamp(scales[upperIdx] + alpha * wUpper * (targetScale - scales[upperIdx]),
+                                      settings::predictor::kMachDragScaleMin,
+                                      settings::predictor::kMachDragScaleMax);
     }
 
     /// Resets all bins to nominal (1.0).

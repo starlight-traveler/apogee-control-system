@@ -11,6 +11,7 @@
 #include "cfd_table.h"
 #include "constants.h"
 #include "data_logger.h"
+#include "ellipse_20.h"
 #include "flight_computer.h"
 #include "icm20948_sensor.h"
 #include "lsm9ds1_sensor.h"
@@ -39,6 +40,10 @@ constexpr size_t kCsvLineBufferSize = settings::replay::kCsvLineBufferSize;
 constexpr float kBarometerAgreementThresholdFeet = settings::sensors::ms5611::kAgreementThresholdFeet;
 constexpr bool kBnoEnabled = settings::sensors::bno::kEnabled;
 constexpr bool kLsmEnabled = settings::sensors::lsm9ds1::kEnabled;
+constexpr bool kPulseEnabled = settings::sensors::ellipse20::kEnabled;
+constexpr uint32_t kPulseSampleMaxAgeUs = settings::sensors::ellipse20::kSampleMaxAgeUs;
+constexpr bool kPulseUseAsMainQuaternionFallback =
+    settings::sensors::ellipse20::kUseAsMainQuaternionFallback;
 constexpr uint32_t kRecoveryRetryInitialMs = settings::flight::kRecoveryRetryInitialMs;
 constexpr uint32_t kRecoveryRetryStepMs = settings::flight::kRecoveryRetryStepMs;
 constexpr uint32_t kRecoveryRetryMaxMs = settings::flight::kRecoveryRetryMaxMs;
@@ -134,6 +139,13 @@ bool StartBnoDuringSetup() {
         return false;
     }
     return Bno085SensorBegin();
+}
+
+bool StartPulseDuringSetup() {
+    if (!kPulseEnabled) {
+        return false;
+    }
+    return Ellipse20SensorBegin();
 }
 
 bool LoadCfdTableDuringSetup(CfdTableStorage *storage) {
@@ -444,6 +456,7 @@ static bool CsvReplayNextSample(SensorData &data) {
 struct SensorAcquireStats {
     uint32_t loops = 0;
     uint32_t bnoHits = 0;
+    uint32_t pulseHits = 0;
     uint32_t icmHits = 0;
     uint32_t icmFreshHits = 0;
     uint32_t icmCachedHits = 0;
@@ -469,20 +482,27 @@ struct SensorComparisonStats {
     PairStats icmLsm;
     PairStats icmBno;
     PairStats lsmBno;
+    PairStats icmPulse;
+    PairStats lsmPulse;
+    PairStats pulseBno;
 };
 
 static SensorComparisonStats g_sensorComparisonStats;
 static float g_icmLsmCrossCheckTrust = 1.0f;
 static float g_bnoReferenceCrossCheckTrust = 1.0f;
+static float g_pulseCrossCheckTrust = 1.0f;
 static SensorRailHealth g_icmHealth = SensorRailHealth::Unavailable;
 static SensorRailHealth g_lsmHealth = SensorRailHealth::Unavailable;
 static SensorRailHealth g_bnoHealth = SensorRailHealth::Unavailable;
+static SensorRailHealth g_pulseHealth = SensorRailHealth::Unavailable;
 
 // Trust hysteresis state: track previous trust direction to reduce oscillation.
 static float g_icmLsmPreviousTrust = 1.0f;
 static bool g_icmLsmTrustWasDecreasing = false;
 static float g_bnoPreviousTrust = 1.0f;
 static bool g_bnoTrustWasDecreasing = false;
+static float g_pulsePreviousTrust = 1.0f;
+static bool g_pulseTrustWasDecreasing = false;
 
 static float VectorDiffNorm3(const float a[3], const float b[3]) {
     const float dx = a[0] - b[0];
@@ -636,6 +656,39 @@ static float ComputeBnoLsmCrossCheckTrust(const Bno085Sample &bnoData, const Sen
                                   lsmData.icmQuaternion);
 }
 
+static float ComputeIcmPulseCrossCheckTrust(const SensorData &icmData, const SensorData &pulseData) {
+    return ComputeCrossCheckTrust(icmData.accelICM,
+                                  icmData.gyro,
+                                  icmData.hasIcmQuaternion,
+                                  icmData.icmQuaternion,
+                                  pulseData.accelPulse,
+                                  pulseData.gyroPulse,
+                                  pulseData.hasPulseQuaternion,
+                                  pulseData.quaternionPulse);
+}
+
+static float ComputeLsmPulseCrossCheckTrust(const SensorData &lsmData, const SensorData &pulseData) {
+    return ComputeCrossCheckTrust(lsmData.accelICM,
+                                  lsmData.gyro,
+                                  lsmData.hasIcmQuaternion,
+                                  lsmData.icmQuaternion,
+                                  pulseData.accelPulse,
+                                  pulseData.gyroPulse,
+                                  pulseData.hasPulseQuaternion,
+                                  pulseData.quaternionPulse);
+}
+
+static float ComputeBnoPulseCrossCheckTrust(const Bno085Sample &bnoData, const SensorData &pulseData) {
+    return ComputeCrossCheckTrust(bnoData.accel,
+                                  bnoData.gyro,
+                                  bnoData.hasQuaternion,
+                                  bnoData.quaternion,
+                                  pulseData.accelPulse,
+                                  pulseData.gyroPulse,
+                                  pulseData.hasPulseQuaternion,
+                                  pulseData.quaternionPulse);
+}
+
 static void UpdatePairComparisonStats(SensorComparisonStats::PairStats &stats,
                                       const float accelA[3],
                                       const float gyroA[3],
@@ -699,6 +752,19 @@ static void CopyLsmFields(SensorData &dst, const SensorData &src) {
     dst.hasLsmYpr = src.hasIcmYpr;
 }
 
+static void CopyPulseFields(SensorData &dst, const SensorData &src) {
+    for (int i = 0; i < 3; ++i) {
+        dst.accelPulse[i] = src.accelPulse[i];
+        dst.gyroPulse[i] = src.gyroPulse[i];
+        dst.pulseYprDeg[i] = src.pulseYprDeg[i];
+    }
+    for (int i = 0; i < 4; ++i) {
+        dst.quaternionPulse[i] = src.quaternionPulse[i];
+    }
+    dst.hasPulseQuaternion = src.hasPulseQuaternion;
+    dst.hasPulseYpr = src.hasPulseYpr;
+}
+
 static void SetMainQuaternion(SensorData &data, const float quaternion[4], MainQuaternionSource source) {
     for (int i = 0; i < 4; ++i) {
         data.quaternion[i] = quaternion[i];
@@ -715,9 +781,19 @@ static bool AcquireSensorData(SensorData &data) {
     if (g_csvReplay.enabled) {
         return CsvReplayNextSample(data);
     }
+    if (kPulseEnabled) {
+        Ellipse20SensorSetCrossCheckTrust(g_pulseCrossCheckTrust);
+    }
     Icm20948SensorSetCrossCheckTrust(g_icmLsmCrossCheckTrust);
     if (kLsmEnabled) {
         Lsm9ds1SensorSetCrossCheckTrust(g_icmLsmCrossCheckTrust);
+    }
+    SensorData pulseData;
+    const bool hasPulseFresh = kPulseEnabled ? Ellipse20SensorAcquire(pulseData) : false;
+    const Ellipse20Diagnostics pulseDiagnostics =
+        kPulseEnabled ? Ellipse20SensorGetDiagnostics() : Ellipse20Diagnostics{};
+    if (pulseDiagnostics.hasImu || pulseDiagnostics.hasQuaternion || pulseDiagnostics.hasYpr) {
+        CopyPulseFields(data, pulseData);
     }
     const bool hasBnoImu = kBnoEnabled ? Bno085SensorAcquire(data) : false;
     const Bno085Sample bnoData = kBnoEnabled ? Bno085SensorGetSample() : Bno085Sample{};
@@ -736,6 +812,9 @@ static bool AcquireSensorData(SensorData &data) {
     ++g_sensorAcquireStats.loops;
     if (hasBnoImu) {
         ++g_sensorAcquireStats.bnoHits;
+    }
+    if (hasPulseFresh) {
+        ++g_sensorAcquireStats.pulseHits;
     }
     if (hasIcmImu) {
         ++g_sensorAcquireStats.icmHits;
@@ -767,6 +846,9 @@ static bool AcquireSensorData(SensorData &data) {
     }
     bool updatedBnoReferenceTrust = false;
     float bnoReferenceTargetTrust = 1.0f;
+    // Track ICM/LSM trust target - influenced by ICM-LSM comparison AND Pulse comparisons.
+    float icmLsmTargetTrust = 1.0f;
+    bool updatedIcmLsmTrust = false;
     const bool compareIcmLsm =
         hasIcmImu && hasLsmImu &&
         SamplesComparable(comparisonNowUs,
@@ -785,26 +867,8 @@ static bool AcquireSensorData(SensorData &data) {
                                   lsmData.gyro,
                                   lsmData.hasIcmQuaternion,
                                   lsmData.icmQuaternion);
-        const float targetTrust = ComputeIcmLsmCrossCheckTrust(data, lsmData);
-        // Trust hysteresis: reduce blend rate when direction changes.
-        float blendRate = kCrossCheckTrustBlend;
-        if (settings::ahrs::kEnableTrustHysteresis) {
-            const bool isDecreasing = targetTrust < g_icmLsmCrossCheckTrust;
-            if (isDecreasing != g_icmLsmTrustWasDecreasing) {
-                blendRate *= settings::ahrs::kTrustHysteresisReductionFactor;
-            }
-            g_icmLsmTrustWasDecreasing = isDecreasing;
-        }
-        g_icmLsmPreviousTrust = g_icmLsmCrossCheckTrust;
-        g_icmLsmCrossCheckTrust += blendRate * (targetTrust - g_icmLsmCrossCheckTrust);
-    } else {
-        // Trust recovery with hysteresis.
-        float recoveryRate = kCrossCheckTrustRecoveryPerLoop;
-        if (settings::ahrs::kEnableTrustHysteresis && g_icmLsmTrustWasDecreasing) {
-            recoveryRate *= settings::ahrs::kTrustHysteresisReductionFactor;
-        }
-        g_icmLsmTrustWasDecreasing = false;
-        g_icmLsmCrossCheckTrust = std::min(1.0f, g_icmLsmCrossCheckTrust + recoveryRate);
+        icmLsmTargetTrust = std::min(icmLsmTargetTrust, ComputeIcmLsmCrossCheckTrust(data, lsmData));
+        updatedIcmLsmTrust = true;
     }
     const bool compareBnoIcm =
         hasBnoImu && hasIcmImu && bnoData.hasAccel && bnoData.hasGyro &&
@@ -848,6 +912,102 @@ static bool AcquireSensorData(SensorData &data) {
         bnoReferenceTargetTrust = std::min(bnoReferenceTargetTrust, ComputeBnoLsmCrossCheckTrust(bnoData, lsmData));
         updatedBnoReferenceTrust = true;
     }
+    float pulseTargetTrust = 1.0f;
+    bool updatedPulseTrust = false;
+    const bool compareIcmPulse =
+        data.hasIcmQuaternion && data.hasPulseQuaternion &&
+        SamplesComparable(comparisonNowUs,
+                          icmDiagnostics.lastSampleMicros,
+                          kCrossCheckFastSampleMaxAgeUs,
+                          pulseDiagnostics.lastSampleMicros,
+                          kPulseSampleMaxAgeUs,
+                          kCrossCheckBnoPairMaxSkewUs);
+    if (compareIcmPulse) {
+        UpdatePairComparisonStats(g_sensorComparisonStats.icmPulse,
+                                  data.accelICM,
+                                  data.gyro,
+                                  data.hasIcmQuaternion,
+                                  data.icmQuaternion,
+                                  pulseData.accelPulse,
+                                  pulseData.gyroPulse,
+                                  pulseData.hasPulseQuaternion,
+                                  pulseData.quaternionPulse);
+        const float icmPulseTrust = ComputeIcmPulseCrossCheckTrust(data, pulseData);
+        pulseTargetTrust = std::min(pulseTargetTrust, icmPulseTrust);
+        // Bidirectional: Pulse disagreement also affects ICM/LSM trust.
+        icmLsmTargetTrust = std::min(icmLsmTargetTrust, icmPulseTrust);
+        updatedPulseTrust = true;
+        updatedIcmLsmTrust = true;
+    }
+    const bool compareLsmPulse =
+        lsmData.hasIcmQuaternion && data.hasPulseQuaternion &&
+        SamplesComparable(comparisonNowUs,
+                          lsmDiagnostics.lastSampleMicros,
+                          kCrossCheckFastSampleMaxAgeUs,
+                          pulseDiagnostics.lastSampleMicros,
+                          kPulseSampleMaxAgeUs,
+                          kCrossCheckBnoPairMaxSkewUs);
+    if (compareLsmPulse) {
+        UpdatePairComparisonStats(g_sensorComparisonStats.lsmPulse,
+                                  lsmData.accelICM,
+                                  lsmData.gyro,
+                                  lsmData.hasIcmQuaternion,
+                                  lsmData.icmQuaternion,
+                                  pulseData.accelPulse,
+                                  pulseData.gyroPulse,
+                                  pulseData.hasPulseQuaternion,
+                                  pulseData.quaternionPulse);
+        const float lsmPulseTrust = ComputeLsmPulseCrossCheckTrust(lsmData, pulseData);
+        pulseTargetTrust = std::min(pulseTargetTrust, lsmPulseTrust);
+        // Bidirectional: Pulse disagreement also affects ICM/LSM trust.
+        icmLsmTargetTrust = std::min(icmLsmTargetTrust, lsmPulseTrust);
+        updatedPulseTrust = true;
+        updatedIcmLsmTrust = true;
+    }
+    const bool compareBnoPulse =
+        hasBnoImu && bnoData.hasAccel && bnoData.hasGyro && data.hasPulseQuaternion &&
+        SamplesComparable(comparisonNowUs,
+                          bnoData.sampleMicros,
+                          kCrossCheckBnoSampleMaxAgeUs,
+                          pulseDiagnostics.lastSampleMicros,
+                          kPulseSampleMaxAgeUs,
+                          kCrossCheckBnoPairMaxSkewUs);
+    if (compareBnoPulse) {
+        UpdatePairComparisonStats(g_sensorComparisonStats.pulseBno,
+                                  pulseData.accelPulse,
+                                  pulseData.gyroPulse,
+                                  pulseData.hasPulseQuaternion,
+                                  pulseData.quaternionPulse,
+                                  bnoData.accel,
+                                  bnoData.gyro,
+                                  bnoData.hasQuaternion,
+                                  bnoData.quaternion);
+        pulseTargetTrust = std::min(pulseTargetTrust, ComputeBnoPulseCrossCheckTrust(bnoData, pulseData));
+        bnoReferenceTargetTrust = std::min(bnoReferenceTargetTrust, ComputeBnoPulseCrossCheckTrust(bnoData, pulseData));
+        updatedPulseTrust = true;
+        updatedBnoReferenceTrust = true;
+    }
+    // Apply ICM/LSM trust update (now includes bidirectional Pulse cross-checks).
+    if (updatedIcmLsmTrust) {
+        float blendRate = kCrossCheckTrustBlend;
+        if (settings::ahrs::kEnableTrustHysteresis) {
+            const bool isDecreasing = icmLsmTargetTrust < g_icmLsmCrossCheckTrust;
+            if (isDecreasing != g_icmLsmTrustWasDecreasing) {
+                blendRate *= settings::ahrs::kTrustHysteresisReductionFactor;
+            }
+            g_icmLsmTrustWasDecreasing = isDecreasing;
+        }
+        g_icmLsmPreviousTrust = g_icmLsmCrossCheckTrust;
+        g_icmLsmCrossCheckTrust += blendRate * (icmLsmTargetTrust - g_icmLsmCrossCheckTrust);
+    } else {
+        // Trust recovery with hysteresis.
+        float recoveryRate = kCrossCheckTrustRecoveryPerLoop;
+        if (settings::ahrs::kEnableTrustHysteresis && g_icmLsmTrustWasDecreasing) {
+            recoveryRate *= settings::ahrs::kTrustHysteresisReductionFactor;
+        }
+        g_icmLsmTrustWasDecreasing = false;
+        g_icmLsmCrossCheckTrust = std::min(1.0f, g_icmLsmCrossCheckTrust + recoveryRate);
+    }
     if (updatedBnoReferenceTrust) {
         // Trust hysteresis for BNO
         float blendRate = kCrossCheckTrustBlend;
@@ -870,12 +1030,39 @@ static bool AcquireSensorData(SensorData &data) {
         g_bnoReferenceCrossCheckTrust =
             std::min(1.0f, g_bnoReferenceCrossCheckTrust + recoveryRate);
     }
+    if (updatedPulseTrust) {
+        float blendRate = kCrossCheckTrustBlend;
+        if (settings::ahrs::kEnableTrustHysteresis) {
+            const bool isDecreasing = pulseTargetTrust < g_pulseCrossCheckTrust;
+            if (isDecreasing != g_pulseTrustWasDecreasing) {
+                blendRate *= settings::ahrs::kTrustHysteresisReductionFactor;
+            }
+            g_pulseTrustWasDecreasing = isDecreasing;
+        }
+        g_pulsePreviousTrust = g_pulseCrossCheckTrust;
+        g_pulseCrossCheckTrust += blendRate * (pulseTargetTrust - g_pulseCrossCheckTrust);
+    } else {
+        float recoveryRate = kCrossCheckTrustRecoveryPerLoop;
+        if (settings::ahrs::kEnableTrustHysteresis && g_pulseTrustWasDecreasing) {
+            recoveryRate *= settings::ahrs::kTrustHysteresisReductionFactor;
+        }
+        g_pulseTrustWasDecreasing = false;
+        g_pulseCrossCheckTrust = std::min(1.0f, g_pulseCrossCheckTrust + recoveryRate);
+    }
     const bool icmRecent =
         SampleAgeWithinUs(comparisonNowUs, icmDiagnostics.lastSampleMicros, kCrossCheckFastSampleMaxAgeUs);
     const bool lsmRecent =
         SampleAgeWithinUs(comparisonNowUs, lsmDiagnostics.lastSampleMicros, kCrossCheckFastSampleMaxAgeUs);
     const bool bnoRecent =
         SampleAgeWithinUs(comparisonNowUs, bnoData.sampleMicros, kCrossCheckBnoSampleMaxAgeUs);
+    const bool pulseRecent =
+        SampleAgeWithinUs(comparisonNowUs, pulseDiagnostics.lastSampleMicros, kPulseSampleMaxAgeUs);
+    g_pulseHealth = ResolveRailHealth(g_pulseHealth,
+                                      pulseDiagnostics.initialized && pulseDiagnostics.hasImu,
+                                      pulseDiagnostics.alignmentReady && data.hasPulseQuaternion,
+                                      pulseRecent,
+                                      compareIcmPulse || compareLsmPulse || compareBnoPulse,
+                                      g_pulseCrossCheckTrust);
     g_icmHealth = ResolveRailHealth(g_icmHealth,
                                     icmDiagnostics.initialized,
                                     icmDiagnostics.alignmentReady && data.hasIcmQuaternion,
@@ -910,46 +1097,147 @@ static bool AcquireSensorData(SensorData &data) {
         const bool icmHealthy = data.hasIcmQuaternion && g_icmHealth == SensorRailHealth::Healthy;
         const bool lsmHealthy = lsmData.hasIcmQuaternion && g_lsmHealth == SensorRailHealth::Healthy;
         const bool bnoHealthy = data.hasBnoQuaternion && g_bnoHealth == SensorRailHealth::Healthy;
+        const bool pulseHealthy = data.hasPulseQuaternion && g_pulseHealth == SensorRailHealth::Healthy;
         const bool icmUsable = data.hasIcmQuaternion &&
                                g_icmHealth != SensorRailHealth::Unavailable &&
                                g_icmHealth != SensorRailHealth::Stale;
         const bool lsmUsable = lsmData.hasIcmQuaternion &&
                                g_lsmHealth != SensorRailHealth::Unavailable &&
                                g_lsmHealth != SensorRailHealth::Stale;
+        const bool pulseUsable = data.hasPulseQuaternion &&
+                                 g_pulseHealth != SensorRailHealth::Unavailable &&
+                                 g_pulseHealth != SensorRailHealth::Stale;
 
-        const float *fastQuaternion = nullptr;
-        MainQuaternionSource fastSource = MainQuaternionSource::None;
-        if (icmHealthy) {
-            fastQuaternion = data.icmQuaternion;
-            fastSource = MainQuaternionSource::Icm;
+        // Multi-source weighted blending: Pulse is primary (highest quality),
+        // with optional blending from ICM/LSM when healthy, scaled by trust.
+        // Weight assignments: Pulse gets base weight 1.0, others get scaled by their trust.
+        constexpr float kPulseBaseWeight = 1.0f;
+        constexpr float kSecondaryBlendScale = 0.3f;  // How much to blend in secondary sources.
+
+        math_utils::Quaternion blendedQuat = {1.0f, 0.0f, 0.0f, 0.0f};
+        float totalWeight = 0.0f;
+        MainQuaternionSource primarySource = MainQuaternionSource::None;
+        bool hasBlendedMultiple = false;
+
+        // Start with the highest-quality healthy source as primary.
+        if (pulseHealthy) {
+            blendedQuat = math_utils::Normalize(math_utils::MakeQuaternion(
+                data.quaternionPulse[0], data.quaternionPulse[1],
+                data.quaternionPulse[2], data.quaternionPulse[3]));
+            totalWeight = kPulseBaseWeight * g_pulseCrossCheckTrust;
+            primarySource = MainQuaternionSource::Pulse;
+
+            // Blend in ICM if healthy and agreeing (high trust).
+            if (icmHealthy && g_icmLsmCrossCheckTrust >= settings::ahrs::kMinBlendTrust) {
+                math_utils::Quaternion icmQuat = math_utils::Normalize(math_utils::MakeQuaternion(
+                    data.icmQuaternion[0], data.icmQuaternion[1],
+                    data.icmQuaternion[2], data.icmQuaternion[3]));
+                const float icmWeight = kSecondaryBlendScale * g_icmLsmCrossCheckTrust;
+                const float blendFactor = icmWeight / (totalWeight + icmWeight);
+                blendedQuat = math_utils::Slerp(blendedQuat, icmQuat, blendFactor);
+                totalWeight += icmWeight;
+                hasBlendedMultiple = true;
+            }
+            // Blend in LSM if healthy and agreeing (high trust).
+            if (lsmHealthy && g_icmLsmCrossCheckTrust >= settings::ahrs::kMinBlendTrust) {
+                math_utils::Quaternion lsmQuat = math_utils::Normalize(math_utils::MakeQuaternion(
+                    lsmData.icmQuaternion[0], lsmData.icmQuaternion[1],
+                    lsmData.icmQuaternion[2], lsmData.icmQuaternion[3]));
+                const float lsmWeight = kSecondaryBlendScale * g_icmLsmCrossCheckTrust;
+                const float blendFactor = lsmWeight / (totalWeight + lsmWeight);
+                blendedQuat = math_utils::Slerp(blendedQuat, lsmQuat, blendFactor);
+                totalWeight += lsmWeight;
+                hasBlendedMultiple = true;
+            }
+        } else if (icmHealthy) {
+            blendedQuat = math_utils::Normalize(math_utils::MakeQuaternion(
+                data.icmQuaternion[0], data.icmQuaternion[1],
+                data.icmQuaternion[2], data.icmQuaternion[3]));
+            totalWeight = g_icmLsmCrossCheckTrust;
+            primarySource = MainQuaternionSource::Icm;
+
+            // Blend in LSM if healthy.
+            if (lsmHealthy && g_icmLsmCrossCheckTrust >= settings::ahrs::kMinBlendTrust) {
+                math_utils::Quaternion lsmQuat = math_utils::Normalize(math_utils::MakeQuaternion(
+                    lsmData.icmQuaternion[0], lsmData.icmQuaternion[1],
+                    lsmData.icmQuaternion[2], lsmData.icmQuaternion[3]));
+                const float lsmWeight = g_icmLsmCrossCheckTrust;
+                const float blendFactor = lsmWeight / (totalWeight + lsmWeight);
+                blendedQuat = math_utils::Slerp(blendedQuat, lsmQuat, blendFactor);
+                totalWeight += lsmWeight;
+                hasBlendedMultiple = true;
+            }
+            // Blend in Pulse if usable (not healthy, but still valid).
+            if (pulseUsable && g_pulseCrossCheckTrust >= settings::ahrs::kMinBlendTrust) {
+                math_utils::Quaternion pulseQuat = math_utils::Normalize(math_utils::MakeQuaternion(
+                    data.quaternionPulse[0], data.quaternionPulse[1],
+                    data.quaternionPulse[2], data.quaternionPulse[3]));
+                const float pulseWeight = kSecondaryBlendScale * g_pulseCrossCheckTrust;
+                const float blendFactor = pulseWeight / (totalWeight + pulseWeight);
+                blendedQuat = math_utils::Slerp(blendedQuat, pulseQuat, blendFactor);
+                totalWeight += pulseWeight;
+                hasBlendedMultiple = true;
+            }
         } else if (lsmHealthy) {
-            fastQuaternion = lsmData.icmQuaternion;
-            fastSource = MainQuaternionSource::Lsm;
+            blendedQuat = math_utils::Normalize(math_utils::MakeQuaternion(
+                lsmData.icmQuaternion[0], lsmData.icmQuaternion[1],
+                lsmData.icmQuaternion[2], lsmData.icmQuaternion[3]));
+            totalWeight = g_icmLsmCrossCheckTrust;
+            primarySource = MainQuaternionSource::Lsm;
+
+            // Blend in Pulse if usable.
+            if (pulseUsable && g_pulseCrossCheckTrust >= settings::ahrs::kMinBlendTrust) {
+                math_utils::Quaternion pulseQuat = math_utils::Normalize(math_utils::MakeQuaternion(
+                    data.quaternionPulse[0], data.quaternionPulse[1],
+                    data.quaternionPulse[2], data.quaternionPulse[3]));
+                const float pulseWeight = kSecondaryBlendScale * g_pulseCrossCheckTrust;
+                const float blendFactor = pulseWeight / (totalWeight + pulseWeight);
+                blendedQuat = math_utils::Slerp(blendedQuat, pulseQuat, blendFactor);
+                totalWeight += pulseWeight;
+                hasBlendedMultiple = true;
+            }
+        } else if (pulseUsable) {
+            blendedQuat = math_utils::Normalize(math_utils::MakeQuaternion(
+                data.quaternionPulse[0], data.quaternionPulse[1],
+                data.quaternionPulse[2], data.quaternionPulse[3]));
+            totalWeight = g_pulseCrossCheckTrust;
+            primarySource = MainQuaternionSource::Pulse;
         } else if (icmUsable) {
-            fastQuaternion = data.icmQuaternion;
-            fastSource = MainQuaternionSource::Icm;
+            blendedQuat = math_utils::Normalize(math_utils::MakeQuaternion(
+                data.icmQuaternion[0], data.icmQuaternion[1],
+                data.icmQuaternion[2], data.icmQuaternion[3]));
+            totalWeight = g_icmLsmCrossCheckTrust;
+            primarySource = MainQuaternionSource::Icm;
         } else if (lsmUsable) {
-            fastQuaternion = lsmData.icmQuaternion;
-            fastSource = MainQuaternionSource::Lsm;
+            blendedQuat = math_utils::Normalize(math_utils::MakeQuaternion(
+                lsmData.icmQuaternion[0], lsmData.icmQuaternion[1],
+                lsmData.icmQuaternion[2], lsmData.icmQuaternion[3]));
+            totalWeight = g_icmLsmCrossCheckTrust;
+            primarySource = MainQuaternionSource::Lsm;
         }
 
-        if (fastQuaternion != nullptr && bnoHealthy) {
-            math_utils::Quaternion fastQuat = math_utils::Normalize(math_utils::MakeQuaternion(
-                fastQuaternion[0], fastQuaternion[1], fastQuaternion[2], fastQuaternion[3]));
+        const bool hasFastQuaternion = totalWeight > 0.0f;
+
+        if (hasFastQuaternion && bnoHealthy) {
             math_utils::Quaternion bnoQuat = math_utils::Normalize(math_utils::MakeQuaternion(
                 data.quaternionBNO[0], data.quaternionBNO[1], data.quaternionBNO[2], data.quaternionBNO[3]));
             const float correctionBlend =
                 std::clamp(kBnoReferenceCorrectionBlendFactor * g_bnoReferenceCrossCheckTrust, 0.0f, 1.0f);
             const math_utils::Quaternion corrected =
-                math_utils::Slerp(fastQuat, bnoQuat, correctionBlend);
+                math_utils::Slerp(blendedQuat, bnoQuat, correctionBlend);
             const float correctedQuat[4] = {corrected.w, corrected.x, corrected.y, corrected.z};
-            SetMainQuaternion(data,
-                              correctedQuat,
-                              correctionBlend > 0.0f ? MainQuaternionSource::Blended : fastSource);
-        } else if (fastQuaternion != nullptr) {
-            SetMainQuaternion(data, fastQuaternion, fastSource);
+            const MainQuaternionSource finalSource =
+                (hasBlendedMultiple || correctionBlend > 0.0f) ? MainQuaternionSource::Blended : primarySource;
+            SetMainQuaternion(data, correctedQuat, finalSource);
+        } else if (hasFastQuaternion) {
+            const float finalQuat[4] = {blendedQuat.w, blendedQuat.x, blendedQuat.y, blendedQuat.z};
+            const MainQuaternionSource finalSource =
+                hasBlendedMultiple ? MainQuaternionSource::Blended : primarySource;
+            SetMainQuaternion(data, finalQuat, finalSource);
         } else if (bnoHealthy) {
             SetMainQuaternion(data, data.quaternionBNO, MainQuaternionSource::Bno);
+        } else if (pulseUsable) {
+            SetMainQuaternion(data, data.quaternionPulse, MainQuaternionSource::Pulse);
         } else if (icmUsable) {
             SetMainQuaternion(data, data.icmQuaternion, MainQuaternionSource::Icm);
         } else if (lsmUsable) {
@@ -957,8 +1245,15 @@ static bool AcquireSensorData(SensorData &data) {
         } else if (data.hasBnoQuaternion) {
             SetMainQuaternion(data, data.quaternionBNO, MainQuaternionSource::Bno);
         }
-    } else if (!data.hasQuaternion && data.hasIcmQuaternion) {
-        if (g_icmHealth != SensorRailHealth::Unavailable && g_icmHealth != SensorRailHealth::Stale) {
+    } else if (!data.hasQuaternion) {
+        // Fallback priority: Pulse → ICM → LSM
+        if (data.hasPulseQuaternion &&
+            g_pulseHealth != SensorRailHealth::Unavailable &&
+            g_pulseHealth != SensorRailHealth::Stale) {
+            SetMainQuaternion(data, data.quaternionPulse, MainQuaternionSource::Pulse);
+        } else if (data.hasIcmQuaternion &&
+                   g_icmHealth != SensorRailHealth::Unavailable &&
+                   g_icmHealth != SensorRailHealth::Stale) {
             SetMainQuaternion(data, data.icmQuaternion, MainQuaternionSource::Icm);
         } else if (lsmData.hasIcmQuaternion &&
                    g_lsmHealth != SensorRailHealth::Unavailable &&
@@ -966,13 +1261,21 @@ static bool AcquireSensorData(SensorData &data) {
             SetMainQuaternion(data, lsmData.icmQuaternion, MainQuaternionSource::Lsm);
         }
     }
+    if (!data.hasQuaternion &&
+        kPulseUseAsMainQuaternionFallback &&
+        data.hasPulseQuaternion &&
+        g_pulseHealth != SensorRailHealth::Unavailable &&
+        g_pulseHealth != SensorRailHealth::Stale) {
+        SetMainQuaternion(data, data.quaternionPulse, MainQuaternionSource::Pulse);
+    }
     const bool hasAltimeter = Bmp585SensorAcquire(data);
     if (hasAltimeter) {
         ++g_sensorAcquireStats.bmpHits;
     }
     // Secondary barometer disabled for now.
     // const bool hasMs5611 = Ms5611SensorAcquire();
-    const bool hasSensorData = hasBnoImu || hasIcmImu || hasLsmImu || hasAltimeter;
+    const bool hasSensorData =
+        hasBnoImu || hasPulseFresh || hasIcmImu || hasLsmImu || hasAltimeter || pulseRecent;
     if (!hasSensorData) {
         ++g_sensorAcquireStats.noDataLoops;
     }
@@ -1096,6 +1399,7 @@ static void LogTimingDiagnostics(uint32_t nowMs) {
     const Bno085Diagnostics bno = kBnoEnabled ? Bno085SensorGetDiagnostics() : Bno085Diagnostics{};
     const Icm20948Diagnostics icm = Icm20948SensorGetDiagnostics();
     const Lsm9ds1Diagnostics lsm = kLsmEnabled ? Lsm9ds1SensorGetDiagnostics() : Lsm9ds1Diagnostics{};
+    const Ellipse20Diagnostics pulse = kPulseEnabled ? Ellipse20SensorGetDiagnostics() : Ellipse20Diagnostics{};
     LOG_PRINT("[timing] loop_us=");
     LOG_PRINT(g_timingStats.maxLoopUs);
     LOG_PRINT(" sensor_us=");
@@ -1140,6 +1444,14 @@ static void LogTimingDiagnostics(uint32_t nowMs) {
     LOG_PRINT(lsm.hasGyro ? 'g' : '-');
     LOG_PRINT(')');
     LOG_PRINT('/');
+    LOG_PRINT(pulse.initialized ? "pulse" : "-");
+    LOG_PRINT('(');
+    LOG_PRINT(pulse.alignmentReady ? 'q' : '-');
+    LOG_PRINT(pulse.lastAcquireFresh ? 'f' : (pulse.lastAcquireUsedCache ? 'c' : '-'));
+    LOG_PRINT(pulse.hasImu ? 'i' : '-');
+    LOG_PRINT(pulse.hasMag ? 'm' : '-');
+    LOG_PRINT(')');
+    LOG_PRINT('/');
     LOG_PRINT(Bmp585SensorIsInitialized() ? "bmp" : "-");
     LOG_PRINT(" acq=");
     LOG_PRINT("b:");
@@ -1155,6 +1467,10 @@ static void LogTimingDiagnostics(uint32_t nowMs) {
     LOG_PRINT(" c");
     LOG_PRINT(g_sensorAcquireStats.icmCachedHits);
     LOG_PRINT(")");
+    LOG_PRINT(" u:");
+    LOG_PRINT(g_sensorAcquireStats.pulseHits);
+    LOG_PRINT('/');
+    LOG_PRINT(g_sensorAcquireStats.loops);
     LOG_PRINT(" l:");
     LOG_PRINT(g_sensorAcquireStats.lsmHits);
     LOG_PRINT('/');
@@ -1180,34 +1496,62 @@ static void LogTimingDiagnostics(uint32_t nowMs) {
     LOG_PRINT(g_sensorComparisonStats.icmBno.samples);
     LOG_PRINT(" lb=");
     LOG_PRINT(g_sensorComparisonStats.lsmBno.samples);
+    LOG_PRINT(" ip=");
+    LOG_PRINT(g_sensorComparisonStats.icmPulse.samples);
+    LOG_PRINT(" lp=");
+    LOG_PRINT(g_sensorComparisonStats.lsmPulse.samples);
+    LOG_PRINT(" pb=");
+    LOG_PRINT(g_sensorComparisonStats.pulseBno.samples);
     LOG_PRINT(" q=");
     LOG_PRINT(g_sensorComparisonStats.icmLsm.maxQuaternionAngleDeg, 1);
     LOG_PRINT("/");
     LOG_PRINT(g_sensorComparisonStats.icmBno.maxQuaternionAngleDeg, 1);
     LOG_PRINT("/");
     LOG_PRINT(g_sensorComparisonStats.lsmBno.maxQuaternionAngleDeg, 1);
+    LOG_PRINT("/");
+    LOG_PRINT(g_sensorComparisonStats.icmPulse.maxQuaternionAngleDeg, 1);
+    LOG_PRINT("/");
+    LOG_PRINT(g_sensorComparisonStats.lsmPulse.maxQuaternionAngleDeg, 1);
+    LOG_PRINT("/");
+    LOG_PRINT(g_sensorComparisonStats.pulseBno.maxQuaternionAngleDeg, 1);
     LOG_PRINT(" a=");
     LOG_PRINT(g_sensorComparisonStats.icmLsm.maxAccelDiffMps2, 2);
     LOG_PRINT("/");
     LOG_PRINT(g_sensorComparisonStats.icmBno.maxAccelDiffMps2, 2);
     LOG_PRINT("/");
     LOG_PRINT(g_sensorComparisonStats.lsmBno.maxAccelDiffMps2, 2);
+    LOG_PRINT("/");
+    LOG_PRINT(g_sensorComparisonStats.icmPulse.maxAccelDiffMps2, 2);
+    LOG_PRINT("/");
+    LOG_PRINT(g_sensorComparisonStats.lsmPulse.maxAccelDiffMps2, 2);
+    LOG_PRINT("/");
+    LOG_PRINT(g_sensorComparisonStats.pulseBno.maxAccelDiffMps2, 2);
     LOG_PRINT(" g=");
     LOG_PRINT(g_sensorComparisonStats.icmLsm.maxGyroDiffRadPerSec, 2);
     LOG_PRINT("/");
     LOG_PRINT(g_sensorComparisonStats.icmBno.maxGyroDiffRadPerSec, 2);
     LOG_PRINT("/");
     LOG_PRINT(g_sensorComparisonStats.lsmBno.maxGyroDiffRadPerSec, 2);
+    LOG_PRINT("/");
+    LOG_PRINT(g_sensorComparisonStats.icmPulse.maxGyroDiffRadPerSec, 2);
+    LOG_PRINT("/");
+    LOG_PRINT(g_sensorComparisonStats.lsmPulse.maxGyroDiffRadPerSec, 2);
+    LOG_PRINT("/");
+    LOG_PRINT(g_sensorComparisonStats.pulseBno.maxGyroDiffRadPerSec, 2);
     LOG_PRINT(" h=");
     LOG_PRINT(HealthCode(g_icmHealth));
     LOG_PRINT("/");
     LOG_PRINT(HealthCode(g_lsmHealth));
     LOG_PRINT("/");
     LOG_PRINT(HealthCode(g_bnoHealth));
+    LOG_PRINT("/");
+    LOG_PRINT(HealthCode(g_pulseHealth));
     LOG_PRINT(" t=");
     LOG_PRINT(g_icmLsmCrossCheckTrust, 2);
     LOG_PRINT("/");
     LOG_PRINT(g_bnoReferenceCrossCheckTrust, 2);
+    LOG_PRINT("/");
+    LOG_PRINT(g_pulseCrossCheckTrust, 2);
     LOG_PRINT(" logger=");
     LOG_PRINT(logger.initialized ? "ok" : "down");
     LOG_PRINTLN("");
@@ -1664,6 +2008,14 @@ void setup() {
             LogSetupCheckpoint("BNO disabled");
         }
 
+        if (kPulseEnabled) {
+            LogSetupCheckpoint("starting Pulse20 init");
+            StartPulseDuringSetup();
+            LogSetupCheckpoint(Ellipse20SensorIsInitialized() ? "Pulse20 init complete" : "Pulse20 unavailable");
+        } else {
+            LogSetupCheckpoint("Pulse20 disabled");
+        }
+
         LogSetupCheckpoint("starting ICM-20948 init");
         ServiceRetry(millis(), g_icmRetry, Icm20948SensorIsInitialized(), &Icm20948SensorBegin, "icm20948");
         LogSetupCheckpoint(Icm20948SensorIsInitialized() ? "ICM-20948 init complete" : "ICM-20948 unavailable");
@@ -1790,6 +2142,9 @@ void loop() {
     Icm20948SensorSetFlightStatus(flightComputer.Status());
     if (kLsmEnabled) {
         Lsm9ds1SensorSetFlightStatus(flightComputer.Status());
+    }
+    if (kPulseEnabled) {
+        Ellipse20SensorSetFlightStatus(flightComputer.Status());
     }
 
     if (g_servoCycleTestMode) {

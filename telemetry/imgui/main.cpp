@@ -57,6 +57,8 @@ const char *MainQuaternionSourceName(uint8_t value) {
             return "LSM";
         case 4:
             return "Blended";
+        case 5:
+            return "Pulse";
         default:
             return "None";
     }

@@ -67,10 +67,12 @@ class EnvironmentModel {
     }
 
     // Density ratio relative to sea-level reference (dimensionless).
+    // Applies pre-flight calibration correction if CalibrateFromMeasurements() was called.
     double DensityRatio(double altitudeMeters) const {
         const double density = DensityKgPerM3(altitudeMeters);
         const double refDensity = static_cast<double>(settings::predictor::kReferenceDensityKgPerM3);
-        return (refDensity > 0.0) ? (density / refDensity) : 1.0;
+        const double ratio = (refDensity > 0.0) ? (density / refDensity) : 1.0;
+        return ratio * static_cast<double>(densityCorrection_);
     }
 
     // Gradient wind experienced above the boundary layer (m/s).
@@ -87,6 +89,27 @@ class EnvironmentModel {
             gradientWind_.y + windOffset_.y,
             gradientWind_.z + windOffset_.z);
     }
+
+    // Pre-flight density calibration using actual barometer/temperature readings.
+    // Call this on the pad before launch to correct ISA model assumptions.
+    void CalibrateFromMeasurements(float measuredPressurePa, float measuredTemperatureK,
+                                   float currentAltitudeMeters) {
+        constexpr float kGasConstant = 287.05f;
+        if (measuredTemperatureK <= 0.0f) {
+            return;
+        }
+        const float actualDensity = measuredPressurePa / (kGasConstant * measuredTemperatureK);
+        const float modelDensity = static_cast<float>(DensityKgPerM3(currentAltitudeMeters));
+        if (modelDensity > 0.0f && actualDensity > 0.0f) {
+            densityCorrection_ = actualDensity / modelDensity;
+        }
+    }
+
+    // Returns the current density correction factor (1.0 = uncalibrated).
+    float DensityCorrection() const { return densityCorrection_; }
+
+    // Resets density calibration to nominal ISA model.
+    void ResetDensityCalibration() { densityCorrection_ = 1.0f; }
 
   private:
     void initialiseWind() {
@@ -123,4 +146,5 @@ class EnvironmentModel {
     Config config_;
     math_utils::Vec3 gradientWind_ = math_utils::MakeVec3(0.0f, 0.0f, 0.0f);
     math_utils::Vec3 windOffset_ = math_utils::MakeVec3(0.0f, 0.0f, 0.0f);
+    float densityCorrection_ = 1.0f;  // Pre-flight calibration factor (1.0 = ISA model)
 };

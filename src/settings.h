@@ -99,7 +99,7 @@ namespace actuation {
 constexpr float kServoMaxActuationDeg = 45.0f;
 constexpr int kServoAttachMinPulseUs = 400;
 constexpr int kServoAttachMaxPulseUs = 2700;
-constexpr int kTopServoClosedPwmUs = 1150;
+constexpr int kTopServoClosedPwmUs = 1135;
 constexpr int kTopServoOpenPwmUs = 1744;
 constexpr int kBottomServoClosedPwmUs = 2169;
 constexpr int kBottomServoOpenPwmUs = 1585;
@@ -349,6 +349,83 @@ constexpr uint32_t kSampleIntervalUs = 10000;
 constexpr uint32_t kDataTimeoutUs = 250000;
 }
 
+namespace ellipse20 {
+// Enable the SBG Pulse 20 sidecar rail. Disabled by default until a serial
+// port and pins are assigned on the target build.
+constexpr bool kEnabled = false;
+// Teensy HardwareSerial instance index: 1 -> Serial1, 2 -> Serial2, etc.
+constexpr uint8_t kSerialPortIndex = 2;
+// Optional explicit RX/TX remap pins for Teensy serial ports. Leave -1 to use
+// the port defaults.
+constexpr int8_t kRxPin = -1;
+constexpr int8_t kTxPin = -1;
+// Pulse 20 example configuration uses 921600 baud.
+constexpr uint32_t kBaudRate = 921600;
+// Drain up to this many SBG frames per acquire call to keep the rail current
+// without letting the serial sidecar monopolize the hot loop.
+constexpr uint8_t kHandleBudgetPerAcquire = 8;
+// Consider cached Pulse data stale after this long without a fresh frame.
+constexpr uint32_t kSampleMaxAgeUs = 100000;
+// One-shot output configuration sent during startup. Pulse 20 is treated as a
+// raw IMU rail here, so only IMU and MAG logs are required.
+constexpr uint16_t kImuOutputMode = 1;  // MAIN_LOOP (200 Hz)
+constexpr uint16_t kMagOutputMode = 4;  // DIV_4 (50 Hz)
+// Allow the Pulse quaternion to seed the main quaternion only when the fast
+// rails don't currently have a usable solution.
+constexpr bool kUseAsMainQuaternionFallback = true;
+// Phase-aware quaternion observer settings, aligned with the ICM/LSM paths.
+constexpr float kMagDeclinationDeg = -14.84f;
+constexpr float kAccelCorrectionGainGround = 18.0f;
+constexpr float kAccelCorrectionGainDescent = 9.0f;
+constexpr float kMagCorrectionGainGround = 7.0f;
+constexpr float kMagCorrectionGainFlight = 2.4f;
+constexpr float kMagCorrectionGainDescent = 5.0f;
+constexpr float kMagTrustGround = 1.0f;
+constexpr float kMagTrustBurn = 0.0f;
+constexpr float kMagTrustCoast = 0.35f;
+constexpr float kMagTrustOvershoot = 0.45f;
+constexpr float kMagTrustDescent = 0.8f;
+constexpr float kMagTrustGyroFadeStartRadPerSec = 0.6f;
+constexpr float kMagTrustGyroFadeEndRadPerSec = 4.0f;
+constexpr float kGyroBiasLearningRate = 0.08f;
+constexpr float kGyroBiasMaxRadPerSec = 0.35f;
+constexpr float kStationaryGyroMaxRadPerSec = 0.35f;
+constexpr float kGyroReferenceTemperatureC = 21.0f;
+constexpr float kGyroTempBiasSlopeRadPerSecPerC[3] = {0.0f, 0.0f, 0.0f};
+constexpr uint16_t kGroundAlignmentMinSamples = 40;
+constexpr float kGroundAlignmentAccelTrustMin = 0.75f;
+constexpr float kGroundAlignmentMagTrustMin = 0.20f;
+constexpr float kAccelCorrectionMinG = 0.8f;
+constexpr float kAccelCorrectionMaxG = 1.2f;
+constexpr float kAccelCorrectionGyroFadeStartRadPerSec = 0.4f;
+constexpr float kAccelCorrectionGyroFadeEndRadPerSec = 3.0f;
+constexpr float kMagCorrectionMaxRelativeError = 0.35f;
+constexpr float kMagReferenceBlend = 0.02f;
+constexpr float kAccelCorrectionMaxRateRadPerSec = 6.0f;
+constexpr float kMagCorrectionMaxRateRadPerSec = 2.5f;
+constexpr float kTotalCorrectionMaxRateRadPerSec = 7.0f;
+// Calibration terms work directly in the engineering units published by the
+// Pulse 20 logs: m/s^2, rad/s, and magnetometer arbitrary units.
+constexpr float kGyroOffset[3] = {0.0f, 0.0f, 0.0f};
+constexpr float kAccelBias[3] = {0.0f, 0.0f, 0.0f};
+constexpr float kAccelAinv[3][3] = {
+    {1.0f, 0.0f, 0.0f},
+    {0.0f, 1.0f, 0.0f},
+    {0.0f, 0.0f, 1.0f},
+};
+constexpr float kMountRotation[3][3] = {
+    {1.0f, 0.0f, 0.0f},
+    {0.0f, 1.0f, 0.0f},
+    {0.0f, 0.0f, 1.0f},
+};
+constexpr float kMagBias[3] = {0.0f, 0.0f, 0.0f};
+constexpr float kMagAinv[3][3] = {
+    {1.0f, 0.0f, 0.0f},
+    {0.0f, 1.0f, 0.0f},
+    {0.0f, 0.0f, 1.0f},
+};
+}
+
 namespace bmp585 {
 // Pressure reference used by barometric altitude conversion.
 constexpr float kSeaLevelPressureHpa = 1032.2f;
@@ -441,6 +518,7 @@ constexpr float kMagReferenceBlend = 0.02f;
 constexpr float kAccelCorrectionMaxRateRadPerSec = 6.0f;
 constexpr float kMagCorrectionMaxRateRadPerSec = 2.5f;
 constexpr float kTotalCorrectionMaxRateRadPerSec = 7.0f;
+
 constexpr float kGyroOffset[3] = {0.0f, 0.0f, 0.0f};
 constexpr float kAccelBias[3] = {0.0f, 0.0f, 0.0f};
 constexpr float kAccelAinv[3][3] = {

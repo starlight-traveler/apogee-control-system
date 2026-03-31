@@ -16,6 +16,7 @@ enum class MainQuaternionSource : uint8_t {
     Icm = 2,
     Lsm = 3,
     Blended = 4,
+    Pulse = 5,
 };
 
 struct SensorData {
@@ -33,6 +34,10 @@ struct SensorData {
     float gyroLSM[3] = {0.0f, 0.0f, 0.0f};
     float quaternionLSM[4] = {1.0f, 0.0f, 0.0f, 0.0f};
     float lsmYprDeg[3] = {0.0f, 0.0f, 0.0f};
+    float accelPulse[3] = {0.0f, 0.0f, 0.0f};
+    float gyroPulse[3] = {0.0f, 0.0f, 0.0f};
+    float quaternionPulse[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+    float pulseYprDeg[3] = {0.0f, 0.0f, 0.0f};
     float icmTemperatureC = 0.0f;
     float icmAhrsDt = 0.0f;
     float icmAccelTrust = 0.0f;
@@ -56,6 +61,8 @@ struct SensorData {
     bool hasIcmYpr = false;
     bool hasLsmQuaternion = false;
     bool hasLsmYpr = false;
+    bool hasPulseQuaternion = false;
+    bool hasPulseYpr = false;
     bool icmAccelSaturated = false;
     bool icmGyroSaturated = false;
     bool icmRailConstrained = false;

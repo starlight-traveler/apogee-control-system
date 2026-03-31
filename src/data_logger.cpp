@@ -33,7 +33,7 @@ constexpr uint32_t kHardFlushIntervalMicros = kFlushIntervalMicros * 4u;
 constexpr const char *kLogPrefix = "SENS";
 constexpr const char *kLogExtension = "BIN";
 constexpr uint16_t kLogFileFormatVersion = 1;
-constexpr uint16_t kLogSchemaVersion = 6;
+constexpr uint16_t kLogSchemaVersion = 7;
 constexpr uint8_t kLogMagic[8] = {'A', 'C', 'S', 'N', 'D', 'R', 'T', '1'};
 
 #if defined(ACS_FIRMWARE_GIT_HASH)
@@ -45,9 +45,9 @@ constexpr const char *kFirmwareGitHash = "unknown";
 // These static asserts are the first line of defense for the binary schema.
 // If any of them changes, the decoder table in tools/decode/native must be
 // updated in lockstep before new logs are trusted.
-static_assert(sizeof(SensorData) == 252, "SensorData size mismatch.");
+static_assert(sizeof(SensorData) == 304, "SensorData size mismatch.");
 static_assert(sizeof(FilteredState) == 60, "FilteredState size mismatch.");
-static_assert(sizeof(TelemetryLogRecord) == 316, "TelemetryLogRecord size mismatch.");
+static_assert(sizeof(TelemetryLogRecord) == 368, "TelemetryLogRecord size mismatch.");
 static_assert(sizeof(EventLogRecord) == 20, "EventLogRecord size mismatch.");
 static_assert(sizeof(LogFilePreamble) == 64, "LogFilePreamble size mismatch.");
 
