@@ -271,7 +271,7 @@ constexpr double kSigmaAccelZ = 0.7;
 constexpr double kSigmaAltimeter = 1.0;
 constexpr double kProcessNoiseXY = 0.6;
 constexpr double kProcessNoiseZ = 1.2;
-constexpr double kApogeeTargetMeters = 1100;
+constexpr double kApogeeTargetMeters = 1540;
 // Predictor-only horizontal speed seed tuning. These values intentionally keep
 // XY speed conservative because the estimator does not have a horizontal
 // position/velocity measurement update.

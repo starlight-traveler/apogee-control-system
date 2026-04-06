@@ -1589,6 +1589,15 @@ static RuntimeSettingsStorageStatus g_runtimeSettingsStorageStatus;
 static uint32_t g_runtimeSettingsRevision = 0;
 static uint32_t g_runtimeSettingsLastRequestId = 0;
 static uint8_t g_runtimeSettingsLastCommandResult = telemetry::kSettingsResultNone;
+static bool g_setupComplete = false;
+
+void ForceTeensyRebootIfSafe(const char *reason) {
+    if (!g_setupComplete || flightComputer.Status() == FlightStatus::Ground) {
+        ForceTeensyReboot(reason);
+    }
+    LOG_PRINT("[fatal] reboot suppressed outside ground/setup: ");
+    LOG_PRINTLN(reason);
+}
 
 struct AutoActuationTelemetry {
     float autoCommandDeg = std::numeric_limits<float>::quiet_NaN();
@@ -2564,6 +2573,7 @@ void setup() {
     g_timingStats = TimingStats{};
     LogSetupCheckpoint("playing startup buzzer");
     PlayStartupMarch();
+    g_setupComplete = true;
     LogSetupCheckpoint("setup complete");
 }
 
@@ -2585,7 +2595,7 @@ void loop() {
         if (kBnoEnabled) {
             ServiceRetry(nowMs, g_bnoRetry, Bno085SensorIsInitialized(), &StartBnoDuringSetup, "bno085");
             if (!Bno085SensorIsInitialized() && g_bnoRetry.attempts >= kCriticalStartupResetAttempts) {
-                ForceTeensyReboot("bno085");
+                ForceTeensyRebootIfSafe("bno085");
             }
         }
         ServiceRetry(nowMs, g_dataLoggerRetry, DataLoggerIsInitialized(), &DataLoggerBegin, "data_logger");
@@ -2605,7 +2615,7 @@ void loop() {
         }
         ServiceRetry(nowMs, g_bmpRetry, Bmp585SensorIsInitialized(), &Bmp585SensorBegin, "bmp585");
         if (!Bmp585SensorIsInitialized() && g_bmpRetry.attempts >= kCriticalStartupResetAttempts) {
-            ForceTeensyReboot("bmp585");
+            ForceTeensyRebootIfSafe("bmp585");
         }
     }
 
