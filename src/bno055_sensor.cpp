@@ -7,6 +7,7 @@
 #include <utility/imumaths.h>
 
 #include "bno085_orientation.h"
+#include "math_utils.h"
 #include "serial_logging.h"
 #include "settings.h"
 
@@ -16,6 +17,7 @@ constexpr uint32_t kSampleIntervalUs = settings::sensors::bno055::kSampleInterva
 constexpr uint8_t kBnoI2cAddress = settings::sensors::bno055::kI2cAddress;
 constexpr int8_t kBnoResetPin = settings::sensors::bno055::kResetPin;
 constexpr uint32_t kDataTimeoutUs = settings::sensors::bno055::kDataTimeoutUs;
+constexpr uint8_t kQuaternionInvalidDropThreshold = 2;
 
 Adafruit_BNO055 g_bno(55, kBnoI2cAddress, &Wire);
 bool g_initialized = false;
@@ -28,6 +30,7 @@ float g_lastQuat[4] = {1.0f, 0.0f, 0.0f, 0.0f};
 bool g_haveAccel = false;
 bool g_haveGyro = false;
 bool g_haveQuat = false;
+uint8_t g_invalidQuaternionStreak = 0;
 
 void ResetCachedState() {
     g_lastSampleUs = 0;
@@ -35,6 +38,7 @@ void ResetCachedState() {
     g_haveAccel = false;
     g_haveGyro = false;
     g_haveQuat = false;
+    g_invalidQuaternionStreak = 0;
 }
 
 bool StartSensorTransport() {
@@ -74,6 +78,7 @@ bool RecoverSensor(const char *reason) {
 }
 
 void PopulateOutput(SensorData &out, uint32_t nowUs) {
+    const bool quaternionValid = g_haveQuat && math_utils::ValidateQuaternionArray(g_lastQuat);
     out.timestamp = static_cast<float>(nowUs) * 1.0e-6f;
     out.accelBNO[0] = g_haveAccel ? g_lastAccel[0] : 0.0f;
     out.accelBNO[1] = g_haveAccel ? g_lastAccel[1] : 0.0f;
@@ -85,7 +90,7 @@ void PopulateOutput(SensorData &out, uint32_t nowUs) {
     out.quaternion[1] = g_lastQuat[1];
     out.quaternion[2] = g_lastQuat[2];
     out.quaternion[3] = g_lastQuat[3];
-    out.hasQuaternion = g_haveQuat;
+    out.hasQuaternion = quaternionValid;
 }
 
 }  // namespace
@@ -131,10 +136,24 @@ bool Bno055SensorAcquire(SensorData &out) {
                                         g_lastAccel[0], g_lastAccel[1], g_lastAccel[2]);
     bno085_orientation::TransformVector(gyro.x(), gyro.y(), gyro.z(),
                                         g_lastGyro[0], g_lastGyro[1], g_lastGyro[2]);
-    bno085_orientation::AdjustQuaternion(quat.w(), quat.x(), quat.y(), quat.z(), g_lastQuat);
+    float adjustedQuat[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+    bno085_orientation::AdjustQuaternion(quat.w(), quat.x(), quat.y(), quat.z(), adjustedQuat);
+    if (math_utils::ValidateQuaternionArray(adjustedQuat)) {
+        for (int i = 0; i < 4; ++i) {
+            g_lastQuat[i] = adjustedQuat[i];
+        }
+        g_invalidQuaternionStreak = 0;
+        g_haveQuat = true;
+    } else {
+        if (g_haveQuat && g_invalidQuaternionStreak < 0xff) {
+            ++g_invalidQuaternionStreak;
+        }
+        if (!g_haveQuat || g_invalidQuaternionStreak >= kQuaternionInvalidDropThreshold) {
+            g_haveQuat = false;
+        }
+    }
     g_haveAccel = true;
     g_haveGyro = true;
-    g_haveQuat = true;
     g_lastHealthyEventUs = nowUs;
 
     PopulateOutput(out, nowUs);

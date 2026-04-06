@@ -106,9 +106,11 @@ class KalmanFilterAccel {
         constexpr double kMaxAccelResidual = 250.0;
         const double residual =
             std::clamp(accelMeasurement - state_[2], -kMaxAccelResidual, kMaxAccelResidual);
+        // Floor innovation to prevent division by very small numbers near floating-point limits.
+        constexpr double kMinInnovation = 1.0e-12;
         double innovation = covariance_[2][2] + measurementVariance_;
-        if (innovation <= 0.0) {
-            innovation = measurementVariance_;
+        if (innovation < kMinInnovation) {
+            innovation = std::max(kMinInnovation, measurementVariance_);
         }
 
         const double invInnovation = 1.0 / innovation;

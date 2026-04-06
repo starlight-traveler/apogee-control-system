@@ -141,17 +141,24 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
 
     math_utils::Quaternion orientation = previousQuaternion_;
     if (!quaternionValid_ && data.hasQuaternion) {
-        previousQuaternion_ = ArrayToQuaternion(data.quaternion);
-        quaternionValid_ = true;
-        orientation = previousQuaternion_;
+        math_utils::Quaternion inputQuaternion = math_utils::MakeQuaternion(1.0f, 0.0f, 0.0f, 0.0f);
+        if (ArrayToQuaternion(data.quaternion, inputQuaternion)) {
+            previousQuaternion_ = inputQuaternion;
+            quaternionValid_ = true;
+            orientation = previousQuaternion_;
+        }
     } else if ((status_ == FlightStatus::Burn || status_ == FlightStatus::Coast) && quaternionValid_) {
         // Propagate attitude through ascent with gyro-only integration so brief
         // quaternion dropouts do not immediately collapse the predictor seed.
-        orientation = TeasleyFilter(previousQuaternion_, data.gyro, static_cast<float>(dt));
+        bool propagatedQuaternionValid = true;
+        orientation = TeasleyFilter(previousQuaternion_, data.gyro, static_cast<float>(dt), &propagatedQuaternionValid);
+        quaternionValid_ = propagatedQuaternionValid;
 
         // When the runtime source selector marks the main quaternion as BNO-led
         // or blended, treat it as a slow external reference and trim the
         // propagated attitude back toward it instead of hard-switching.
+        // During coast, use more aggressive correction to quickly fix any
+        // gyro drift accumulated during burn.
         const MainQuaternionSource correctionSource =
             static_cast<MainQuaternionSource>(data.mainQuaternionSource);
         if (settings::ahrs::kEnableBnoReferenceCorrection &&
@@ -159,19 +166,28 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
             data.hasQuaternion &&
             (correctionSource == MainQuaternionSource::Bno ||
              correctionSource == MainQuaternionSource::Blended)) {
-            const math_utils::Quaternion referenceQuat = ArrayToQuaternion(data.quaternion);
-            const float blendFactor = settings::ahrs::kBnoReferenceCorrectionBlendFactor *
-                                      std::max(0.0f, data.icmAccelTrust);
-            if (blendFactor > 0.0f) {
-                orientation = math_utils::Slerp(orientation, referenceQuat, blendFactor);
+            math_utils::Quaternion referenceQuat = math_utils::MakeQuaternion(1.0f, 0.0f, 0.0f, 0.0f);
+            if (ArrayToQuaternion(data.quaternion, referenceQuat)) {
+                // Use higher blend factor during coast to aggressively correct drift
+                const float baseBlendFactor = (status_ == FlightStatus::Coast)
+                    ? settings::ahrs::kBnoCoastCorrectionBlendFactor
+                    : settings::ahrs::kBnoReferenceCorrectionBlendFactor;
+                const float blendFactor = baseBlendFactor * std::max(0.0f, data.icmAccelTrust);
+                if (blendFactor > 0.0f) {
+                    orientation = math_utils::Slerp(orientation, referenceQuat, blendFactor);
+                    quaternionValid_ = math_utils::ValidateQuaternion(orientation);
+                }
             }
         }
 
         previousQuaternion_ = orientation;
     } else if (data.hasQuaternion) {
-        orientation = ArrayToQuaternion(data.quaternion);
-        previousQuaternion_ = orientation;
-        quaternionValid_ = true;
+        math_utils::Quaternion inputQuaternion = math_utils::MakeQuaternion(1.0f, 0.0f, 0.0f, 0.0f);
+        if (ArrayToQuaternion(data.quaternion, inputQuaternion)) {
+            orientation = inputQuaternion;
+            previousQuaternion_ = orientation;
+            quaternionValid_ = true;
+        }
     }
 
     float yaw = 0.0f;
@@ -326,8 +342,10 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
         predictorState.horizontalVelocity = predictorHorizontalVelocity;
         predictorState.zenith = seedZenith;
         predictorState.angularVelocity = predictorAngularRate;
-        UpdateAdaptiveDragScale(predictorState, accZ, dt);
-        lastApogeePrediction_ = apogeePredictor_.PredictApogee(predictorState);
+        // Single integration pass returns both altitude and time-to-apogee
+        const PredictResult prediction = apogeePredictor_.PredictApogeeWithTime(predictorState);
+        UpdateAdaptiveDragScale(predictorState, accZ, dt, prediction.timeToApogee);
+        lastApogeePrediction_ = prediction.altitude;
     } else {
         ResetPredictorHorizontalVelocityTracker(predictorHorizontalVelocity_);
     }
@@ -392,7 +410,8 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
 /// Now supports both legacy single-scale and Mach-dependent adaptation.
 void FlightComputer::UpdateAdaptiveDragScale(const ApogeeState &predictorState,
                                              double measuredVerticalAcceleration,
-                                             double dtSeconds) {
+                                             double dtSeconds,
+                                             double timeToApogeeSeconds) {
     if (status_ != FlightStatus::Coast ||
         predictorState.verticalVelocity <= 0.0 ||
         !quaternionValid_ ||
@@ -436,10 +455,18 @@ void FlightComputer::UpdateAdaptiveDragScale(const ApogeeState &predictorState,
 
     // Update Mach-dependent drag scale if enabled.
     if (settings::predictor::kEnableMachDependentDrag) {
-        apogeePredictor_.AdaptMachDragScale(mach, residual, axialModelAcceleration, dtSeconds);
+        apogeePredictor_.AdaptMachDragScale(mach,
+                                           residual,
+                                           axialModelAcceleration,
+                                           dtSeconds,
+                                           std::max(0.0, timeToApogeeSeconds));
+        // Keep the legacy scalar neutral when the Mach-binned learner is
+        // active so the same residual does not adapt two drag models at once.
+        apogeePredictor_.SetAxialDragScale(1.0);
+        return;
     }
 
-    // Legacy single-scale adaptation (still useful as overall bias correction).
+    // Legacy single-scale adaptation path when Mach-dependent learning is disabled.
     const double currentScale = apogeePredictor_.AxialDragScale();
     const double minScale =
         static_cast<double>(settings::flight::kAdaptiveAxialDragScaleMin);
@@ -535,19 +562,36 @@ void FlightComputer::ReportEvent(bool includeAltitude, float timeSeconds, const 
 
 /// Integrates quaternion attitude one sample forward using gyro data only.
 /// Uses exponential map when enabled for reduced integration error.
-math_utils::Quaternion FlightComputer::TeasleyFilter(const math_utils::Quaternion &quat, const float gyro[3], float dt) {
+math_utils::Quaternion FlightComputer::TeasleyFilter(const math_utils::Quaternion &quat,
+                                                     const float gyro[3],
+                                                     float dt,
+                                                     bool *validOut) {
+    math_utils::Quaternion validatedQuat = quat;
+    if (!math_utils::ValidateQuaternion(validatedQuat)) {
+        if (validOut != nullptr) {
+            *validOut = false;
+        }
+        return validatedQuat;
+    }
+
     if (settings::ahrs::kEnableExponentialMap) {
         // Exponential map integration using Rodrigues formula.
         // More accurate than first-order Euler: reduces O(dt^2) error per step.
-        return math_utils::ExponentialMapUpdate(quat, gyro[0], gyro[1], gyro[2], dt);
+        math_utils::Quaternion updated =
+            math_utils::ExponentialMapUpdate(validatedQuat, gyro[0], gyro[1], gyro[2], dt);
+        const bool isValid = math_utils::ValidateQuaternion(updated);
+        if (validOut != nullptr) {
+            *validOut = isValid;
+        }
+        return updated;
     }
 
     // Legacy first-order Euler integration.
     const float half_dt = 0.5f * dt;
-    const float qw = quat.w;
-    const float qx = quat.x;
-    const float qy = quat.y;
-    const float qz = quat.z;
+    const float qw = validatedQuat.w;
+    const float qx = validatedQuat.x;
+    const float qy = validatedQuat.y;
+    const float qz = validatedQuat.z;
     const float gx = gyro[0];
     const float gy = gyro[1];
     const float gz = gyro[2];
@@ -562,12 +606,17 @@ math_utils::Quaternion FlightComputer::TeasleyFilter(const math_utils::Quaternio
         qx + dq_x,
         qy + dq_y,
         qz + dq_z);
-    return math_utils::Normalize(updated);
+    const bool isValid = math_utils::ValidateQuaternion(updated);
+    if (validOut != nullptr) {
+        *validOut = isValid;
+    }
+    return updated;
 }
 
 /// Converts raw telemetry quaternion storage into the internal math type.
-math_utils::Quaternion FlightComputer::ArrayToQuaternion(const float values[4]) const {
-    return math_utils::Normalize(math_utils::MakeQuaternion(values[0], values[1], values[2], values[3]));
+bool FlightComputer::ArrayToQuaternion(const float values[4], math_utils::Quaternion &out) const {
+    out = math_utils::MakeQuaternion(values[0], values[1], values[2], values[3]);
+    return math_utils::ValidateQuaternion(out);
 }
 
 /// Returns a stable string label for a flight status value.

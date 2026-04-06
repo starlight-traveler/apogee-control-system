@@ -136,11 +136,17 @@ class FlightComputer {
     /// Emits a human-readable event to the serial log.
     void ReportEvent(bool includeAltitude, float timeSeconds, const char *label);
     /// Propagates attitude with gyro-only integration during ascent/coast.
-    math_utils::Quaternion TeasleyFilter(const math_utils::Quaternion &quat, const float gyro[3], float dt);
+    math_utils::Quaternion TeasleyFilter(const math_utils::Quaternion &quat,
+                                        const float gyro[3],
+                                        float dt,
+                                        bool *validOut = nullptr);
     /// Converts a raw quaternion array into the internal math type.
-    math_utils::Quaternion ArrayToQuaternion(const float values[4]) const;
+    bool ArrayToQuaternion(const float values[4], math_utils::Quaternion &out) const;
     /// Updates the predictor's adaptive axial drag scale from measured/model accel mismatch.
-    void UpdateAdaptiveDragScale(const ApogeeState &predictorState, double measuredVerticalAcceleration, double dtSeconds);
+    void UpdateAdaptiveDragScale(const ApogeeState &predictorState,
+                                 double measuredVerticalAcceleration,
+                                 double dtSeconds,
+                                 double timeToApogeeSeconds);
 
     KalmanFilterAccel kalmanX_;
     KalmanFilterAccel kalmanY_;

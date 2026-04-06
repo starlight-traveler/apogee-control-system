@@ -5,6 +5,7 @@
 
 #include <SparkFunLSM9DS1.h>
 
+#include "math_utils.h"
 #include "serial_logging.h"
 #include "settings.h"
 
@@ -17,6 +18,7 @@ constexpr uint32_t kSampleIntervalUs = settings::sensors::lsm9ds1::kSampleInterv
 constexpr float kPi = 3.14159265358979323846f;
 constexpr float kGToMps2 = 9.80665f;
 constexpr float kRadToDeg = 57.295779513082320876f;
+constexpr uint8_t kQuaternionInvalidDropThreshold = 2;
 
 LSM9DS1 g_lsm;
 volatile bool g_dataReadyInterrupt = false;
@@ -25,6 +27,8 @@ bool g_hasCachedSample = false;
 uint32_t g_lastSampleUs = 0;
 uint32_t g_lastFilterUs = 0;
 FlightStatus g_flightStatus = FlightStatus::Ground;
+float g_burnoutTimestampSeconds = 0.0f;
+float g_currentTimestampSeconds = 0.0f;
 
 float g_q[4] = {1.0f, 0.0f, 0.0f, 0.0f};
 float g_lastQuaternion[4] = {1.0f, 0.0f, 0.0f, 0.0f};
@@ -54,6 +58,12 @@ bool g_lastAcquireUsedInterrupt = false;
 bool g_interruptConfigured = false;
 bool g_fifoEnabled = false;
 float g_crossCheckTrust = 1.0f;
+uint8_t g_invalidQuaternionStreak = 0;
+
+// Gyro bias learning validation: track accelerometer magnitude for sanity check.
+float g_lastAccelMagnitudeG = 1.0f;
+float g_lastMagMagnitude = 0.0f;
+float g_lastMagBody[3] = {0.0f, 0.0f, 0.0f};
 
 float g_activeAccelLsbPerG = 16384.0f;
 float g_activeGyroLsbPerDps = 114.285714f;
@@ -109,7 +119,8 @@ float AccelLsbPerGForRange(uint8_t rangeG) {
         case 8:
             return 4096.0f;
         case 16:
-            return 2048.0f;
+            // The SparkFun LSM9DS1 library uses 0.732 mg/LSB at +/-16 g.
+            return 1366.12024f;
         default:
             return 16384.0f;
     }
@@ -297,7 +308,7 @@ bool QuaternionFromEarthBasisInBody(const float northBody[3],
     return true;
 }
 
-bool InitializeQuaternionFromAccelMag(const float accelNorm[3], const float magNorm[3]) {
+bool QuaternionFromAccelMag(const float accelNorm[3], const float magNorm[3], float quaternion[4]) {
     float upBody[3] = {accelNorm[0], accelNorm[1], accelNorm[2]};
     float magneticBody[3] = {magNorm[0], magNorm[1], magNorm[2]};
     if (!Normalize3(upBody[0], upBody[1], upBody[2]) ||
@@ -325,6 +336,19 @@ bool InitializeQuaternionFromAccelMag(const float accelNorm[3], const float magN
 
     float aligned[4] = {1.0f, 0.0f, 0.0f, 0.0f};
     if (!QuaternionFromEarthBasisInBody(northBody, eastBody, upBody, aligned)) {
+        return false;
+    }
+
+    quaternion[0] = aligned[0];
+    quaternion[1] = aligned[1];
+    quaternion[2] = aligned[2];
+    quaternion[3] = aligned[3];
+    return true;
+}
+
+bool InitializeQuaternionFromAccelMag(const float accelNorm[3], const float magNorm[3]) {
+    float aligned[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+    if (!QuaternionFromAccelMag(accelNorm, magNorm, aligned)) {
         return false;
     }
 
@@ -382,6 +406,8 @@ float RescaleCalibrationCounts(float calibrationCounts, float activeLsbPerUnit, 
     return calibrationCounts * (activeLsbPerUnit / calibrationLsbPerUnit);
 }
 
+/// Computes trust in the accelerometer gravity proxy for the current phase.
+/// During coast, implements burnout correction burst to quickly correct gyro drift.
 float ComputeAccelTrust(float accelMagnitudeG, float gyroNorm) {
     float phaseTrust = 0.0f;
     switch (g_flightStatus) {
@@ -392,9 +418,22 @@ float ComputeAccelTrust(float accelMagnitudeG, float gyroNorm) {
             phaseTrust = 0.75f;
             break;
         case FlightStatus::Burn:
+            // During burn, accelerometer reads thrust, not gravity - no trust
+            return 0.0f;
         case FlightStatus::Coast:
         case FlightStatus::Overshoot:
-            return 0.0f;
+            // Burnout correction burst: aggressive correction right after burnout
+            if (settings::ahrs::kEnableBurnoutCorrectionBurst && g_burnoutTimestampSeconds > 0.0f) {
+                const float timeSinceBurnout = g_currentTimestampSeconds - g_burnoutTimestampSeconds;
+                if (timeSinceBurnout >= 0.0f && timeSinceBurnout < settings::ahrs::kBurnoutCorrectionWindowSeconds) {
+                    // Within burnout correction window - high trust to quickly correct drift
+                    phaseTrust = settings::ahrs::kBurnoutCorrectionAccelTrust;
+                    break;
+                }
+            }
+            // After burnout window, maintain moderate trust for ongoing correction
+            phaseTrust = settings::ahrs::kCoastAccelTrust;
+            break;
     }
     const float magnitudeTrust = WindowTrust(accelMagnitudeG,
                                              settings::sensors::lsm9ds1::kAccelCorrectionMinG,
@@ -402,7 +441,7 @@ float ComputeAccelTrust(float accelMagnitudeG, float gyroNorm) {
     const float rateTrust = DescendingTrust(gyroNorm,
                                             settings::sensors::lsm9ds1::kAccelCorrectionGyroFadeStartRadPerSec,
                                             settings::sensors::lsm9ds1::kAccelCorrectionGyroFadeEndRadPerSec);
-    return g_crossCheckTrust * phaseTrust * magnitudeTrust * rateTrust;
+    return phaseTrust * magnitudeTrust * rateTrust;
 }
 
 float MagTrustPhaseScale() {
@@ -427,9 +466,9 @@ float ComputeMagTrust(float magMagnitude, float gyroNorm) {
         return 0.0f;
     }
     if (!g_hasMagReference || !(g_magReferenceNorm > 0.0f)) {
-        return g_crossCheckTrust * phaseTrust * DescendingTrust(gyroNorm,
-                                                                settings::sensors::lsm9ds1::kMagTrustGyroFadeStartRadPerSec,
-                                                                settings::sensors::lsm9ds1::kMagTrustGyroFadeEndRadPerSec);
+        return phaseTrust * DescendingTrust(gyroNorm,
+                                            settings::sensors::lsm9ds1::kMagTrustGyroFadeStartRadPerSec,
+                                            settings::sensors::lsm9ds1::kMagTrustGyroFadeEndRadPerSec);
     }
     const float relativeError = fabsf(magMagnitude - g_magReferenceNorm) / g_magReferenceNorm;
     if (relativeError >= settings::sensors::lsm9ds1::kMagCorrectionMaxRelativeError) {
@@ -440,7 +479,7 @@ float ComputeMagTrust(float magMagnitude, float gyroNorm) {
     const float rateTrust = DescendingTrust(gyroNorm,
                                             settings::sensors::lsm9ds1::kMagTrustGyroFadeStartRadPerSec,
                                             settings::sensors::lsm9ds1::kMagTrustGyroFadeEndRadPerSec);
-    return g_crossCheckTrust * phaseTrust * magnitudeTrust * rateTrust;
+    return phaseTrust * magnitudeTrust * rateTrust;
 }
 
 void UpdateMagReference(float magMagnitude, float trust) {
@@ -497,6 +536,8 @@ void UpdateGroundAlignment(const float accelNorm[3], float accelTrust, const flo
     InitializeQuaternionFromAccelMag(avgAccel, avgMag);
 }
 
+/// Returns the phase-specific proportional gain for accelerometer correction.
+/// Returns aggressive gain during burnout correction window.
 float AccelCorrectionGain() {
     switch (g_flightStatus) {
         case FlightStatus::Ground:
@@ -504,9 +545,18 @@ float AccelCorrectionGain() {
         case FlightStatus::Descent:
             return settings::sensors::lsm9ds1::kAccelCorrectionGainDescent;
         case FlightStatus::Burn:
+            return 0.0f;
         case FlightStatus::Coast:
         case FlightStatus::Overshoot:
-            return 0.0f;
+            // Burnout correction burst: aggressive gain right after burnout
+            if (settings::ahrs::kEnableBurnoutCorrectionBurst && g_burnoutTimestampSeconds > 0.0f) {
+                const float timeSinceBurnout = g_currentTimestampSeconds - g_burnoutTimestampSeconds;
+                if (timeSinceBurnout >= 0.0f && timeSinceBurnout < settings::ahrs::kBurnoutCorrectionWindowSeconds) {
+                    return settings::ahrs::kBurnoutCorrectionAccelGain;
+                }
+            }
+            // After burnout window, use moderate correction gain
+            return settings::ahrs::kCoastAccelCorrectionGain;
     }
     return 0.0f;
 }
@@ -525,7 +575,17 @@ float MagCorrectionGain() {
     return 0.0f;
 }
 
+/// Returns true when residual gyro bias can be learned safely.
+/// Validates accelerometer magnitude is ~1g to prevent learning corrupted bias.
 bool ShouldLearnGyroBias(float accelTrust, float gyroNorm) {
+    // Validate accelerometer magnitude is close to 1g (gravity only).
+    // If magnitude is way off, accelerometer may be corrupted - skip bias learning.
+    constexpr float kMinAccelMagnitudeG = 0.85f;
+    constexpr float kMaxAccelMagnitudeG = 1.15f;
+    if (g_lastAccelMagnitudeG < kMinAccelMagnitudeG || g_lastAccelMagnitudeG > kMaxAccelMagnitudeG) {
+        return false;
+    }
+
     if (g_flightStatus == FlightStatus::Ground) {
         return accelTrust > 0.35f && gyroNorm <= settings::sensors::lsm9ds1::kStationaryGyroMaxRadPerSec;
     }
@@ -629,6 +689,10 @@ void AdaptiveQuaternionUpdate(const float accelNorm[3],
     g_q[1] *= invNorm;
     g_q[2] *= invNorm;
     g_q[3] *= invNorm;
+    if (!math_utils::ValidateQuaternionArray(g_q)) {
+        g_hasQuaternionContinuityReference = false;
+        return;
+    }
     ApplyQuaternionContinuity();
 }
 
@@ -654,8 +718,8 @@ void PublishFromState(SensorData &out, uint32_t nowUs) {
     out.icmGyroBias[0] = g_gyroBiasLearned[0];
     out.icmGyroBias[1] = g_gyroBiasLearned[1];
     out.icmGyroBias[2] = g_gyroBiasLearned[2];
-    out.hasIcmQuaternion = g_groundAlignmentReady;
-    out.hasIcmYpr = g_groundAlignmentReady;
+    out.hasIcmQuaternion = g_haveQuaternion;
+    out.hasIcmYpr = g_haveQuaternion;
 }
 
 bool InterruptAsserted() {
@@ -707,8 +771,8 @@ bool ConfigureSensor() {
     g_lsm.settings.mag.ZPerformance = settings::sensors::lsm9ds1::kMagZPerformanceSetting;
     g_lsm.settings.mag.lowPowerEnable = settings::sensors::lsm9ds1::kMagLowPowerEnable;
     g_lsm.settings.mag.operatingMode = settings::sensors::lsm9ds1::kMagOperatingModeSetting;
-    SPI.begin();
-    if (g_lsm.beginSPI(kAccelGyroChipSelectPin, kMagChipSelectPin) == 0) {
+    SPI1.begin();
+    if (g_lsm.beginSPI(kAccelGyroChipSelectPin, kMagChipSelectPin, SPI1) == 0) {
         return false;
     }
 
@@ -813,6 +877,7 @@ bool Lsm9ds1SensorBegin() {
     g_q[2] = 0.0f;
     g_q[3] = 0.0f;
     g_hasQuaternionContinuityReference = false;
+    g_invalidQuaternionStreak = 0;
     g_lastAcquireFresh = false;
     g_lastAcquireUsedCache = false;
     g_lastAcquireUsedInterrupt = false;
@@ -827,6 +892,14 @@ bool Lsm9ds1SensorIsInitialized() {
 
 void Lsm9ds1SensorSetFlightStatus(FlightStatus status) {
     g_flightStatus = status;
+}
+
+void Lsm9ds1SensorSetBurnoutTimestamp(float burnoutTimeSeconds) {
+    g_burnoutTimestampSeconds = burnoutTimeSeconds;
+}
+
+void Lsm9ds1SensorSetCurrentTimestamp(float currentTimeSeconds) {
+    g_currentTimestampSeconds = currentTimeSeconds;
 }
 
 void Lsm9ds1SensorSetCrossCheckTrust(float trust) {
@@ -974,6 +1047,9 @@ bool Lsm9ds1SensorAcquire(SensorData &out) {
     Apply3x3(settings::sensors::lsm9ds1::kMagAinv, magRaw, magRaw);
     ApplyAxisTransform(magRaw);
     ApplyMountRotation(magRaw);
+    g_lastMagBody[0] = magRaw[0];
+    g_lastMagBody[1] = magRaw[1];
+    g_lastMagBody[2] = magRaw[2];
     const float magMagnitude = Magnitude3(magRaw[0], magRaw[1], magRaw[2]);
     float magNorm[3] = {magRaw[0], magRaw[1], magRaw[2]};
     Normalize3(magNorm[0], magNorm[1], magNorm[2]);
@@ -989,18 +1065,37 @@ bool Lsm9ds1SensorAcquire(SensorData &out) {
     g_lastAhrsDt = dt;
 
     const float gyroNorm = Magnitude3(gyroRadPerSec[0], gyroRadPerSec[1], gyroRadPerSec[2]);
-    const float accelTrust = ComputeAccelTrust(accelMagnitudeG, gyroNorm);
-    const float magTrust = ComputeMagTrust(magMagnitude, gyroNorm);
-    g_lastAccelTrust = accelTrust;
-    g_lastMagTrust = magTrust;
-    UpdateGroundAlignment(accelNorm, accelTrust, magNorm, magTrust, gyroNorm);
+    const float localAccelTrust = ComputeAccelTrust(accelMagnitudeG, gyroNorm);
+    const float localMagTrust = ComputeMagTrust(magMagnitude, gyroNorm);
+    g_lastAccelTrust = localAccelTrust;
+    g_lastMagTrust = localMagTrust;
+
+    // Track accelerometer magnitude for gyro bias learning validation.
+    g_lastAccelMagnitudeG = accelMagnitudeG;
+    g_lastMagMagnitude = magMagnitude;
+    UpdateGroundAlignment(accelNorm, localAccelTrust, magNorm, localMagTrust, gyroNorm);
 
     if (g_groundAlignmentReady) {
-        AdaptiveQuaternionUpdate(accelNorm, accelTrust, gyroRadPerSec, magNorm, magTrust, dt);
+        AdaptiveQuaternionUpdate(accelNorm, localAccelTrust, gyroRadPerSec, magNorm, localMagTrust, dt);
     }
-    LearnGyroBias(gyroRadPerSec, accelTrust, gyroNorm);
-    UpdateMagReference(magMagnitude, magTrust);
-    QuaternionToEulerDeg(g_q, g_lastYprDeg);
+    LearnGyroBias(gyroRadPerSec, localAccelTrust, gyroNorm);
+    UpdateMagReference(magMagnitude, localMagTrust);
+    const bool quaternionValidNow = g_groundAlignmentReady && math_utils::ValidateQuaternionArray(g_q);
+    if (quaternionValidNow) {
+        g_invalidQuaternionStreak = 0;
+        QuaternionToEulerDeg(g_q, g_lastYprDeg);
+        for (int i = 0; i < 4; ++i) {
+            g_lastQuaternionOut[i] = g_q[i];
+        }
+        g_haveQuaternion = true;
+    } else {
+        if (g_haveQuaternion && g_invalidQuaternionStreak < 0xff) {
+            ++g_invalidQuaternionStreak;
+        }
+        if (!g_haveQuaternion || g_invalidQuaternionStreak >= kQuaternionInvalidDropThreshold) {
+            g_haveQuaternion = false;
+        }
+    }
 
     g_lastAccel[0] = accelRaw[0] / g_activeAccelLsbPerG * kGToMps2;
     g_lastAccel[1] = accelRaw[1] / g_activeAccelLsbPerG * kGToMps2;
@@ -1008,10 +1103,6 @@ bool Lsm9ds1SensorAcquire(SensorData &out) {
     g_lastGyro[0] = gyroRadPerSec[0];
     g_lastGyro[1] = gyroRadPerSec[1];
     g_lastGyro[2] = gyroRadPerSec[2];
-    for (int i = 0; i < 4; ++i) {
-        g_lastQuaternionOut[i] = g_q[i];
-    }
-    g_haveQuaternion = g_groundAlignmentReady;
     g_hasCachedSample = true;
 
     PublishFromState(out, nowUs);
@@ -1023,6 +1114,7 @@ Lsm9ds1Diagnostics Lsm9ds1SensorGetDiagnostics() {
     diagnostics.initialized = g_initialized;
     diagnostics.hasAccel = g_haveAccel;
     diagnostics.hasGyro = g_haveGyro;
+    diagnostics.hasMag = g_haveMag;
     diagnostics.hasQuaternion = g_haveQuaternion;
     diagnostics.alignmentReady = g_groundAlignmentReady;
     diagnostics.lastAcquireFresh = g_lastAcquireFresh;
@@ -1031,5 +1123,47 @@ Lsm9ds1Diagnostics Lsm9ds1SensorGetDiagnostics() {
     diagnostics.lastAcquireUsedInterrupt = g_lastAcquireUsedInterrupt;
     diagnostics.fifoEnabled = g_fifoEnabled;
     diagnostics.lastSampleMicros = g_lastSampleUs;
+    diagnostics.groundAlignmentSampleCount = g_groundAlignmentSampleCount;
+    diagnostics.lastAccelTrust = g_lastAccelTrust;
+    diagnostics.lastMagTrust = g_lastMagTrust;
+    diagnostics.lastAccelMagnitudeG = g_lastAccelMagnitudeG;
+    diagnostics.lastMagMagnitude = g_lastMagMagnitude;
+    diagnostics.magReferenceNorm = g_magReferenceNorm;
+    diagnostics.accelBodyMps2[0] = g_lastAccel[0];
+    diagnostics.accelBodyMps2[1] = g_lastAccel[1];
+    diagnostics.accelBodyMps2[2] = g_lastAccel[2];
+    diagnostics.magBody[0] = g_lastMagBody[0];
+    diagnostics.magBody[1] = g_lastMagBody[1];
+    diagnostics.magBody[2] = g_lastMagBody[2];
+    if (diagnostics.hasAccel && diagnostics.hasMag) {
+        float accelNorm[3] = {g_lastAccel[0], g_lastAccel[1], g_lastAccel[2]};
+        float magNorm[3] = {g_lastMagBody[0], g_lastMagBody[1], g_lastMagBody[2]};
+        float bootstrapQuat[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+        if (QuaternionFromAccelMag(accelNorm, magNorm, bootstrapQuat)) {
+            float yaw = 0.0f;
+            float pitch = 0.0f;
+            float roll = 0.0f;
+            const math_utils::Quaternion quat =
+                math_utils::MakeQuaternion(bootstrapQuat[0], bootstrapQuat[1], bootstrapQuat[2], bootstrapQuat[3]);
+            math_utils::QuaternionToEuler(quat, yaw, pitch, roll);
+            diagnostics.hasBootstrapYpr = true;
+            diagnostics.bootstrapYprDeg[0] = yaw * 57.295779513082320876f;
+            diagnostics.bootstrapYprDeg[1] = pitch * 57.295779513082320876f;
+            diagnostics.bootstrapYprDeg[2] = roll * 57.295779513082320876f;
+        }
+    }
+    if (diagnostics.hasQuaternion) {
+        float yaw = 0.0f;
+        float pitch = 0.0f;
+        float roll = 0.0f;
+        const math_utils::Quaternion quat = math_utils::MakeQuaternion(g_lastQuaternionOut[0],
+                                                                       g_lastQuaternionOut[1],
+                                                                       g_lastQuaternionOut[2],
+                                                                       g_lastQuaternionOut[3]);
+        math_utils::QuaternionToEuler(quat, yaw, pitch, roll);
+        diagnostics.yprDeg[0] = yaw * 57.295779513082320876f;
+        diagnostics.yprDeg[1] = pitch * 57.295779513082320876f;
+        diagnostics.yprDeg[2] = roll * 57.295779513082320876f;
+    }
     return diagnostics;
 }

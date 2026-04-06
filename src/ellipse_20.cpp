@@ -31,6 +31,7 @@ constexpr SbgEComOutputMode kMagOutputMode =
 constexpr float kGToMps2 = 9.80665f;
 constexpr float kRadToDeg = 57.295779513082320876f;
 constexpr float kDefaultDtSeconds = 0.005f;
+constexpr uint8_t kQuaternionInvalidDropThreshold = 2;
 
 struct SerialInterfaceContext {
     HardwareSerial *serial = nullptr;
@@ -78,6 +79,7 @@ float g_lastAccelTrust = 0.0f;
 float g_lastMagTrust = 0.0f;
 float g_gyroBiasLearned[3] = {0.0f, 0.0f, 0.0f};
 float g_magReferenceNorm = 0.0f;
+uint8_t g_invalidQuaternionStreak = 0;
 float g_magReferenceEarth[3] = {0.0f, 1.0f, 0.0f};
 float g_lastContinuousQuaternion[4] = {1.0f, 0.0f, 0.0f, 0.0f};
 
@@ -766,6 +768,7 @@ void ResetCachedState() {
     g_lastQuaternion[1] = 0.0f;
     g_lastQuaternion[2] = 0.0f;
     g_lastQuaternion[3] = 0.0f;
+    g_invalidQuaternionStreak = 0;
     for (int i = 0; i < 3; ++i) {
         g_rawAccel[i] = 0.0f;
         g_rawGyro[i] = 0.0f;
@@ -846,7 +849,7 @@ void PublishFromState(SensorData &out, uint32_t nowUs) {
         out.quaternionPulse[i] = g_lastQuaternion[i];
     }
     out.hasPulseQuaternion = g_haveQuaternion;
-    out.hasPulseYpr = g_haveYpr;
+    out.hasPulseYpr = g_haveYpr && g_haveQuaternion;
 }
 
 SbgErrorCode SerialDestroy(SbgInterface *pInterface) {
@@ -1139,12 +1142,25 @@ bool Ellipse20SensorAcquire(SensorData &out) {
             UpdateEarthMagReference(magNorm, accelTrust, magTrust);
         }
         AdaptiveQuaternionUpdate(accelNorm, accelTrust, gyroRadPerSec, magNorm, magTrust, dt);
-        QuaternionToYprDeg(g_q, g_lastYprDeg);
-        for (int i = 0; i < 4; ++i) {
-            g_lastQuaternion[i] = g_q[i];
+        const bool quaternionValidNow = math_utils::ValidateQuaternionArray(g_q);
+        if (quaternionValidNow) {
+            g_invalidQuaternionStreak = 0;
+            QuaternionToYprDeg(g_q, g_lastYprDeg);
+            for (int i = 0; i < 4; ++i) {
+                g_lastQuaternion[i] = g_q[i];
+            }
+            g_haveQuaternion = true;
+            g_haveYpr = true;
+        } else {
+            g_hasQuaternionContinuityReference = false;
+            if (g_haveQuaternion && g_invalidQuaternionStreak < 0xff) {
+                ++g_invalidQuaternionStreak;
+            }
+            if (!g_haveQuaternion || g_invalidQuaternionStreak >= kQuaternionInvalidDropThreshold) {
+                g_haveQuaternion = false;
+                g_haveYpr = false;
+            }
         }
-        g_haveQuaternion = true;
-        g_haveYpr = true;
     }
 
     for (int i = 0; i < 3; ++i) {

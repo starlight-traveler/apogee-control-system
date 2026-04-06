@@ -10,6 +10,26 @@
 #error "Use the lsm9ds1_calibration PlatformIO environment to build this target."
 #endif
 
+// Recommended workflow:
+//   1. Let the board thermally settle on the bench.
+//   2. Run 'g' with the board perfectly still.
+//   3. Put each accel axis up and capture x X y Y z Z.
+//   4. Run 'm', sweep all orientations slowly, then run 'm' again.
+//   5. Run 'p' for the paste-ready settings block.
+// Optional:
+//   Repeat 'g' at 2+ different temperatures to fit gyro temp slopes.
+// Useful detail commands:
+//   d = detailed capture dump
+//   w = print this workflow again
+
+//
+// Gyro calibration capture complete.
+// Gyro mean raw offsets = {94.42f, 152.01f, -210.36f};
+// Gyro stddev raw = {14.78, 13.48, 14.47}
+// Mean calibration temperature C = 280.00
+// Stored gyro temp-fit points = 1
+
+
 namespace {
 
 constexpr uint8_t kAccelGyroChipSelectPin = settings::sensors::lsm9ds1::kAccelGyroChipSelectPin;
@@ -22,6 +42,7 @@ constexpr uint32_t kStreamIntervalMs = 100;
 constexpr uint32_t kGyroCalibrationSamples = 1000;
 constexpr size_t kMaxGyroTemperaturePoints = 8;
 constexpr uint16_t kMaxMagSamples = 2048;
+constexpr uint32_t kForcedMagCaptureIntervalMs = 15;
 
 LSM9DS1 g_lsm;
 bool g_streamEnabled = true;
@@ -110,12 +131,15 @@ size_t g_gyroTemperaturePointCount = 0;
 
 bool g_magCaptureActive = false;
 bool g_magCaptureReady = false;
+bool g_magSampleFresh = false;
 float g_magMin[3] = {0.0f, 0.0f, 0.0f};
 float g_magMax[3] = {0.0f, 0.0f, 0.0f};
 float g_magLast[3] = {0.0f, 0.0f, 0.0f};
 uint32_t g_magSampleCount = 0;
 float g_magSamples[kMaxMagSamples][3] = {};
 uint16_t g_magStoredSamples = 0;
+uint32_t g_magReservoirState = 0x13579BDFu;
+uint32_t g_lastForcedMagReadMs = 0;
 
 float AccelLsbPerGForRange(uint8_t rangeG) {
     switch (rangeG) {
@@ -126,7 +150,8 @@ float AccelLsbPerGForRange(uint8_t rangeG) {
         case 8:
             return 4096.0f;
         case 16:
-            return 2048.0f;
+            // Match the SparkFun LSM9DS1 library's 16 g sensitivity.
+            return 1366.12024f;
         default:
             return 16384.0f;
     }
@@ -145,6 +170,40 @@ float GyroLsbPerDpsForRange(uint16_t rangeDps) {
     }
 }
 
+void Apply3x3(const float matrix[3][3], const float in[3], float out[3]) {
+    out[0] = matrix[0][0] * in[0] + matrix[0][1] * in[1] + matrix[0][2] * in[2];
+    out[1] = matrix[1][0] * in[0] + matrix[1][1] * in[1] + matrix[1][2] * in[2];
+    out[2] = matrix[2][0] * in[0] + matrix[2][1] * in[1] + matrix[2][2] * in[2];
+}
+
+void ApplyAxisTransform(float vector[3]) {
+    float axisTransform[3][3];
+    calibration_matrix::BuildAxisTransform(settings::sensors::lsm9ds1::kAxisMap,
+                                           settings::sensors::lsm9ds1::kAxisSign,
+                                           axisTransform);
+    float remapped[3] = {0.0f, 0.0f, 0.0f};
+    Apply3x3(axisTransform, vector, remapped);
+    vector[0] = remapped[0];
+    vector[1] = remapped[1];
+    vector[2] = remapped[2];
+}
+
+void PrintAxisMapSign() {
+    Serial.print("{");
+    Serial.print(settings::sensors::lsm9ds1::kAxisMap[0]);
+    Serial.print(", ");
+    Serial.print(settings::sensors::lsm9ds1::kAxisMap[1]);
+    Serial.print(", ");
+    Serial.print(settings::sensors::lsm9ds1::kAxisMap[2]);
+    Serial.print("} / {");
+    Serial.print(settings::sensors::lsm9ds1::kAxisSign[0]);
+    Serial.print(", ");
+    Serial.print(settings::sensors::lsm9ds1::kAxisSign[1]);
+    Serial.print(", ");
+    Serial.print(settings::sensors::lsm9ds1::kAxisSign[2]);
+    Serial.print("}");
+}
+
 void Print3x3(const float matrix[3][3]) {
     for (int row = 0; row < 3; ++row) {
         Serial.print("  {");
@@ -155,6 +214,11 @@ void Print3x3(const float matrix[3][3]) {
         Serial.print(matrix[row][2], 5);
         Serial.println("f},");
     }
+}
+
+uint32_t NextMagReservoirRandom() {
+    g_magReservoirState = 1664525u * g_magReservoirState + 1013904223u;
+    return g_magReservoirState;
 }
 
 void PrintSettingsInsertionGuide() {
@@ -178,11 +242,14 @@ void PrintWorkflow() {
     Serial.println("Recommended workflow:");
     Serial.println("  1. Let the board thermally settle on the bench.");
     Serial.println("  2. Run 'g' with the board perfectly still.");
-    Serial.println("  3. Put each accel axis up and capture x X y Y z Z.");
+    Serial.println("  3. Put each rocket/body accel axis up and capture x X y Y z Z.");
     Serial.println("  4. Run 'm', sweep all orientations slowly, then run 'm' again.");
     Serial.println("  5. Run 'p' for the paste-ready settings block.");
     Serial.println("Optional:");
     Serial.println("  Repeat 'g' at 2+ different temperatures to fit gyro temp slopes.");
+    Serial.print("Current fixed axis map/sign before mount rotation = ");
+    PrintAxisMapSign();
+    Serial.println();
     Serial.println("Useful detail commands:");
     Serial.println("  d = detailed capture dump");
     Serial.println("  w = print this workflow again");
@@ -198,12 +265,12 @@ void PrintHelp() {
     Serial.println("  s  : toggle live stream");
     Serial.println("  c  : print one current sample");
     Serial.println("  g  : start gyro bias capture (repeat at different temps for slope fit)");
-    Serial.println("  x  : capture accel face +X up");
-    Serial.println("  X  : capture accel face -X up");
-    Serial.println("  y  : capture accel face +Y up");
-    Serial.println("  Y  : capture accel face -Y up");
-    Serial.println("  z  : capture accel face +Z up");
-    Serial.println("  Z  : capture accel face -Z up");
+    Serial.println("  x  : capture rocket/body accel face +X up");
+    Serial.println("  X  : capture rocket/body accel face -X up");
+    Serial.println("  y  : capture rocket/body accel face +Y up");
+    Serial.println("  Y  : capture rocket/body accel face -Y up");
+    Serial.println("  z  : capture rocket/body accel face +Z up");
+    Serial.println("  Z  : capture rocket/body accel face -Z up");
     Serial.println("  m  : toggle magnetometer sweep capture");
     Serial.println("  p  : print recommended settings block");
     Serial.println("  d  : print detailed capture dump and quality report");
@@ -214,6 +281,7 @@ void PrintHelp() {
 
 void ResetMagCapture() {
     g_magCaptureReady = false;
+    g_magSampleFresh = false;
     g_magSampleCount = 0;
     for (int i = 0; i < 3; ++i) {
         g_magMin[i] = 0.0f;
@@ -221,6 +289,8 @@ void ResetMagCapture() {
         g_magLast[i] = 0.0f;
     }
     g_magStoredSamples = 0;
+    g_magReservoirState = 0x13579BDFu;
+    g_lastForcedMagReadMs = 0;
 }
 
 void ResetCalibrationState() {
@@ -255,8 +325,19 @@ bool ConfigureSensor() {
     g_lsm.settings.gyro.sampleRate = settings::sensors::lsm9ds1::kGyroSampleRateSetting;
     g_lsm.settings.accel.sampleRate = settings::sensors::lsm9ds1::kAccelSampleRateSetting;
     g_lsm.settings.mag.sampleRate = settings::sensors::lsm9ds1::kMagSampleRateSetting;
-    SPI.begin();
-    return g_lsm.beginSPI(kAccelGyroChipSelectPin, kMagChipSelectPin) != 0;
+    g_lsm.settings.gyro.bandwidth = settings::sensors::lsm9ds1::kGyroBandwidthSetting;
+    g_lsm.settings.accel.bandwidth = settings::sensors::lsm9ds1::kAccelBandwidthSetting;
+    g_lsm.settings.accel.highResEnable = settings::sensors::lsm9ds1::kAccelHighResolutionEnable;
+    g_lsm.settings.accel.highResBandwidth =
+        settings::sensors::lsm9ds1::kAccelHighResolutionBandwidthSetting;
+    g_lsm.settings.mag.tempCompensationEnable =
+        settings::sensors::lsm9ds1::kMagTemperatureCompensationEnable;
+    g_lsm.settings.mag.XYPerformance = settings::sensors::lsm9ds1::kMagXyPerformanceSetting;
+    g_lsm.settings.mag.ZPerformance = settings::sensors::lsm9ds1::kMagZPerformanceSetting;
+    g_lsm.settings.mag.lowPowerEnable = settings::sensors::lsm9ds1::kMagLowPowerEnable;
+    g_lsm.settings.mag.operatingMode = settings::sensors::lsm9ds1::kMagOperatingModeSetting;
+    SPI1.begin();
+    return g_lsm.beginSPI(kAccelGyroChipSelectPin, kMagChipSelectPin, SPI1) != 0;
 }
 
 void UpdateTemperature() {
@@ -267,6 +348,7 @@ void UpdateTemperature() {
 }
 
 void UpdateSensors() {
+    g_magSampleFresh = false;
     if (g_lsm.accelAvailable()) {
         g_lsm.readAccel();
     }
@@ -275,6 +357,15 @@ void UpdateSensors() {
     }
     if (g_lsm.magAvailable()) {
         g_lsm.readMag();
+        g_magSampleFresh = true;
+        g_lastForcedMagReadMs = millis();
+    } else if (g_magCaptureActive) {
+        const uint32_t nowMs = millis();
+        if ((nowMs - g_lastForcedMagReadMs) >= kForcedMagCaptureIntervalMs) {
+            g_lsm.readMag();
+            g_magSampleFresh = true;
+            g_lastForcedMagReadMs = nowMs;
+        }
     }
     UpdateTemperature();
 }
@@ -298,6 +389,12 @@ void PrintCurrentSample() {
                                  (gy * gyroScale) * (gy * gyroScale) +
                                  (gz * gyroScale) * (gz * gyroScale));
     const float magNorm = sqrtf(mx * mx + my * my + mz * mz);
+    float accelAxisFrame[3] = {ax * accelScale, ay * accelScale, az * accelScale};
+    float gyroAxisFrame[3] = {gx * gyroScale, gy * gyroScale, gz * gyroScale};
+    float magAxisFrame[3] = {mx, my, mz};
+    ApplyAxisTransform(accelAxisFrame);
+    ApplyAxisTransform(gyroAxisFrame);
+    ApplyAxisTransform(magAxisFrame);
 
     Serial.print("acc_raw=[");
     Serial.print(ax, 2);
@@ -311,6 +408,12 @@ void PrintCurrentSample() {
     Serial.print(ay * accelScale, 4);
     Serial.print(", ");
     Serial.print(az * accelScale, 4);
+    Serial.print("] acc_axis_g=[");
+    Serial.print(accelAxisFrame[0], 4);
+    Serial.print(", ");
+    Serial.print(accelAxisFrame[1], 4);
+    Serial.print(", ");
+    Serial.print(accelAxisFrame[2], 4);
     Serial.print("] gyr_raw=[");
     Serial.print(gx, 2);
     Serial.print(", ");
@@ -323,19 +426,31 @@ void PrintCurrentSample() {
     Serial.print(gy * gyroScale, 4);
     Serial.print(", ");
     Serial.print(gz * gyroScale, 4);
+    Serial.print("] gyr_axis_dps=[");
+    Serial.print(gyroAxisFrame[0], 4);
+    Serial.print(", ");
+    Serial.print(gyroAxisFrame[1], 4);
+    Serial.print(", ");
+    Serial.print(gyroAxisFrame[2], 4);
     Serial.print("] mag_raw=[");
     Serial.print(mx, 2);
     Serial.print(", ");
     Serial.print(my, 2);
     Serial.print(", ");
     Serial.print(mz, 2);
+    Serial.print("] mag_axis_raw=[");
+    Serial.print(magAxisFrame[0], 2);
+    Serial.print(", ");
+    Serial.print(magAxisFrame[1], 2);
+    Serial.print(", ");
+    Serial.print(magAxisFrame[2], 2);
     Serial.print("] |acc|g=");
     Serial.print(accelNorm, 4);
     Serial.print(" |gyro|dps=");
     Serial.print(gyroNorm, 4);
     Serial.print(" |mag|raw=");
     Serial.print(magNorm, 2);
-    Serial.print(" temp_c=");
+    Serial.print(" temp_reading=");
     Serial.println(g_lastTemperatureC, 2);
 }
 
@@ -345,6 +460,12 @@ void CaptureAccelFace(AccelFaceIndex face) {
     g_accelFaces[face].mean[1] = static_cast<float>(g_lsm.ay);
     g_accelFaces[face].mean[2] = static_cast<float>(g_lsm.az);
     g_accelFaces[face].temperatureC = g_lastTemperatureC;
+    float accelAxisFrame[3] = {
+        g_accelFaces[face].mean[0] / AccelLsbPerGForRange(kAccelRangeG),
+        g_accelFaces[face].mean[1] / AccelLsbPerGForRange(kAccelRangeG),
+        g_accelFaces[face].mean[2] / AccelLsbPerGForRange(kAccelRangeG),
+    };
+    ApplyAxisTransform(accelAxisFrame);
 
     Serial.print("Captured accel face");
     Serial.print(g_accelFaces[face].name);
@@ -354,6 +475,12 @@ void CaptureAccelFace(AccelFaceIndex face) {
     Serial.print(g_accelFaces[face].mean[1], 2);
     Serial.print(", ");
     Serial.print(g_accelFaces[face].mean[2], 2);
+    Serial.print("] axis_g=[");
+    Serial.print(accelAxisFrame[0], 4);
+    Serial.print(", ");
+    Serial.print(accelAxisFrame[1], 4);
+    Serial.print(", ");
+    Serial.print(accelAxisFrame[2], 4);
     Serial.println("]");
 }
 
@@ -449,7 +576,7 @@ void UpdateGyroCalibration() {
     Serial.print(", ");
     Serial.print(g_gyroCalibrationStats.StdDev(2), 2);
     Serial.println("}");
-    Serial.print("Mean calibration temperature C = ");
+    Serial.print("Mean calibration temp reading = ");
     Serial.println(g_gyroCalibrationStats.MeanTemperature(), 2);
     Serial.print("Stored gyro temp-fit points = ");
     Serial.println(static_cast<unsigned long>(g_gyroTemperaturePointCount));
@@ -471,7 +598,7 @@ void UpdateMagCapture() {
     g_magLast[0] = static_cast<float>(g_lsm.mx);
     g_magLast[1] = static_cast<float>(g_lsm.my);
     g_magLast[2] = static_cast<float>(g_lsm.mz);
-    if (!g_magCaptureActive) {
+    if (!g_magCaptureActive || !g_magSampleFresh) {
         return;
     }
 
@@ -494,6 +621,13 @@ void UpdateMagCapture() {
         g_magSamples[g_magStoredSamples][1] = g_magLast[1];
         g_magSamples[g_magStoredSamples][2] = g_magLast[2];
         ++g_magStoredSamples;
+    } else {
+        const uint32_t replaceIndex = NextMagReservoirRandom() % g_magSampleCount;
+        if (replaceIndex < kMaxMagSamples) {
+            g_magSamples[replaceIndex][0] = g_magLast[0];
+            g_magSamples[replaceIndex][1] = g_magLast[1];
+            g_magSamples[replaceIndex][2] = g_magLast[2];
+        }
     }
 }
 
@@ -653,7 +787,7 @@ void PrintQualityAssessment() {
         Serial.println(static_cast<unsigned long>(g_gyroTemperaturePointCount));
     }
     Serial.print("  accel: ");
-    Serial.println(haveAccel ? "OK" : "incomplete, need x X y Y z Z");
+    Serial.println(haveAccel ? "OK" : "incomplete, need x X y Y z Z body-face captures");
     Serial.print("  mag: ");
     if (haveMag) {
         Serial.print("OK, samples=");
@@ -662,7 +796,7 @@ void PrintQualityAssessment() {
         Serial.print("weak sweep, samples=");
         Serial.println(g_magSampleCount);
     } else {
-        Serial.println("missing, run m sweep");
+        Serial.println("missing, run m to start a sweep, rotate fully, then run m again");
     }
     Serial.println();
 }
@@ -672,6 +806,7 @@ void PrintDetailedDump() {
     Serial.println("==== LSM detailed calibration dump ====");
     PrintSettingsInsertionGuide();
     PrintQualityAssessment();
+    Serial.println("Temperature note: the LSM9DS1 library reports a chip-relative internal reading, not ambient air temperature.");
     PrintGyroTemperatureTable();
     PrintAccelFaceTable();
     PrintMagCaptureTable();
@@ -715,6 +850,7 @@ void PrintRecommendedSettings() {
     Serial.print("constexpr float kGyroReferenceTemperatureC = ");
     Serial.print(gyroReferenceTemperatureC, 2);
     Serial.println("f;");
+    Serial.println("// Note: this LSM temperature reference is the SparkFun library's chip-relative reading.");
     Serial.print("constexpr float kGyroOffset[3] = {");
     Serial.print(gyroOffsetRaw[0], 2);
     Serial.print("f, ");
@@ -738,7 +874,7 @@ void PrintRecommendedSettings() {
         Print3x3(mountRotation);
         Serial.println("};");
     } else {
-        Serial.println("// Accel calibration incomplete. Capture +X/-X/+Y/-Y/+Z/-Z first.");
+        Serial.println("// Accel calibration incomplete. Capture body/rocket faces with x X y Y z Z first.");
     }
 
     if (haveMag) {
@@ -753,22 +889,12 @@ void PrintRecommendedSettings() {
         Print3x3(magAinv);
         Serial.println("};");
     } else {
-        Serial.println("// Mag calibration incomplete. Run a full sweep capture with m.");
+        Serial.println("// Mag calibration incomplete. Run m to start a full sweep, rotate through all orientations, then run m again.");
     }
 
-    Serial.print("// Current axis map/sign = {");
-    Serial.print(settings::sensors::lsm9ds1::kAxisMap[0]);
-    Serial.print(", ");
-    Serial.print(settings::sensors::lsm9ds1::kAxisMap[1]);
-    Serial.print(", ");
-    Serial.print(settings::sensors::lsm9ds1::kAxisMap[2]);
-    Serial.print("} / {");
-    Serial.print(settings::sensors::lsm9ds1::kAxisSign[0]);
-    Serial.print(", ");
-    Serial.print(settings::sensors::lsm9ds1::kAxisSign[1]);
-    Serial.print(", ");
-    Serial.print(settings::sensors::lsm9ds1::kAxisSign[2]);
-    Serial.println("}");
+    Serial.print("// Current axis map/sign = ");
+    PrintAxisMapSign();
+    Serial.println();
     if (haveGyroFit && g_gyroTemperaturePointCount >= 2) {
         Serial.print("constexpr float kGyroTempBiasSlopeRadPerSecPerC[3] = {");
         Serial.print(gyroTempSlopeRadPerSecPerC[0], 8);

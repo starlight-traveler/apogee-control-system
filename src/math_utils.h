@@ -313,6 +313,73 @@ inline double FastInvSqrt(double x) {
 }
 
 // ---------------------------------------------------------------------------
+// Quaternion Magnitude Validation
+// Checks if quaternion norm is within acceptable bounds.
+// Returns true if valid, false if corrupted (and resets to identity).
+// ---------------------------------------------------------------------------
+inline bool ValidateQuaternion(Quaternion &q) {
+    const float normSq = q.w * q.w + q.x * q.x + q.y * q.y + q.z * q.z;
+    // Check for NaN/Inf or magnitude way out of bounds
+    if (!std::isfinite(normSq) || normSq < 0.5f || normSq > 2.0f) {
+        // Severely corrupted - reset to identity
+        q.w = 1.0f;
+        q.x = 0.0f;
+        q.y = 0.0f;
+        q.z = 0.0f;
+        return false;
+    }
+    // Check if slightly out of unit bounds - renormalize
+    if (normSq < 0.98f || normSq > 1.02f) {
+        const float inv = FastInvSqrt(normSq);
+        q.w *= inv;
+        q.x *= inv;
+        q.y *= inv;
+        q.z *= inv;
+    }
+    return true;
+}
+
+inline bool ValidateQuaternion(Quaterniond &q) {
+    const double normSq = q.w * q.w + q.x * q.x + q.y * q.y + q.z * q.z;
+    if (!std::isfinite(normSq) || normSq < 0.5 || normSq > 2.0) {
+        q.w = 1.0;
+        q.x = 0.0;
+        q.y = 0.0;
+        q.z = 0.0;
+        return false;
+    }
+    if (normSq < 0.98 || normSq > 1.02) {
+        const double inv = FastInvSqrt(normSq);
+        q.w *= inv;
+        q.x *= inv;
+        q.y *= inv;
+        q.z *= inv;
+    }
+    return true;
+}
+
+/// Validates a quaternion stored as float array [w, x, y, z].
+/// Returns true if valid, false if corrupted (and resets to identity).
+inline bool ValidateQuaternionArray(float* q) {
+    const float normSq = q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3];
+    if (!std::isfinite(normSq) || normSq < 0.5f || normSq > 2.0f) {
+        q[0] = 1.0f;
+        q[1] = 0.0f;
+        q[2] = 0.0f;
+        q[3] = 0.0f;
+        return false;
+    }
+    if (normSq < 0.98f || normSq > 1.02f) {
+        const float inv = FastInvSqrt(normSq);
+        q[0] *= inv;
+        q[1] *= inv;
+        q[2] *= inv;
+        q[3] *= inv;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 // Quaternion Dot Product
 // ---------------------------------------------------------------------------
 inline float Dot(const Quaternion &a, const Quaternion &b) {

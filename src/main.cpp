@@ -5,6 +5,7 @@
 #include <limits>
 #include <stdlib.h>
 #include <string.h>
+#include <SPI.h>
 
 #include "bno085_sensor.h"
 #include "bmp585_sensor.h"
@@ -30,6 +31,9 @@ namespace {
 /// Flight-loop constants mirrored locally to keep `main.cpp` readable.
 constexpr uint8_t kStatusLedPin = settings::hardware::kStatusLedPin;
 constexpr uint8_t kBuzzerPin = settings::hardware::kBuzzerPin;
+constexpr int8_t kAirliftSsPin = settings::network::kAirliftSsPin;
+constexpr int8_t kAirliftResetPin = settings::network::kAirliftResetPin;
+constexpr int8_t kAirliftGpio0Pin = settings::network::kAirliftGpio0Pin;
 constexpr uint32_t kErrorBlinkIntervalMs = settings::flight::kErrorBlinkIntervalMs;
 constexpr uint32_t kRecoveryBlinkIntervalMs = settings::flight::kRecoveryBlinkIntervalMs;
 constexpr float kServoMaxActuationDeg = settings::actuation::kServoMaxActuationDeg;
@@ -41,15 +45,26 @@ constexpr float kBarometerAgreementThresholdFeet = settings::sensors::ms5611::kA
 constexpr bool kBnoEnabled = settings::sensors::bno::kEnabled;
 constexpr bool kLsmEnabled = settings::sensors::lsm9ds1::kEnabled;
 constexpr bool kPulseEnabled = settings::sensors::ellipse20::kEnabled;
+constexpr int8_t kBnoResetPin = settings::sensors::bno085::kResetPin;
+constexpr uint32_t kBnoResetPulseDelayMs = settings::sensors::bno085::kResetPulseDelayMs;
+constexpr uint32_t kBnoPostResetBootDelayMs = settings::sensors::bno085::kPostResetBootDelayMs;
+constexpr uint8_t kBmpChipSelectPin = 35;
+constexpr uint8_t kMs5611ChipSelectPin = settings::sensors::ms5611::kChipSelectPin;
+constexpr uint8_t kBnoChipSelectPin = settings::sensors::bno085::kChipSelectPin;
+constexpr uint8_t kIcmChipSelectPin = settings::sensors::icm20948::kChipSelectPin;
+constexpr uint8_t kLsmAccelGyroChipSelectPin = settings::sensors::lsm9ds1::kAccelGyroChipSelectPin;
+constexpr uint8_t kLsmMagChipSelectPin = settings::sensors::lsm9ds1::kMagChipSelectPin;
 constexpr uint32_t kPulseSampleMaxAgeUs = settings::sensors::ellipse20::kSampleMaxAgeUs;
 constexpr bool kPulseUseAsMainQuaternionFallback =
     settings::sensors::ellipse20::kUseAsMainQuaternionFallback;
 constexpr uint32_t kRecoveryRetryInitialMs = settings::flight::kRecoveryRetryInitialMs;
 constexpr uint32_t kRecoveryRetryStepMs = settings::flight::kRecoveryRetryStepMs;
 constexpr uint32_t kRecoveryRetryMaxMs = settings::flight::kRecoveryRetryMaxMs;
+constexpr uint32_t kCriticalStartupResetAttempts = 5;
 constexpr uint32_t kTimingLogIntervalMs = settings::flight::kTimingLogIntervalMs;
 constexpr uint8_t kCfdStartupRetryCount = 5;
 constexpr uint32_t kCfdStartupRetryDelayMs = 200;
+constexpr uint32_t kSpiBusStartupSettleDelayMs = 50;
 constexpr float kCrossCheckAccelFullTrustMps2 = settings::sensors::icm20948::crosscheck::kAccelDiffFullTrustMps2;
 constexpr float kCrossCheckAccelZeroTrustMps2 = settings::sensors::icm20948::crosscheck::kAccelDiffZeroTrustMps2;
 constexpr float kCrossCheckGyroFullTrustRadPerSec = settings::sensors::icm20948::crosscheck::kGyroDiffFullTrustRadPerSec;
@@ -134,6 +149,17 @@ void LogSetupCheckpoint(const char *message) {
     LOG_PRINTLN(message);
 }
 
+[[noreturn]] void ForceTeensyReboot(const char *reason) {
+    LOG_PRINT("[fatal] rebooting Teensy: ");
+    LOG_PRINTLN(reason);
+    Serial.flush();
+    delay(10);
+    SCB_AIRCR = 0x05FA0004;
+    __DSB();
+    while (true) {
+    }
+}
+
 bool StartBnoDuringSetup() {
     if (!kBnoEnabled) {
         return false;
@@ -163,6 +189,66 @@ bool LoadCfdTableDuringSetup(CfdTableStorage *storage) {
         }
     }
     return false;
+}
+
+void DrivePinHighIfValid(int pin) {
+    if (pin < 0) {
+        return;
+    }
+    pinMode(pin, OUTPUT);
+    digitalWrite(pin, HIGH);
+}
+
+void DrivePinLowIfValid(int pin) {
+    if (pin < 0) {
+        return;
+    }
+    pinMode(pin, OUTPUT);
+    digitalWrite(pin, LOW);
+}
+
+void PrepareSpiChipSelectPins() {
+    DrivePinHighIfValid(kAirliftSsPin);
+    DrivePinHighIfValid(kBmpChipSelectPin);
+    DrivePinHighIfValid(kMs5611ChipSelectPin);
+    DrivePinHighIfValid(kBnoChipSelectPin);
+    DrivePinHighIfValid(kIcmChipSelectPin);
+    DrivePinHighIfValid(kLsmAccelGyroChipSelectPin);
+    DrivePinHighIfValid(kLsmMagChipSelectPin);
+}
+
+void PreparePeripheralResetPins() {
+    DrivePinHighIfValid(kAirliftResetPin);
+    if (kAirliftGpio0Pin >= 0) {
+        pinMode(kAirliftGpio0Pin, INPUT_PULLUP);
+    }
+    if (kBnoResetPin >= 0) {
+        DrivePinHighIfValid(kBnoResetPin);
+    }
+}
+
+void ResetBnoIfWired() {
+    if (kBnoResetPin < 0) {
+        return;
+    }
+    DrivePinHighIfValid(kBnoResetPin);
+    delay(kSpiBusStartupSettleDelayMs);
+    DrivePinLowIfValid(kBnoResetPin);
+    delay(kBnoResetPulseDelayMs);
+    DrivePinHighIfValid(kBnoResetPin);
+    delay(kBnoPostResetBootDelayMs);
+}
+
+void PrepareSpiBusesForStartup() {
+    PrepareSpiChipSelectPins();
+    PreparePeripheralResetPins();
+    SPI.begin();
+    SPI1.begin();
+    PrepareSpiChipSelectPins();
+    delay(kSpiBusStartupSettleDelayMs);
+    ResetBnoIfWired();
+    PrepareSpiChipSelectPins();
+    delay(kSpiBusStartupSettleDelayMs);
 }
 
 /// Plays the current boot melody.
@@ -511,10 +597,124 @@ static float VectorDiffNorm3(const float a[3], const float b[3]) {
     return sqrtf(dx * dx + dy * dy + dz * dz);
 }
 
-static float QuaternionAngleDifferenceDeg(const float a[4], const float b[4]) {
-    float dot = fabsf(a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3]);
-    dot = std::max(0.0f, std::min(1.0f, dot));
-    return 2.0f * acosf(dot) * (180.0f / 3.14159265358979323846f);
+static bool LoadValidatedQuaternion(const float values[4], math_utils::Quaternion &quat) {
+    quat = math_utils::MakeQuaternion(values[0], values[1], values[2], values[3]);
+    return math_utils::ValidateQuaternion(quat);
+}
+
+static bool QuaternionFromPitchRollDeg(float pitchDeg, float rollDeg, float quaternion[4]) {
+    if (quaternion == nullptr || !std::isfinite(pitchDeg) || !std::isfinite(rollDeg)) {
+        return false;
+    }
+    constexpr float kDegToRad = 3.14159265358979323846f / 180.0f;
+    const float halfPitch = 0.5f * pitchDeg * kDegToRad;
+    const float halfRoll = 0.5f * rollDeg * kDegToRad;
+    float sinPitch = 0.0f;
+    float cosPitch = 1.0f;
+    float sinRoll = 0.0f;
+    float cosRoll = 1.0f;
+    math_utils::FastSinCos(halfPitch, sinPitch, cosPitch);
+    math_utils::FastSinCos(halfRoll, sinRoll, cosRoll);
+    const math_utils::Quaternion q = math_utils::Normalize(math_utils::MakeQuaternion(
+        cosPitch * cosRoll,
+        -cosPitch * sinRoll,
+        -sinPitch * cosRoll,
+        -sinPitch * sinRoll));
+    quaternion[0] = q.w;
+    quaternion[1] = q.x;
+    quaternion[2] = q.y;
+    quaternion[3] = q.z;
+    return true;
+}
+
+static bool TiltQuaternionFromYprDeg(const float yprDeg[3], float quaternion[4]) {
+    if (yprDeg == nullptr) {
+        return false;
+    }
+    return QuaternionFromPitchRollDeg(yprDeg[1], yprDeg[2], quaternion);
+}
+
+static bool TiltQuaternionFromQuaternion(const float input[4], float quaternion[4]) {
+    math_utils::Quaternion q = math_utils::MakeQuaternion(1.0f, 0.0f, 0.0f, 0.0f);
+    if (!LoadValidatedQuaternion(input, q)) {
+        return false;
+    }
+    float yaw = 0.0f;
+    float pitch = 0.0f;
+    float roll = 0.0f;
+    math_utils::QuaternionToEuler(q, yaw, pitch, roll);
+    return QuaternionFromPitchRollDeg(pitch * (180.0f / 3.14159265358979323846f),
+                                      roll * (180.0f / 3.14159265358979323846f),
+                                      quaternion);
+}
+
+static void PreferTiltOnlyQuaternion(float quaternion[4], bool &hasQuaternion, const float bootstrapYprDeg[3], bool hasBootstrapYpr) {
+    float tiltQuaternion[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+    if (hasBootstrapYpr && TiltQuaternionFromYprDeg(bootstrapYprDeg, tiltQuaternion)) {
+        for (int i = 0; i < 4; ++i) {
+            quaternion[i] = tiltQuaternion[i];
+        }
+        hasQuaternion = true;
+        return;
+    }
+    if (hasQuaternion && TiltQuaternionFromQuaternion(quaternion, tiltQuaternion)) {
+        for (int i = 0; i < 4; ++i) {
+            quaternion[i] = tiltQuaternion[i];
+        }
+        return;
+    }
+    hasQuaternion = false;
+}
+
+static bool ZenithDegFromYprDeg(const float yprDeg[3], float &zenithDeg) {
+    constexpr float kDegToRad = 3.14159265358979323846f / 180.0f;
+    const float pitchRad = yprDeg[1] * kDegToRad;
+    const float rollRad = yprDeg[2] * kDegToRad;
+    const float zenithRad = math_utils::EulerToZenith(pitchRad, rollRad);
+    if (!std::isfinite(zenithRad)) {
+        return false;
+    }
+    zenithDeg = fabsf(zenithRad) * (180.0f / 3.14159265358979323846f);
+    return true;
+}
+
+static bool ZenithDegFromQuaternion(const float quaternion[4], float &zenithDeg) {
+    math_utils::Quaternion q = math_utils::MakeQuaternion(1.0f, 0.0f, 0.0f, 0.0f);
+    if (!LoadValidatedQuaternion(quaternion, q)) {
+        return false;
+    }
+    float yaw = 0.0f;
+    float pitch = 0.0f;
+    float roll = 0.0f;
+    math_utils::QuaternionToEuler(q, yaw, pitch, roll);
+    const float zenithRad = math_utils::EulerToZenith(pitch, roll);
+    if (!std::isfinite(zenithRad)) {
+        return false;
+    }
+    zenithDeg = fabsf(zenithRad) * (180.0f / 3.14159265358979323846f);
+    return true;
+}
+
+static bool TiltDifferenceDegFromYprDeg(const float yprA[3], const float yprB[3], float &differenceDeg) {
+    float zenithA = 0.0f;
+    float zenithB = 0.0f;
+    if (!ZenithDegFromYprDeg(yprA, zenithA) || !ZenithDegFromYprDeg(yprB, zenithB)) {
+        return false;
+    }
+    differenceDeg = fabsf(zenithA - zenithB);
+    return true;
+}
+
+static bool TiltDifferenceDegFromQuaternions(const float quaternionA[4],
+                                             const float quaternionB[4],
+                                             float &differenceDeg) {
+    float zenithA = 0.0f;
+    float zenithB = 0.0f;
+    if (!ZenithDegFromQuaternion(quaternionA, zenithA) || !ZenithDegFromQuaternion(quaternionB, zenithB)) {
+        return false;
+    }
+    differenceDeg = fabsf(zenithA - zenithB);
+    return true;
 }
 
 static float DescendingTrust(float value, float fullTrustMax, float zeroTrustMin) {
@@ -601,109 +801,129 @@ static bool SamplesComparable(uint32_t nowUs,
 
 static float ComputeCrossCheckTrust(const float accelA[3],
                                     const float gyroA[3],
-                                    const bool hasQuaternionA,
-                                    const float quaternionA[4],
                                     const float accelB[3],
-                                    const float gyroB[3],
-                                    const bool hasQuaternionB,
-                                    const float quaternionB[4]) {
+                                    const float gyroB[3]) {
     const float accelTrust = DescendingTrust(VectorDiffNorm3(accelA, accelB),
                                              kCrossCheckAccelFullTrustMps2,
                                              kCrossCheckAccelZeroTrustMps2);
     const float gyroTrust = DescendingTrust(VectorDiffNorm3(gyroA, gyroB),
                                             kCrossCheckGyroFullTrustRadPerSec,
                                             kCrossCheckGyroZeroTrustRadPerSec);
-    float trust = std::min(accelTrust, gyroTrust);
-    if (hasQuaternionA && hasQuaternionB) {
-        const float quaternionTrust = DescendingTrust(QuaternionAngleDifferenceDeg(quaternionA, quaternionB),
-                                                      kCrossCheckQuaternionFullTrustDeg,
-                                                      kCrossCheckQuaternionZeroTrustDeg);
-        trust = std::min(trust, quaternionTrust);
+    return std::max(0.0f, std::min(1.0f, std::min(accelTrust, gyroTrust)));
+}
+
+static float ApplyTiltTrust(float baseTrust, bool hasTiltDifference, float tiltDifferenceDeg) {
+    if (!hasTiltDifference) {
+        return baseTrust;
     }
-    return std::max(0.0f, std::min(1.0f, trust));
+    const float tiltTrust = DescendingTrust(tiltDifferenceDeg,
+                                            kCrossCheckQuaternionFullTrustDeg,
+                                            kCrossCheckQuaternionZeroTrustDeg);
+    return std::max(0.0f, std::min(1.0f, std::min(baseTrust, tiltTrust)));
 }
 
-static float ComputeIcmLsmCrossCheckTrust(const SensorData &icmData, const SensorData &lsmData) {
-    return ComputeCrossCheckTrust(icmData.accelICM,
-                                  icmData.gyro,
-                                  icmData.hasIcmQuaternion,
-                                  icmData.icmQuaternion,
-                                  lsmData.accelICM,
-                                  lsmData.gyro,
-                                  lsmData.hasIcmQuaternion,
-                                  lsmData.icmQuaternion);
+static float ComputeTiltOnlyTrust(bool hasTiltDifference, float tiltDifferenceDeg) {
+    if (!hasTiltDifference) {
+        return 0.0f;
+    }
+    return DescendingTrust(tiltDifferenceDeg,
+                           kCrossCheckQuaternionFullTrustDeg,
+                           kCrossCheckQuaternionZeroTrustDeg);
 }
 
-static float ComputeBnoIcmCrossCheckTrust(const Bno085Sample &bnoData, const SensorData &icmData) {
-    return ComputeCrossCheckTrust(bnoData.accel,
-                                  bnoData.gyro,
-                                  bnoData.hasQuaternion,
-                                  bnoData.quaternion,
-                                  icmData.accelICM,
-                                  icmData.gyro,
-                                  icmData.hasIcmQuaternion,
-                                  icmData.icmQuaternion);
+static bool ComputeIcmLsmTiltDifference(const SensorData &icmData,
+                                        const Icm20948Diagnostics &icmDiagnostics,
+                                        const SensorData &lsmData,
+                                        const Lsm9ds1Diagnostics &lsmDiagnostics,
+                                        float &differenceDeg) {
+    if (icmDiagnostics.hasBootstrapYpr && lsmDiagnostics.hasBootstrapYpr) {
+        return TiltDifferenceDegFromYprDeg(icmDiagnostics.bootstrapYprDeg, lsmDiagnostics.bootstrapYprDeg, differenceDeg);
+    }
+    if (icmData.hasIcmQuaternion && lsmData.hasIcmQuaternion) {
+        return TiltDifferenceDegFromQuaternions(icmData.icmQuaternion, lsmData.icmQuaternion, differenceDeg);
+    }
+    return false;
 }
 
-static float ComputeBnoLsmCrossCheckTrust(const Bno085Sample &bnoData, const SensorData &lsmData) {
-    return ComputeCrossCheckTrust(bnoData.accel,
-                                  bnoData.gyro,
-                                  bnoData.hasQuaternion,
-                                  bnoData.quaternion,
-                                  lsmData.accelICM,
-                                  lsmData.gyro,
-                                  lsmData.hasIcmQuaternion,
-                                  lsmData.icmQuaternion);
+static bool ComputeBnoIcmTiltDifference(const Bno085Sample &bnoData,
+                                        const Bno085Diagnostics &bnoDiagnostics,
+                                        const SensorData &icmData,
+                                        const Icm20948Diagnostics &icmDiagnostics,
+                                        float &differenceDeg) {
+    if (bnoDiagnostics.hasBootstrapYpr && icmDiagnostics.hasBootstrapYpr) {
+        return TiltDifferenceDegFromYprDeg(bnoDiagnostics.bootstrapYprDeg, icmDiagnostics.bootstrapYprDeg, differenceDeg);
+    }
+    if (bnoData.hasQuaternion && icmData.hasIcmQuaternion) {
+        return TiltDifferenceDegFromQuaternions(bnoData.quaternion, icmData.icmQuaternion, differenceDeg);
+    }
+    return false;
+}
+
+static bool ComputeBnoLsmTiltDifference(const Bno085Sample &bnoData,
+                                        const Bno085Diagnostics &bnoDiagnostics,
+                                        const SensorData &lsmData,
+                                        const Lsm9ds1Diagnostics &lsmDiagnostics,
+                                        float &differenceDeg) {
+    if (bnoDiagnostics.hasBootstrapYpr && lsmDiagnostics.hasBootstrapYpr) {
+        return TiltDifferenceDegFromYprDeg(bnoDiagnostics.bootstrapYprDeg, lsmDiagnostics.bootstrapYprDeg, differenceDeg);
+    }
+    if (bnoData.hasQuaternion && lsmData.hasIcmQuaternion) {
+        return TiltDifferenceDegFromQuaternions(bnoData.quaternion, lsmData.icmQuaternion, differenceDeg);
+    }
+    return false;
 }
 
 static float ComputeIcmPulseCrossCheckTrust(const SensorData &icmData, const SensorData &pulseData) {
-    return ComputeCrossCheckTrust(icmData.accelICM,
-                                  icmData.gyro,
-                                  icmData.hasIcmQuaternion,
-                                  icmData.icmQuaternion,
-                                  pulseData.accelPulse,
-                                  pulseData.gyroPulse,
-                                  pulseData.hasPulseQuaternion,
-                                  pulseData.quaternionPulse);
+    const float baseTrust = ComputeCrossCheckTrust(icmData.accelICM,
+                                                   icmData.gyro,
+                                                   pulseData.accelPulse,
+                                                   pulseData.gyroPulse);
+    float tiltDifferenceDeg = 0.0f;
+    const bool hasTiltDifference =
+        icmData.hasIcmQuaternion &&
+        pulseData.hasPulseQuaternion &&
+        TiltDifferenceDegFromQuaternions(icmData.icmQuaternion, pulseData.quaternionPulse, tiltDifferenceDeg);
+    return ApplyTiltTrust(baseTrust, hasTiltDifference, tiltDifferenceDeg);
 }
 
 static float ComputeLsmPulseCrossCheckTrust(const SensorData &lsmData, const SensorData &pulseData) {
-    return ComputeCrossCheckTrust(lsmData.accelICM,
-                                  lsmData.gyro,
-                                  lsmData.hasIcmQuaternion,
-                                  lsmData.icmQuaternion,
-                                  pulseData.accelPulse,
-                                  pulseData.gyroPulse,
-                                  pulseData.hasPulseQuaternion,
-                                  pulseData.quaternionPulse);
+    const float baseTrust = ComputeCrossCheckTrust(lsmData.accelICM,
+                                                   lsmData.gyro,
+                                                   pulseData.accelPulse,
+                                                   pulseData.gyroPulse);
+    float tiltDifferenceDeg = 0.0f;
+    const bool hasTiltDifference =
+        lsmData.hasIcmQuaternion &&
+        pulseData.hasPulseQuaternion &&
+        TiltDifferenceDegFromQuaternions(lsmData.icmQuaternion, pulseData.quaternionPulse, tiltDifferenceDeg);
+    return ApplyTiltTrust(baseTrust, hasTiltDifference, tiltDifferenceDeg);
 }
 
 static float ComputeBnoPulseCrossCheckTrust(const Bno085Sample &bnoData, const SensorData &pulseData) {
-    return ComputeCrossCheckTrust(bnoData.accel,
-                                  bnoData.gyro,
-                                  bnoData.hasQuaternion,
-                                  bnoData.quaternion,
-                                  pulseData.accelPulse,
-                                  pulseData.gyroPulse,
-                                  pulseData.hasPulseQuaternion,
-                                  pulseData.quaternionPulse);
+    const float baseTrust = ComputeCrossCheckTrust(bnoData.accel,
+                                                   bnoData.gyro,
+                                                   pulseData.accelPulse,
+                                                   pulseData.gyroPulse);
+    float tiltDifferenceDeg = 0.0f;
+    const bool hasTiltDifference =
+        bnoData.hasQuaternion &&
+        pulseData.hasPulseQuaternion &&
+        TiltDifferenceDegFromQuaternions(bnoData.quaternion, pulseData.quaternionPulse, tiltDifferenceDeg);
+    return ApplyTiltTrust(baseTrust, hasTiltDifference, tiltDifferenceDeg);
 }
 
 static void UpdatePairComparisonStats(SensorComparisonStats::PairStats &stats,
                                       const float accelA[3],
                                       const float gyroA[3],
-                                      const bool hasQuaternionA,
-                                      const float quaternionA[4],
                                       const float accelB[3],
                                       const float gyroB[3],
-                                      const bool hasQuaternionB,
-                                      const float quaternionB[4]) {
+                                      const bool hasTiltDifference,
+                                      float tiltDifferenceDeg) {
     ++stats.samples;
     stats.maxAccelDiffMps2 = std::max(stats.maxAccelDiffMps2, VectorDiffNorm3(accelA, accelB));
     stats.maxGyroDiffRadPerSec = std::max(stats.maxGyroDiffRadPerSec, VectorDiffNorm3(gyroA, gyroB));
-    if (hasQuaternionA && hasQuaternionB) {
-        stats.maxQuaternionAngleDeg =
-            std::max(stats.maxQuaternionAngleDeg, QuaternionAngleDifferenceDeg(quaternionA, quaternionB));
+    if (hasTiltDifference) {
+        stats.maxQuaternionAngleDeg = std::max(stats.maxQuaternionAngleDeg, tiltDifferenceDeg);
     }
 }
 
@@ -766,11 +986,23 @@ static void CopyPulseFields(SensorData &dst, const SensorData &src) {
 }
 
 static void SetMainQuaternion(SensorData &data, const float quaternion[4], MainQuaternionSource source) {
-    for (int i = 0; i < 4; ++i) {
-        data.quaternion[i] = quaternion[i];
+    float tiltQuaternion[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+    if (!TiltQuaternionFromQuaternion(quaternion, tiltQuaternion)) {
+        data.hasQuaternion = false;
+        data.mainQuaternionSource = static_cast<uint8_t>(MainQuaternionSource::None);
+        return;
     }
+    data.quaternion[0] = tiltQuaternion[0];
+    data.quaternion[1] = tiltQuaternion[1];
+    data.quaternion[2] = tiltQuaternion[2];
+    data.quaternion[3] = tiltQuaternion[3];
     data.hasQuaternion = true;
     data.mainQuaternionSource = static_cast<uint8_t>(source);
+}
+
+static void SetMainQuaternion(SensorData &data, const math_utils::Quaternion &quaternion, MainQuaternionSource source) {
+    const float values[4] = {quaternion.w, quaternion.x, quaternion.y, quaternion.z};
+    SetMainQuaternion(data, values, source);
 }
 
 /// Acquires one sensor sample from replay or live hardware.
@@ -797,6 +1029,7 @@ static bool AcquireSensorData(SensorData &data) {
     }
     const bool hasBnoImu = kBnoEnabled ? Bno085SensorAcquire(data) : false;
     const Bno085Sample bnoData = kBnoEnabled ? Bno085SensorGetSample() : Bno085Sample{};
+    const Bno085Diagnostics bnoDiagnostics = kBnoEnabled ? Bno085SensorGetDiagnostics() : Bno085Diagnostics{};
     const bool hasIcmImu = Icm20948SensorAcquire(data);
     const Icm20948Diagnostics icmDiagnostics = Icm20948SensorGetDiagnostics();
     SensorData lsmData;
@@ -809,6 +1042,22 @@ static bool AcquireSensorData(SensorData &data) {
     if (hasLsmImu) {
         CopyLsmFields(data, lsmData);
     }
+    PreferTiltOnlyQuaternion(data.icmQuaternion,
+                             data.hasIcmQuaternion,
+                             icmDiagnostics.bootstrapYprDeg,
+                             icmDiagnostics.hasBootstrapYpr);
+    PreferTiltOnlyQuaternion(lsmData.icmQuaternion,
+                             lsmData.hasIcmQuaternion,
+                             lsmDiagnostics.bootstrapYprDeg,
+                             lsmDiagnostics.hasBootstrapYpr);
+    PreferTiltOnlyQuaternion(data.quaternionBNO,
+                             data.hasBnoQuaternion,
+                             bnoDiagnostics.bootstrapYprDeg,
+                             bnoDiagnostics.hasBootstrapYpr);
+    PreferTiltOnlyQuaternion(data.quaternionPulse,
+                             data.hasPulseQuaternion,
+                             nullptr,
+                             false);
     ++g_sensorAcquireStats.loops;
     if (hasBnoImu) {
         ++g_sensorAcquireStats.bnoHits;
@@ -858,16 +1107,23 @@ static bool AcquireSensorData(SensorData &data) {
                           kCrossCheckFastSampleMaxAgeUs,
                           kCrossCheckFastPairMaxSkewUs);
     if (compareIcmLsm) {
+        float tiltDifferenceDeg = 0.0f;
+        const bool hasTiltDifference =
+            ComputeIcmLsmTiltDifference(data, icmDiagnostics, lsmData, lsmDiagnostics, tiltDifferenceDeg);
         UpdatePairComparisonStats(g_sensorComparisonStats.icmLsm,
                                   data.accelICM,
                                   data.gyro,
-                                  data.hasIcmQuaternion,
-                                  data.icmQuaternion,
                                   lsmData.accelICM,
                                   lsmData.gyro,
-                                  lsmData.hasIcmQuaternion,
-                                  lsmData.icmQuaternion);
-        icmLsmTargetTrust = std::min(icmLsmTargetTrust, ComputeIcmLsmCrossCheckTrust(data, lsmData));
+                                  hasTiltDifference,
+                                  tiltDifferenceDeg);
+        const float trust = hasTiltDifference
+                                ? ComputeTiltOnlyTrust(hasTiltDifference, tiltDifferenceDeg)
+                                : ComputeCrossCheckTrust(data.accelICM,
+                                                         data.gyro,
+                                                         lsmData.accelICM,
+                                                         lsmData.gyro);
+        icmLsmTargetTrust = std::min(icmLsmTargetTrust, trust);
         updatedIcmLsmTrust = true;
     }
     const bool compareBnoIcm =
@@ -879,16 +1135,23 @@ static bool AcquireSensorData(SensorData &data) {
                           kCrossCheckFastSampleMaxAgeUs,
                           kCrossCheckBnoPairMaxSkewUs);
     if (compareBnoIcm) {
+        float tiltDifferenceDeg = 0.0f;
+        const bool hasTiltDifference =
+            ComputeBnoIcmTiltDifference(bnoData, bnoDiagnostics, data, icmDiagnostics, tiltDifferenceDeg);
         UpdatePairComparisonStats(g_sensorComparisonStats.icmBno,
                                   data.accelICM,
                                   data.gyro,
-                                  data.hasIcmQuaternion,
-                                  data.icmQuaternion,
                                   bnoData.accel,
                                   bnoData.gyro,
-                                  bnoData.hasQuaternion,
-                                  bnoData.quaternion);
-        bnoReferenceTargetTrust = std::min(bnoReferenceTargetTrust, ComputeBnoIcmCrossCheckTrust(bnoData, data));
+                                  hasTiltDifference,
+                                  tiltDifferenceDeg);
+        const float trust = hasTiltDifference
+                                ? ComputeTiltOnlyTrust(hasTiltDifference, tiltDifferenceDeg)
+                                : ComputeCrossCheckTrust(data.accelICM,
+                                                         data.gyro,
+                                                         bnoData.accel,
+                                                         bnoData.gyro);
+        bnoReferenceTargetTrust = std::min(bnoReferenceTargetTrust, trust);
         updatedBnoReferenceTrust = true;
     }
     const bool compareBnoLsm =
@@ -900,16 +1163,23 @@ static bool AcquireSensorData(SensorData &data) {
                           kCrossCheckFastSampleMaxAgeUs,
                           kCrossCheckBnoPairMaxSkewUs);
     if (compareBnoLsm) {
+        float tiltDifferenceDeg = 0.0f;
+        const bool hasTiltDifference =
+            ComputeBnoLsmTiltDifference(bnoData, bnoDiagnostics, lsmData, lsmDiagnostics, tiltDifferenceDeg);
         UpdatePairComparisonStats(g_sensorComparisonStats.lsmBno,
                                   lsmData.accelICM,
                                   lsmData.gyro,
-                                  lsmData.hasIcmQuaternion,
-                                  lsmData.icmQuaternion,
                                   bnoData.accel,
                                   bnoData.gyro,
-                                  bnoData.hasQuaternion,
-                                  bnoData.quaternion);
-        bnoReferenceTargetTrust = std::min(bnoReferenceTargetTrust, ComputeBnoLsmCrossCheckTrust(bnoData, lsmData));
+                                  hasTiltDifference,
+                                  tiltDifferenceDeg);
+        const float trust = hasTiltDifference
+                                ? ComputeTiltOnlyTrust(hasTiltDifference, tiltDifferenceDeg)
+                                : ComputeCrossCheckTrust(lsmData.accelICM,
+                                                         lsmData.gyro,
+                                                         bnoData.accel,
+                                                         bnoData.gyro);
+        bnoReferenceTargetTrust = std::min(bnoReferenceTargetTrust, trust);
         updatedBnoReferenceTrust = true;
     }
     float pulseTargetTrust = 1.0f;
@@ -923,15 +1193,18 @@ static bool AcquireSensorData(SensorData &data) {
                           kPulseSampleMaxAgeUs,
                           kCrossCheckBnoPairMaxSkewUs);
     if (compareIcmPulse) {
+        float tiltDifferenceDeg = 0.0f;
+        const bool hasTiltDifference =
+            data.hasIcmQuaternion &&
+            pulseData.hasPulseQuaternion &&
+            TiltDifferenceDegFromQuaternions(data.icmQuaternion, pulseData.quaternionPulse, tiltDifferenceDeg);
         UpdatePairComparisonStats(g_sensorComparisonStats.icmPulse,
                                   data.accelICM,
                                   data.gyro,
-                                  data.hasIcmQuaternion,
-                                  data.icmQuaternion,
                                   pulseData.accelPulse,
                                   pulseData.gyroPulse,
-                                  pulseData.hasPulseQuaternion,
-                                  pulseData.quaternionPulse);
+                                  hasTiltDifference,
+                                  tiltDifferenceDeg);
         const float icmPulseTrust = ComputeIcmPulseCrossCheckTrust(data, pulseData);
         pulseTargetTrust = std::min(pulseTargetTrust, icmPulseTrust);
         // Bidirectional: Pulse disagreement also affects ICM/LSM trust.
@@ -948,15 +1221,18 @@ static bool AcquireSensorData(SensorData &data) {
                           kPulseSampleMaxAgeUs,
                           kCrossCheckBnoPairMaxSkewUs);
     if (compareLsmPulse) {
+        float tiltDifferenceDeg = 0.0f;
+        const bool hasTiltDifference =
+            lsmData.hasIcmQuaternion &&
+            pulseData.hasPulseQuaternion &&
+            TiltDifferenceDegFromQuaternions(lsmData.icmQuaternion, pulseData.quaternionPulse, tiltDifferenceDeg);
         UpdatePairComparisonStats(g_sensorComparisonStats.lsmPulse,
                                   lsmData.accelICM,
                                   lsmData.gyro,
-                                  lsmData.hasIcmQuaternion,
-                                  lsmData.icmQuaternion,
                                   pulseData.accelPulse,
                                   pulseData.gyroPulse,
-                                  pulseData.hasPulseQuaternion,
-                                  pulseData.quaternionPulse);
+                                  hasTiltDifference,
+                                  tiltDifferenceDeg);
         const float lsmPulseTrust = ComputeLsmPulseCrossCheckTrust(lsmData, pulseData);
         pulseTargetTrust = std::min(pulseTargetTrust, lsmPulseTrust);
         // Bidirectional: Pulse disagreement also affects ICM/LSM trust.
@@ -973,15 +1249,18 @@ static bool AcquireSensorData(SensorData &data) {
                           kPulseSampleMaxAgeUs,
                           kCrossCheckBnoPairMaxSkewUs);
     if (compareBnoPulse) {
+        float tiltDifferenceDeg = 0.0f;
+        const bool hasTiltDifference =
+            pulseData.hasPulseQuaternion &&
+            bnoData.hasQuaternion &&
+            TiltDifferenceDegFromQuaternions(pulseData.quaternionPulse, bnoData.quaternion, tiltDifferenceDeg);
         UpdatePairComparisonStats(g_sensorComparisonStats.pulseBno,
                                   pulseData.accelPulse,
                                   pulseData.gyroPulse,
-                                  pulseData.hasPulseQuaternion,
-                                  pulseData.quaternionPulse,
                                   bnoData.accel,
                                   bnoData.gyro,
-                                  bnoData.hasQuaternion,
-                                  bnoData.quaternion);
+                                  hasTiltDifference,
+                                  tiltDifferenceDeg);
         pulseTargetTrust = std::min(pulseTargetTrust, ComputeBnoPulseCrossCheckTrust(bnoData, pulseData));
         bnoReferenceTargetTrust = std::min(bnoReferenceTargetTrust, ComputeBnoPulseCrossCheckTrust(bnoData, pulseData));
         updatedPulseTrust = true;
@@ -1225,15 +1504,13 @@ static bool AcquireSensorData(SensorData &data) {
                 std::clamp(kBnoReferenceCorrectionBlendFactor * g_bnoReferenceCrossCheckTrust, 0.0f, 1.0f);
             const math_utils::Quaternion corrected =
                 math_utils::Slerp(blendedQuat, bnoQuat, correctionBlend);
-            const float correctedQuat[4] = {corrected.w, corrected.x, corrected.y, corrected.z};
             const MainQuaternionSource finalSource =
                 (hasBlendedMultiple || correctionBlend > 0.0f) ? MainQuaternionSource::Blended : primarySource;
-            SetMainQuaternion(data, correctedQuat, finalSource);
+            SetMainQuaternion(data, corrected, finalSource);
         } else if (hasFastQuaternion) {
-            const float finalQuat[4] = {blendedQuat.w, blendedQuat.x, blendedQuat.y, blendedQuat.z};
             const MainQuaternionSource finalSource =
                 hasBlendedMultiple ? MainQuaternionSource::Blended : primarySource;
-            SetMainQuaternion(data, finalQuat, finalSource);
+            SetMainQuaternion(data, blendedQuat, finalSource);
         } else if (bnoHealthy) {
             SetMainQuaternion(data, data.quaternionBNO, MainQuaternionSource::Bno);
         } else if (pulseUsable) {
@@ -1340,6 +1617,7 @@ struct TimingStats {
 };
 
 static RetryState g_dataLoggerRetry;
+static RetryState g_bnoRetry;
 static RetryState g_icmRetry;
 static RetryState g_bmpRetry;
 static uint32_t g_lastTimingLogMs = 0;
@@ -1386,6 +1664,71 @@ static bool ServiceRetry(uint32_t nowMs,
     retry.nextAttemptMs = nowMs + retry.retryDelayMs;
     retry.retryDelayMs = std::min(retry.retryDelayMs + kRecoveryRetryStepMs, kRecoveryRetryMaxMs);
     return false;
+}
+
+static void RetryServiceUntilReady(RetryState &retry,
+                                   bool (*isReady)(),
+                                   bool (*initializer)(),
+                                   const char *serviceName,
+                                   const char *waitingMessage,
+                                   uint32_t resetAttempts = 0) {
+    uint32_t lastWaitLogMs = 0;
+    while (!isReady()) {
+        const uint32_t nowMs = millis();
+        ServiceRetry(nowMs, retry, isReady(), initializer, serviceName);
+        if (!isReady() && resetAttempts > 0 && retry.attempts >= resetAttempts) {
+            ForceTeensyReboot(serviceName);
+        }
+        if (!isReady() &&
+            (lastWaitLogMs == 0 || (nowMs - lastWaitLogMs) >= settings::flight::kDebugHeartbeatIntervalMs)) {
+            LogSetupCheckpoint(waitingMessage);
+            lastWaitLogMs = nowMs;
+        }
+        if (!isReady()) {
+            delay(10);
+        }
+    }
+}
+
+static void RetryCsvReplayUntilReady() {
+    if (!kEnableCsvReplay) {
+        return;
+    }
+
+    uint32_t lastWaitLogMs = 0;
+    while (!g_csvReplay.enabled) {
+        if (DataLoggerIsInitialized()) {
+            CsvReplayInit();
+        }
+        if (!g_csvReplay.enabled) {
+            const uint32_t nowMs = millis();
+            if (lastWaitLogMs == 0 || (nowMs - lastWaitLogMs) >= settings::flight::kDebugHeartbeatIntervalMs) {
+                LogSetupCheckpoint("CSV replay unavailable, retrying");
+                lastWaitLogMs = nowMs;
+            }
+            delay(50);
+        }
+    }
+}
+
+static void RetryCfdTableUntilLoaded(CfdTableStorage *storage) {
+    uint32_t lastWaitLogMs = 0;
+    uint32_t attempts = 0;
+    while (!storage->loaded) {
+        ++attempts;
+        if (LoadCfdTableDuringSetup(storage)) {
+            return;
+        }
+        if (attempts >= kCriticalStartupResetAttempts) {
+            ForceTeensyReboot("cfd_table");
+        }
+        const uint32_t nowMs = millis();
+        if (lastWaitLogMs == 0 || (nowMs - lastWaitLogMs) >= settings::flight::kDebugHeartbeatIntervalMs) {
+            LogSetupCheckpoint("CFD table unavailable, retrying");
+            lastWaitLogMs = nowMs;
+        }
+        delay(kCfdStartupRetryDelayMs);
+    }
 }
 
 /// Emits periodic loop and logger timing diagnostics, then resets the maxima.
@@ -1552,6 +1895,102 @@ static void LogTimingDiagnostics(uint32_t nowMs) {
     LOG_PRINT(g_bnoReferenceCrossCheckTrust, 2);
     LOG_PRINT("/");
     LOG_PRINT(g_pulseCrossCheckTrust, 2);
+    LOG_PRINT(" lsmdbg=m");
+    LOG_PRINT(lsm.hasMag ? '1' : '0');
+    LOG_PRINT(" ga=");
+    LOG_PRINT(lsm.groundAlignmentSampleCount);
+    LOG_PRINT("/");
+    LOG_PRINT(settings::sensors::lsm9ds1::kGroundAlignmentMinSamples);
+    LOG_PRINT(" at=");
+    LOG_PRINT(lsm.lastAccelTrust, 2);
+    LOG_PRINT(" mt=");
+    LOG_PRINT(lsm.lastMagTrust, 2);
+    LOG_PRINT(" am=");
+    LOG_PRINT(lsm.lastAccelMagnitudeG, 2);
+    LOG_PRINT(" mm=");
+    LOG_PRINT(lsm.lastMagMagnitude, 1);
+    LOG_PRINT(" mr=");
+    LOG_PRINT(lsm.magReferenceNorm, 1);
+    LOG_PRINT(" byaw=");
+    LOG_PRINT(bno.yprDeg[0], 1);
+    LOG_PRINT(" iboot=");
+    if (icm.hasBootstrapYpr) {
+        LOG_PRINT("(");
+        LOG_PRINT(icm.bootstrapYprDeg[0], 1);
+        LOG_PRINT(",");
+        LOG_PRINT(icm.bootstrapYprDeg[1], 1);
+        LOG_PRINT(",");
+        LOG_PRINT(icm.bootstrapYprDeg[2], 1);
+        LOG_PRINT(")");
+    } else {
+        LOG_PRINT("na");
+    }
+    LOG_PRINT(" lboot=");
+    if (lsm.hasBootstrapYpr) {
+        LOG_PRINT("(");
+        LOG_PRINT(lsm.bootstrapYprDeg[0], 1);
+        LOG_PRINT(",");
+        LOG_PRINT(lsm.bootstrapYprDeg[1], 1);
+        LOG_PRINT(",");
+        LOG_PRINT(lsm.bootstrapYprDeg[2], 1);
+        LOG_PRINT(")");
+    } else {
+        LOG_PRINT("na");
+    }
+    LOG_PRINT(" bboot=");
+    if (bno.hasBootstrapYpr) {
+        LOG_PRINT("(");
+        LOG_PRINT(bno.bootstrapYprDeg[0], 1);
+        LOG_PRINT(",");
+        LOG_PRINT(bno.bootstrapYprDeg[1], 1);
+        LOG_PRINT(",");
+        LOG_PRINT(bno.bootstrapYprDeg[2], 1);
+        LOG_PRINT(")");
+    } else {
+        LOG_PRINT("na");
+    }
+    LOG_PRINT(" iaccg=(");
+    LOG_PRINT(icm.accelPreMountG[0], 2);
+    LOG_PRINT(",");
+    LOG_PRINT(icm.accelPreMountG[1], 2);
+    LOG_PRINT(",");
+    LOG_PRINT(icm.accelPreMountG[2], 2);
+    LOG_PRINT(")");
+    LOG_PRINT(" iacc=(");
+    LOG_PRINT(icm.accelBodyMps2[0], 2);
+    LOG_PRINT(",");
+    LOG_PRINT(icm.accelBodyMps2[1], 2);
+    LOG_PRINT(",");
+    LOG_PRINT(icm.accelBodyMps2[2], 2);
+    LOG_PRINT(")");
+    LOG_PRINT(" imag0=(");
+    LOG_PRINT(icm.magPreAxis[0], 2);
+    LOG_PRINT(",");
+    LOG_PRINT(icm.magPreAxis[1], 2);
+    LOG_PRINT(",");
+    LOG_PRINT(icm.magPreAxis[2], 2);
+    LOG_PRINT(")");
+    LOG_PRINT(" imag=(");
+    LOG_PRINT(icm.magBody[0], 2);
+    LOG_PRINT(",");
+    LOG_PRINT(icm.magBody[1], 2);
+    LOG_PRINT(",");
+    LOG_PRINT(icm.magBody[2], 2);
+    LOG_PRINT(")");
+    LOG_PRINT(" lmag=(");
+    LOG_PRINT(lsm.magBody[0], 2);
+    LOG_PRINT(",");
+    LOG_PRINT(lsm.magBody[1], 2);
+    LOG_PRINT(",");
+    LOG_PRINT(lsm.magBody[2], 2);
+    LOG_PRINT(")");
+    LOG_PRINT(" bmag=(");
+    LOG_PRINT(bno.magBody[0], 2);
+    LOG_PRINT(",");
+    LOG_PRINT(bno.magBody[1], 2);
+    LOG_PRINT(",");
+    LOG_PRINT(bno.magBody[2], 2);
+    LOG_PRINT(")");
     LOG_PRINT(" logger=");
     LOG_PRINT(logger.initialized ? "ok" : "down");
     LOG_PRINTLN("");
@@ -1719,28 +2158,10 @@ static float ComputeAutoActuationCommandDeg(uint32_t nowMs,
     if (state.velocity[2] > 0.0f) {
         predictorSeedFlags |= kPredictorSeedFlagPositiveVerticalVelocity;
     }
-    const float timeToApogeeS = std::max(0.0f, state.velocity[2] / static_cast<float>(constants::kGravity));
-    if (telemetry != nullptr) {
-        telemetry->timeToApogeeS = timeToApogeeS;
-    }
-    if (!canControl) {
-        ResetPredictorHorizontalVelocityTracker(g_actuationPredictorHorizontalVelocity);
-        g_actuationLastCommandDeg = 0.0f;
-        if (telemetry != nullptr) {
-            telemetry->autoCommandDeg = 0.0f;
-        }
-        return 0.0f;
-    }
-
-    if (g_actuationHasLastControlUpdate &&
-        (nowMs - g_actuationLastControlUpdateMs) < settings::actuation::kControlUpdateIntervalMs) {
-        return g_actuationLastCommandDeg;
-    }
-    g_actuationHasLastControlUpdate = true;
-    g_actuationLastControlUpdateMs = nowMs;
     const double clampedZenith = SanitizePredictorZenithRadians(static_cast<double>(state.zenith));
-    // A stale seed is forced back to a simpler vertical-only predictor input.
-    const bool useHorizontalModel = freshSeedSample;
+    // A stale or inactive control window is forced back to a simpler
+    // vertical-only predictor seed.
+    const bool useHorizontalModel = canControl && freshSeedSample;
     if (!useHorizontalModel) {
         ResetPredictorHorizontalVelocityTracker(g_actuationPredictorHorizontalVelocity);
     }
@@ -1790,6 +2211,27 @@ static float ComputeAutoActuationCommandDeg(uint32_t nowMs,
     predictorState.horizontalVelocity = predictorHorizontalVelocity;
     predictorState.zenith = clampedZenith;
     predictorState.angularVelocity = clampedAngularRate;
+    const double timeToApogeeSeconds =
+        (g_actuationPredictorReady && predictorState.verticalVelocity > 0.0)
+            ? g_actuationPredictor.EstimateTimeToApogee(predictorState)
+            : 0.0;
+    if (telemetry != nullptr) {
+        telemetry->timeToApogeeS = static_cast<float>(std::max(0.0, timeToApogeeSeconds));
+    }
+    if (!canControl) {
+        g_actuationLastCommandDeg = 0.0f;
+        if (telemetry != nullptr) {
+            telemetry->autoCommandDeg = 0.0f;
+        }
+        return 0.0f;
+    }
+
+    if (g_actuationHasLastControlUpdate &&
+        (nowMs - g_actuationLastControlUpdateMs) < settings::actuation::kControlUpdateIntervalMs) {
+        return g_actuationLastCommandDeg;
+    }
+    g_actuationHasLastControlUpdate = true;
+    g_actuationLastControlUpdateMs = nowMs;
 
     const double targetApogeeMeters = settings::flight::kApogeeTargetMeters;
     const double deadbandMeters = static_cast<double>(settings::actuation::kApogeeErrorDeadbandMeters);
@@ -1804,7 +2246,7 @@ static float ComputeAutoActuationCommandDeg(uint32_t nowMs,
         const double hardDisableTime = static_cast<double>(settings::actuation::kCoastHardDisableTimeToApogeeS);
         const double softDisableStart =
             static_cast<double>(settings::actuation::kCoastSoftDisableStartTimeToApogeeS);
-        const double timeToApogee = std::max(0.0, static_cast<double>(state.velocity[2]) / constants::kGravity);
+        const double timeToApogee = std::max(0.0, timeToApogeeSeconds);
 
         if (state.velocity[2] <= hardDisableVz || timeToApogee <= hardDisableTime) {
             g_actuationLastCommandDeg = 0.0f;
@@ -1972,8 +2414,8 @@ static void LogBarometerDiagnostics(uint32_t nowMs) {
 
 /// Arduino setup entry point.
 ///
-/// Setup favors degraded-mode startup over retry-forever behavior so the main
-/// loop can continue running even if logging or a sensor is temporarily down.
+/// Setup blocks on required startup dependencies so the system does not proceed
+/// until logging, replay/CFD assets, and critical sensors are available.
 void setup() {
     // pinMode(kStatusLedPin, OUTPUT);
     // digitalWrite(kStatusLedPin, LOW);
@@ -1984,26 +2426,40 @@ void setup() {
     }
 
     LogSetupCheckpoint("boot");
+    LogSetupCheckpoint("preparing SPI buses");
+    PrepareSpiBusesForStartup();
+    LogSetupCheckpoint("SPI buses ready");
     LogSetupCheckpoint("attaching flap servos");
     g_flapActuator.Begin();
     LogSetupCheckpoint("flap servos initialized");
 
     LogSetupCheckpoint("starting data logger init");
-    ServiceRetry(millis(), g_dataLoggerRetry, DataLoggerIsInitialized(), &DataLoggerBegin, "data_logger");
-    LogSetupCheckpoint(DataLoggerIsInitialized() ? "data logger init complete" : "data logger unavailable");
+    RetryServiceUntilReady(g_dataLoggerRetry,
+                           &DataLoggerIsInitialized,
+                           &DataLoggerBegin,
+                           "data_logger",
+                           "data logger unavailable, retrying");
+    LogSetupCheckpoint("data logger init complete");
 
     LogSetupCheckpoint("checking CSV replay");
-    if (DataLoggerIsInitialized()) {
-        CsvReplayInit();
+    if (kEnableCsvReplay) {
+        RetryCsvReplayUntilReady();
+        LogSetupCheckpoint("CSV replay active");
+    } else {
+        LogSetupCheckpoint("CSV replay disabled");
     }
-    LogSetupCheckpoint(g_csvReplay.enabled ? "CSV replay active" : "CSV replay disabled");
 
     if (!g_csvReplay.enabled) {
         if (kBnoEnabled) {
             LOG_PRINTLN("Configured BNO sensor: BNO085 over I2C");
             LogSetupCheckpoint("starting BNO init");
-            StartBnoDuringSetup();
-            LogSetupCheckpoint(Bno085SensorIsInitialized() ? "BNO init complete" : "BNO unavailable");
+            RetryServiceUntilReady(g_bnoRetry,
+                                   &Bno085SensorIsInitialized,
+                                   &StartBnoDuringSetup,
+                                   "bno085",
+                                   "BNO unavailable, retrying",
+                                   kCriticalStartupResetAttempts);
+            LogSetupCheckpoint("BNO init complete");
         } else {
             LogSetupCheckpoint("BNO disabled");
         }
@@ -2029,14 +2485,19 @@ void setup() {
         }
 
         LogSetupCheckpoint("starting BMP585 init");
-        ServiceRetry(millis(), g_bmpRetry, Bmp585SensorIsInitialized(), &Bmp585SensorBegin, "bmp585");
-        LogSetupCheckpoint(Bmp585SensorIsInitialized() ? "BMP585 init complete" : "BMP585 unavailable");
+        RetryServiceUntilReady(g_bmpRetry,
+                               &Bmp585SensorIsInitialized,
+                               &Bmp585SensorBegin,
+                               "bmp585",
+                               "BMP585 unavailable, retrying",
+                               kCriticalStartupResetAttempts);
+        LogSetupCheckpoint("BMP585 init complete");
 
     }
 
     LogSetupCheckpoint("loading CFD table");
-    LoadCfdTableDuringSetup(&g_cfdTable);
-    LogSetupCheckpoint(g_cfdTable.loaded ? "CFD table loaded" : "CFD table unavailable");
+    RetryCfdTableUntilLoaded(&g_cfdTable);
+    LogSetupCheckpoint("CFD table loaded");
 
     LogSetupCheckpoint("loading runtime settings");
     InitializeRuntimeSettings();
@@ -2121,6 +2582,12 @@ void loop() {
     ServiceRuntimeSettingsCommands();
 
     if (!g_csvReplay.enabled) {
+        if (kBnoEnabled) {
+            ServiceRetry(nowMs, g_bnoRetry, Bno085SensorIsInitialized(), &StartBnoDuringSetup, "bno085");
+            if (!Bno085SensorIsInitialized() && g_bnoRetry.attempts >= kCriticalStartupResetAttempts) {
+                ForceTeensyReboot("bno085");
+            }
+        }
         ServiceRetry(nowMs, g_dataLoggerRetry, DataLoggerIsInitialized(), &DataLoggerBegin, "data_logger");
         if (kEnableCsvReplay && DataLoggerIsInitialized() && !g_csvReplay.enabled && !g_csvReplay.completed) {
             CsvReplayInit();
@@ -2137,11 +2604,21 @@ void loop() {
             Lsm9ds1SensorBegin();
         }
         ServiceRetry(nowMs, g_bmpRetry, Bmp585SensorIsInitialized(), &Bmp585SensorBegin, "bmp585");
+        if (!Bmp585SensorIsInitialized() && g_bmpRetry.attempts >= kCriticalStartupResetAttempts) {
+            ForceTeensyReboot("bmp585");
+        }
     }
 
     Icm20948SensorSetFlightStatus(flightComputer.Status());
+    // Pass burnout timestamp and current timestamp for burnout correction burst
+    const float currentTimeSeconds = static_cast<float>(nowMs) * 0.001f;
+    const float burnoutTimeSeconds = static_cast<float>(flightComputer.BurnoutTime());
+    Icm20948SensorSetBurnoutTimestamp(burnoutTimeSeconds);
+    Icm20948SensorSetCurrentTimestamp(currentTimeSeconds);
     if (kLsmEnabled) {
         Lsm9ds1SensorSetFlightStatus(flightComputer.Status());
+        Lsm9ds1SensorSetBurnoutTimestamp(burnoutTimeSeconds);
+        Lsm9ds1SensorSetCurrentTimestamp(currentTimeSeconds);
     }
     if (kPulseEnabled) {
         Ellipse20SensorSetFlightStatus(flightComputer.Status());

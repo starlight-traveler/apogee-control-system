@@ -6,8 +6,14 @@ struct Bno085Diagnostics {
     bool transportReady = false;
     bool hasAccel = false;
     bool hasGyro = false;
+    bool hasMag = false;
     bool hasQuaternion = false;
+    bool hasBootstrapYpr = false;
     bool lastAcquireFresh = false;
+    float yprDeg[3] = {0.0f, 0.0f, 0.0f};
+    float bootstrapYprDeg[3] = {0.0f, 0.0f, 0.0f};
+    float accelBodyMps2[3] = {0.0f, 0.0f, 0.0f};
+    float magBody[3] = {0.0f, 0.0f, 0.0f};
 };
 
 struct Bno085Sample {

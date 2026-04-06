@@ -113,6 +113,12 @@ struct MachDependentDragScale {
     }
 };
 
+/// Basic result of a single apogee prediction.
+struct PredictResult {
+    double altitude = 0.0;       // Predicted apogee altitude (meters)
+    double timeToApogee = 0.0;   // Time to reach apogee (seconds)
+};
+
 /// Result of apogee prediction with uncertainty bounds.
 struct ApogeePredictionResult {
     double nominal = 0.0;        // Best estimate
@@ -210,8 +216,29 @@ class ApogeePredictor {
     MachDependentDragScale &MachDragScale() { return machDragScale_; }
     const MachDependentDragScale &MachDragScale() const { return machDragScale_; }
 
+    /// Computes adaptive drag learning time constant based on time-to-apogee.
+    /// Fast learning early in coast for quick convergence, slow near apogee for stability.
+    static double ComputeAdaptiveTau(double timeToApogee) {
+        const double tStart = static_cast<double>(settings::predictor::kMachDragAdaptTauTransitionStart);
+        const double tEnd = static_cast<double>(settings::predictor::kMachDragAdaptTauTransitionEnd);
+        const double tauEarly = static_cast<double>(settings::predictor::kMachDragAdaptTauSecondsEarly);
+        const double tauLate = static_cast<double>(settings::predictor::kMachDragAdaptTauSecondsLate);
+
+        if (timeToApogee >= tStart) {
+            return tauEarly;  // Aggressive learning far from apogee
+        }
+        if (timeToApogee <= tEnd) {
+            return tauLate;   // Conservative near apogee
+        }
+        // Linear interpolation between early and late tau
+        const double t = (timeToApogee - tEnd) / (tStart - tEnd);
+        return tauLate + t * (tauEarly - tauLate);
+    }
+
     /// Adapts the Mach-dependent drag scale at the given Mach number.
-    void AdaptMachDragScale(double mach, double residualAccel, double modelAxialAccel, double dtSeconds) {
+    /// Uses adaptive time constant based on time-to-apogee for fast early convergence.
+    void AdaptMachDragScale(double mach, double residualAccel, double modelAxialAccel,
+                            double dtSeconds, double timeToApogee = 10.0) {
         if (!settings::predictor::kEnableMachDependentDrag) {
             return;
         }
@@ -222,8 +249,8 @@ class ApogeePredictor {
         // Compute target scale adjustment from residual
         const float currentScale = machDragScale_.InterpolateScale(static_cast<float>(mach));
         const double targetScale = currentScale + (residualAccel / modelAxialAccel);
-        // Compute blend alpha from time constant
-        const double tauSeconds = static_cast<double>(settings::predictor::kMachDragAdaptTauSeconds);
+        // Compute blend alpha from adaptive time constant
+        const double tauSeconds = ComputeAdaptiveTau(timeToApogee);
         const double alpha = (dtSeconds > 0.0 && tauSeconds > 0.0)
                                  ? (1.0 - std::exp(-dtSeconds / tauSeconds))
                                  : 0.0;
@@ -238,52 +265,80 @@ class ApogeePredictor {
     /// Sets the maximum number of integration steps allowed per prediction.
     void SetMaxIntegrationSteps(int steps) { maxIntegrationSteps_ = (steps > 0) ? steps : 1; }
 
-    /// Predicts apogee using the default RK4 integration path.
+    /// Predicts apogee using the default RK4 integration path (altitude only).
     double PredictApogee(const ApogeeState &initialState) {
-        return PredictApogee(initialState, IntegrationMethod::RK4);
+        return PredictApogeeWithTime(initialState, IntegrationMethod::RK4).altitude;
     }
 
-    /// Predicts apogee using midpoint/RK2 integration.
+    /// Predicts apogee using midpoint/RK2 integration (altitude only).
     ///
     /// This path exists for the flap-angle sweep where candidate ordering is
     /// more important than sub-meter absolute accuracy.
     double PredictApogeeMidpoint(const ApogeeState &initialState) {
-        return PredictApogee(initialState, IntegrationMethod::Midpoint);
+        return PredictApogeeWithTime(initialState, IntegrationMethod::Midpoint).altitude;
     }
 
-    /// Predicts apogee using the requested integration method.
+    /// Predicts apogee and time-to-apogee using the default RK4 integration.
+    PredictResult PredictApogeeWithTime(const ApogeeState &initialState) {
+        return PredictApogeeWithTime(initialState, IntegrationMethod::RK4);
+    }
+
+    /// Predicts apogee and time-to-apogee using the requested integration method.
     ///
     /// The predictor stops when vertical velocity crosses zero or when the
     /// configured step limit is reached. Zero-crossing refinement is used to
     /// avoid returning the overshot altitude from the final integration step.
-    double PredictApogee(const ApogeeState &initialState, IntegrationMethod method) {
+    PredictResult PredictApogeeWithTime(const ApogeeState &initialState, IntegrationMethod method) {
+        PredictResult result;
         if (initialState.verticalVelocity <= minVerticalVelocityForPrediction_) {
-            return initialState.altitudeMeters;
+            result.altitude = initialState.altitudeMeters;
+            result.timeToApogee = 0.0;
+            return result;
         }
         ApogeeState state = initialState;
         InterpHintSet hints;
         int steps = 0;
+        double elapsedTime = 0.0;
         while (state.verticalVelocity > 0.0 && steps < maxIntegrationSteps_) {
             const ApogeeState previousState = state;
             state = IntegrateStep(state, timeStep_, hints, method);
+            elapsedTime += timeStep_;
             ++steps;
             if (previousState.verticalVelocity > 0.0 && state.verticalVelocity <= 0.0) {
-                return RefineApogeeAtZeroCrossing(previousState, state);
+                // Refine both altitude and time at the zero crossing
+                const double previousVz = previousState.verticalVelocity;
+                const double currentVz = state.verticalVelocity;
+                const double vzDelta = previousVz - currentVz;
+                if (std::fabs(vzDelta) >= 1.0e-9) {
+                    const double alpha = std::clamp(previousVz / vzDelta, 0.0, 1.0);
+                    result.altitude = previousState.altitudeMeters +
+                                      alpha * (state.altitudeMeters - previousState.altitudeMeters);
+                    result.timeToApogee = (elapsedTime - timeStep_) + alpha * timeStep_;
+                } else {
+                    result.altitude = std::max(previousState.altitudeMeters, state.altitudeMeters);
+                    result.timeToApogee = elapsedTime;
+                }
+                return result;
             }
         }
-        return state.altitudeMeters;
+        result.altitude = state.altitudeMeters;
+        result.timeToApogee = elapsedTime;
+        return result;
     }
 
     /// Predicts apogee with uncertainty bounds by perturbing drag and wind.
     /// Returns nominal prediction plus lower/upper confidence bounds.
     ApogeePredictionResult PredictApogeeWithBounds(const ApogeeState &initialState) {
         ApogeePredictionResult result;
-        result.nominal = PredictApogee(initialState);
+
+        // Get nominal prediction and time-to-apogee in a single integration pass
+        const PredictResult nominalResult = PredictApogeeWithTime(initialState);
+        result.nominal = nominalResult.altitude;
+        result.timeToApogee = nominalResult.timeToApogee;
 
         if (!settings::predictor::kEnableUncertaintyBounds) {
             result.lower = result.nominal;
             result.upper = result.nominal;
-            result.timeToApogee = EstimateTimeToApogee(initialState);
             return result;
         }
 
@@ -311,30 +366,14 @@ class ApogeePredictor {
         axialDragScale_ = originalAxialScale;
         machDragScale_ = originalMachScale;
 
-        // Estimate time to apogee
-        result.timeToApogee = EstimateTimeToApogee(initialState);
-
         return result;
     }
 
-    /// Estimates time to apogee in seconds using simplified ballistic approximation.
-    double EstimateTimeToApogee(const ApogeeState &state) const {
-        if (state.verticalVelocity <= 0.0) {
-            return 0.0;
-        }
-        // Simple estimate: t ≈ v / g (ignoring drag)
-        // More accurate: integrate with drag but use faster midpoint method
-        ApogeeState simState = state;
-        InterpHintSet hints;
-        double time = 0.0;
-        int steps = 0;
-        while (simState.verticalVelocity > 0.0 && steps < maxIntegrationSteps_) {
-            simState = const_cast<ApogeePredictor*>(this)->IntegrateStep(
-                simState, timeStep_, hints, IntegrationMethod::Midpoint);
-            time += timeStep_;
-            ++steps;
-        }
-        return time;
+    /// Estimates time to apogee in seconds.
+    /// This is a convenience wrapper; prefer PredictApogeeWithTime() when you
+    /// need both altitude and time to avoid redundant integration.
+    double EstimateTimeToApogee(const ApogeeState &state) {
+        return PredictApogeeWithTime(state, IntegrationMethod::Midpoint).timeToApogee;
     }
 
     /// Evaluates the current model vertical acceleration at one predictor seed.

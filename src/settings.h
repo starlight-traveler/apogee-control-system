@@ -261,7 +261,7 @@ constexpr uint8_t kLiftoffConfirmSamples = 3;
 constexpr float kBurnoutAccelerationThresholdMps2 = 2.0f;
 constexpr float kBurnoutVelocityThresholdMps = 5.0f;
 constexpr float kBurnoutMinDurationSeconds = 1.0f;
-constexpr uint8_t kBurnoutConfirmSamples = 10;
+constexpr uint8_t kBurnoutConfirmSamples = 5;
 constexpr float kDescentVelocityThresholdMps = 0.0f;
 constexpr float kDescentAccelerationThresholdMps2 = 0.0f;
 
@@ -324,9 +324,11 @@ constexpr uint32_t kDataTimeoutUs = 250000;
 
 namespace bno085 {
 // BNO085 I2C address.
-constexpr uint8_t kI2cAddress = 0x4B;
+constexpr uint8_t kI2cAddress = 0x4A;
 // Fast-mode I2C clock for the BNO085 sidecar path.
+// constexpr uint32_t kI2cClockHz = 400000UL;
 constexpr uint32_t kI2cClockHz = 400000UL;
+
 // SPI chip-select pin for the BNO085 when SPI transport is selected.
 constexpr uint8_t kChipSelectPin = 4;
 // Optional interrupt pin for the BNO085 SPI transport. Set to -1 if unused.
@@ -451,7 +453,7 @@ constexpr float kAgreementThresholdFeet = 150.0f;
 }
 
 namespace lsm9ds1 {
-constexpr bool kEnabled = false;
+constexpr bool kEnabled = true;
 constexpr uint8_t kAccelGyroChipSelectPin = 15;
 constexpr uint8_t kMagChipSelectPin = 14;
 // Route the LSM9DS1 accel/gyro data-ready output (INT1) to this pin.
@@ -486,8 +488,13 @@ constexpr uint8_t kFifoMaxBurstSamplesPerAcquire = 4;
 // Optional library-side hard-iron offset load for sanity checks.
 // Keep false for the normal path; the firmware calibration model remains primary.
 constexpr bool kUseLibraryMagOffsets = false;
+// BNO-defined body basis. The LSM is physically mounted backwards relative
+// to the BNO:
+// - From BNO's POV: LSM +Y points up (same as BNO), LSM +X points left (opposite)
+// - This requires a 180° rotation around the Y-axis applied via kMountRotation
+// The axis map/sign stays identity; the mount rotation handles frame alignment.
 constexpr uint8_t kAxisMap[3] = {0, 1, 2};
-constexpr int8_t kAxisSign[3] = {-1, 1, 1};
+constexpr int8_t kAxisSign[3] = {1, 1, 1};
 constexpr float kMagDeclinationDeg = -14.84f;
 constexpr float kAccelCorrectionGainGround = 18.0f;
 constexpr float kAccelCorrectionGainDescent = 9.0f;
@@ -519,24 +526,26 @@ constexpr float kAccelCorrectionMaxRateRadPerSec = 6.0f;
 constexpr float kMagCorrectionMaxRateRadPerSec = 2.5f;
 constexpr float kTotalCorrectionMaxRateRadPerSec = 7.0f;
 
-constexpr float kGyroOffset[3] = {0.0f, 0.0f, 0.0f};
-constexpr float kAccelBias[3] = {0.0f, 0.0f, 0.0f};
+constexpr float kGyroOffset[3] = {91.85f, 178.88f, -210.18f};
+constexpr float kAccelBias[3] = {-121.00f, -104.50f, -142.00f};
 constexpr float kAccelAinv[3][3] = {
-    {1.0f, 0.0f, 0.0f},
-    {0.0f, 1.0f, 0.0f},
-    {0.0f, 0.0f, 1.0f},
+  {1.00626f, -0.00332f, 0.00705f},
+  {-0.00332f, 1.00802f, -0.02086f},
+  {0.00705f, -0.02086f, 1.00402f},
 };
-// Fixed rotation from calibrated sensor axes into the rocket body frame.
+// LSM is mounted backwards relative to BNO: X points left instead of right.
+// Transform: BNO_X = -LSM_X, BNO_Y = LSM_Y, BNO_Z = LSM_Z
 constexpr float kMountRotation[3][3] = {
-    {1.0f, 0.0f, 0.0f},
-    {0.0f, 1.0f, 0.0f},
-    {0.0f, 0.0f, 1.0f},
+  {-1.0f, 0.0f, 0.0f},
+  {0.0f, 1.0f, 0.0f},
+  {0.0f, 0.0f, 1.0f},
 };
-constexpr float kMagBias[3] = {0.0f, 0.0f, 0.0f};
+
+constexpr float kMagBias[3] = {-2277.00f, 4479.00f, -2310.00f};
 constexpr float kMagAinv[3][3] = {
-    {1.0f, 0.0f, 0.0f},
-    {0.0f, 1.0f, 0.0f},
-    {0.0f, 0.0f, 1.0f},
+  {0.00036f, 0.00004f, -0.00000f},
+  {0.00004f, 0.00035f, -0.00002f},
+  {-0.00000f, -0.00002f, 0.00030f},
 };
 }
 
@@ -625,12 +634,21 @@ constexpr float kAccelAinv[3][3] = {
     {0.00470f, 1.00846f, -0.00328f},
     {-0.00428f, -0.00328f, 0.99559f},
 };
-// Fixed rotation from calibrated sensor axes into the rocket body frame.
+// Fixed rotation from calibrated sensor axes into the BNO-defined rocket body
+// frame. The ICM is physically mounted with Y inverted relative to the BNO:
+// - From BNO's POV: ICM +Y points down, ICM +X points right (same as BNO)
+// Transform: BNO_X = ICM_X, BNO_Y = -ICM_Y, BNO_Z = ICM_Z
 constexpr float kMountRotation[3][3] = {
     {1.0f, 0.0f, 0.0f},
-    {0.0f, 1.0f, 0.0f},
+    {0.0f, -1.0f, 0.0f},
     {0.0f, 0.0f, 1.0f},
 };
+// Keep the ICM magnetometer in the same calibrated sensor frame as the
+// accel/gyro. Per the measured rail alignment, the ICM-to-BNO transform is the
+// same simple Y inversion for all three vectors; the mount rotation below
+// handles that body-frame alignment.
+constexpr uint8_t kMagAxisMap[3] = {0, 1, 2};
+constexpr int8_t kMagAxisSign[3] = {1, 1, 1};
 // Calibrated magnetometer hard-iron offsets.
 constexpr float kMagBias[3] = {-156.70f, -52.79f, -141.07f};
 // Calibrated magnetometer soft-iron inverse matrix.
@@ -643,7 +661,7 @@ constexpr float kMagAinv[3][3] = {
 namespace crosscheck {
 // Agreement thresholds used to gate sensor correction trust between the ICM and LSM AHRS paths.
 constexpr float kAccelDiffFullTrustMps2 = 0.75f;
-constexpr float kAccelDiffZeroTrustMps2 = 3.0f;
+constexpr float kAccelDiffZeroTrustMps2 = 4.0f;
 constexpr float kGyroDiffFullTrustRadPerSec = 0.15f;
 constexpr float kGyroDiffZeroTrustRadPerSec = 1.0f;
 constexpr float kQuaternionDiffFullTrustDeg = 5.0f;
@@ -685,9 +703,23 @@ constexpr float kMinBlendTrust = 0.1f;
 
 // BNO085 coast blending: blend factor applied to BNO quaternion during coast phase.
 constexpr float kBnoCoastBlendFactor = 0.1f;
-// Slow BNO reference correction: small slerp toward the healthy BNO-backed
-// reference quaternion after gyro propagation.
-constexpr float kBnoReferenceCorrectionBlendFactor = 0.03f;
+// Slow BNO reference correction: when the BNO tilt rail is healthy, give it a
+// more meaningful influence over the final tilt quaternion instead of treating
+// it as a near-zero trim source.
+constexpr float kBnoReferenceCorrectionBlendFactor = 0.20f;
+// Aggressive BNO correction during coast - weight BNO much more heavily to
+// quickly correct any gyro drift accumulated during burn.
+constexpr float kBnoCoastCorrectionBlendFactor = 0.50f;
+
+// Burnout correction burst: aggressive accel correction window after burnout
+// to quickly correct gyro drift accumulated during burn phase.
+constexpr bool kEnableBurnoutCorrectionBurst = true;
+constexpr float kBurnoutCorrectionWindowSeconds = 1.5f;  // Duration of aggressive correction
+constexpr float kBurnoutCorrectionAccelTrust = 0.8f;     // High accel trust during window
+constexpr float kBurnoutCorrectionAccelGain = 25.0f;     // Aggressive correction gain
+// After burnout window, maintain moderate accel trust during coast for ongoing correction.
+constexpr float kCoastAccelTrust = 0.25f;
+constexpr float kCoastAccelCorrectionGain = 6.0f;
 // Rail health thresholds derived from cross-check trust.
 constexpr float kHealthyRailTrust = 0.65f;
 constexpr float kDegradedRailTrust = 0.35f;
@@ -721,7 +753,13 @@ constexpr int kMachBinCount = 4;
 constexpr float kMachBinEdges[kMachBinCount] = {0.3f, 0.6f, 0.9f, 1.2f};
 constexpr float kMachDragScaleMin = 0.85f;
 constexpr float kMachDragScaleMax = 1.50f;
-constexpr float kMachDragAdaptTauSeconds = 0.6f;
+
+// Adaptive drag learning time constants: fast early for quick convergence,
+// slow late for stability when prediction accuracy matters most.
+constexpr float kMachDragAdaptTauSecondsEarly = 0.25f;   // Aggressive learning (t_apogee > 4s)
+constexpr float kMachDragAdaptTauSecondsLate = 1.2f;     // Conservative near apogee (t_apogee < 1.5s)
+constexpr float kMachDragAdaptTauTransitionStart = 4.0f; // Start slowing down at this t_apogee
+constexpr float kMachDragAdaptTauTransitionEnd = 1.5f;   // Fully conservative below this t_apogee
 
 // Prediction uncertainty bounds: perturbation factors for confidence interval.
 constexpr float kUncertaintyDragPerturbFraction = 0.12f;  // +/- 12% drag variation
