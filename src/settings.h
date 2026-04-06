@@ -209,13 +209,13 @@ constexpr size_t kCsvLineBufferSize = 2048;
 // ---------------------------------------------------------------------------
 namespace environment {
 // Ground temperature used as altitude=0 reference in Fahrenheit.
-constexpr float kGroundTemperatureF = 32.0f;
+constexpr float kGroundTemperatureF = 42.0f;
 // Measured surface wind speed in miles per hour.
-constexpr float kWindSpeedMph = 8.0f;
+constexpr float kWindSpeedMph = 13.0f;
 // Meteorological wind direction in degrees.
-constexpr float kWindDirectionDeg = 63.0f;
+constexpr float kWindDirectionDeg = 317.0f;
 // Launch rail azimuth direction in degrees.
-constexpr float kLaunchDirectionDeg = 63.0f;
+constexpr float kLaunchDirectionDeg = 317.0f;
 // Terrain roughness length (meters) for log wind profile.
 constexpr float kRoughnessLengthMeters = 0.075f;
 // Height where gradient wind is modeled (meters).
@@ -430,7 +430,7 @@ constexpr float kMagAinv[3][3] = {
 
 namespace bmp585 {
 // Pressure reference used by barometric altitude conversion.
-constexpr float kSeaLevelPressureHpa = 1032.2f;
+constexpr float kSeaLevelPressureHpa = 1022.689f;
 // Reject altitude jumps that imply faster vertical motion than this rate.
 constexpr float kMaxAltitudeRateFeetPerSecond = 2500.0f;
 // Minimum single-sample jump (feet) required before classifying as a spike.

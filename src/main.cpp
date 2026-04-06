@@ -30,7 +30,7 @@ namespace {
 
 /// Flight-loop constants mirrored locally to keep `main.cpp` readable.
 constexpr uint8_t kStatusLedPin = settings::hardware::kStatusLedPin;
-constexpr uint8_t kBootLedPin = 2;
+constexpr uint8_t kBootLedPin = 0;
 constexpr uint8_t kBuzzerPin = settings::hardware::kBuzzerPin;
 constexpr int8_t kAirliftSsPin = settings::network::kAirliftSsPin;
 constexpr int8_t kAirliftResetPin = settings::network::kAirliftResetPin;
