@@ -30,6 +30,7 @@ namespace {
 
 /// Flight-loop constants mirrored locally to keep `main.cpp` readable.
 constexpr uint8_t kStatusLedPin = settings::hardware::kStatusLedPin;
+constexpr uint8_t kBootLedPin = 2;
 constexpr uint8_t kBuzzerPin = settings::hardware::kBuzzerPin;
 constexpr int8_t kAirliftSsPin = settings::network::kAirliftSsPin;
 constexpr int8_t kAirliftResetPin = settings::network::kAirliftResetPin;
@@ -149,14 +150,125 @@ void LogSetupCheckpoint(const char *message) {
     LOG_PRINTLN(message);
 }
 
+struct BuzzerNote {
+    uint16_t frequencyHz;
+    uint16_t durationMs;
+};
+
+// Note frequencies (Hz) - full chromatic scale
+constexpr uint16_t kNoteRest = 0;
+constexpr uint16_t kNoteC4 = 262;
+constexpr uint16_t kNoteCS4 = 277;
+constexpr uint16_t kNoteD4 = 294;
+constexpr uint16_t kNoteDS4 = 311;
+constexpr uint16_t kNoteE4 = 330;
+constexpr uint16_t kNoteF4 = 349;
+constexpr uint16_t kNoteFS4 = 370;
+constexpr uint16_t kNoteG4 = 392;
+constexpr uint16_t kNoteGS4 = 415;
+constexpr uint16_t kNoteGSharp4 = 415;  // Alias for existing code
+constexpr uint16_t kNoteA4 = 440;
+constexpr uint16_t kNoteAS4 = 466;
+constexpr uint16_t kNoteB4 = 494;
+constexpr uint16_t kNoteC5 = 523;
+constexpr uint16_t kNoteCS5 = 554;
+constexpr uint16_t kNoteD5 = 587;
+constexpr uint16_t kNoteDS5 = 622;
+constexpr uint16_t kNoteE5 = 659;
+constexpr uint16_t kNoteF5 = 698;
+constexpr uint16_t kNoteFS5 = 740;
+constexpr uint16_t kNoteG5 = 784;
+constexpr uint16_t kNoteGS5 = 831;
+constexpr uint16_t kNoteA5 = 880;
+constexpr uint16_t kNoteAS5 = 932;
+constexpr uint16_t kNoteB5 = 988;
+constexpr uint16_t kNoteC6 = 1047;
+constexpr uint16_t kNoteD6 = 1175;
+constexpr uint16_t kNoteE6 = 1319;
+constexpr uint16_t kNoteF6 = 1397;
+constexpr uint16_t kNoteG6 = 1568;
+
+// Number of startup melodies available
+constexpr uint8_t kNumStartupMelodies = 9;
+
+void PlayFailureSiren();
+
+// Boot LED state tracking
+bool g_bootLedInitialized = false;
+bool g_bootLedState = false;
+uint32_t g_bootLedLastToggleMs = 0;
+
+/// Initializes the boot status LED on pin 2.
+void BootLedBegin() {
+    pinMode(kBootLedPin, OUTPUT);
+    digitalWrite(kBootLedPin, LOW);
+    g_bootLedInitialized = true;
+    g_bootLedState = false;
+    g_bootLedLastToggleMs = millis();
+}
+
+/// Toggles the boot LED for a slow blink pattern (long on/off during boot).
+/// Call this periodically during setup to show boot progress.
+void BootLedSlowBlink() {
+    if (!g_bootLedInitialized) {
+        BootLedBegin();
+    }
+    constexpr uint32_t kSlowBlinkIntervalMs = 500;
+    const uint32_t nowMs = millis();
+    if ((nowMs - g_bootLedLastToggleMs) >= kSlowBlinkIntervalMs) {
+        g_bootLedState = !g_bootLedState;
+        digitalWrite(kBootLedPin, g_bootLedState ? HIGH : LOW);
+        g_bootLedLastToggleMs = nowMs;
+    }
+}
+
+/// Runs a fast blink pattern (short on/off) to indicate boot failure.
+/// This function loops forever and does not return.
+[[noreturn]] void BootLedFailureBlink() {
+    if (!g_bootLedInitialized) {
+        BootLedBegin();
+    }
+    constexpr uint32_t kFastBlinkIntervalMs = 100;
+    while (true) {
+        digitalWrite(kBootLedPin, HIGH);
+        delay(kFastBlinkIntervalMs);
+        digitalWrite(kBootLedPin, LOW);
+        delay(kFastBlinkIntervalMs);
+    }
+}
+
+/// Turns the boot LED permanently on to indicate successful boot.
+void BootLedSolidOn() {
+    if (!g_bootLedInitialized) {
+        BootLedBegin();
+    }
+    digitalWrite(kBootLedPin, HIGH);
+    g_bootLedState = true;
+}
+
 [[noreturn]] void ForceTeensyReboot(const char *reason) {
     LOG_PRINT("[fatal] rebooting Teensy: ");
     LOG_PRINTLN(reason);
     Serial.flush();
-    delay(10);
+    PlayFailureSiren();
+    // Blink fast to indicate failure before reboot
+    if (!g_bootLedInitialized) {
+        BootLedBegin();
+    }
+    for (int i = 0; i < 20; ++i) {
+        digitalWrite(kBootLedPin, HIGH);
+        delay(100);
+        digitalWrite(kBootLedPin, LOW);
+        delay(100);
+    }
     SCB_AIRCR = 0x05FA0004;
     __DSB();
     while (true) {
+        // If reboot fails, keep blinking fast
+        digitalWrite(kBootLedPin, HIGH);
+        delay(100);
+        digitalWrite(kBootLedPin, LOW);
+        delay(100);
     }
 }
 
@@ -251,27 +363,185 @@ void PrepareSpiBusesForStartup() {
     delay(kSpiBusStartupSettleDelayMs);
 }
 
-/// Plays the current boot melody.
+/// Helper to play a melody array
+void PlayMelody(const BuzzerNote *melody, size_t length) {
+    pinMode(kBuzzerPin, OUTPUT);
+    for (size_t i = 0; i < length; ++i) {
+        if (melody[i].frequencyHz == kNoteRest) {
+            noTone(kBuzzerPin);
+            delay(melody[i].durationMs);
+        } else {
+            tone(kBuzzerPin, melody[i].frequencyHz, melody[i].durationMs);
+            delay(melody[i].durationMs + 20);
+        }
+    }
+    noTone(kBuzzerPin);
+}
+
+// =============================================================================
+// STARTUP MELODIES (~5-10 seconds each)
+// =============================================================================
+
+// 0: Star Wars - Imperial March (original)
+static const BuzzerNote kMelodyImperialMarch[] = {
+    {kNoteA4, 500}, {kNoteA4, 500}, {kNoteA4, 500}, {kNoteF4, 350}, {kNoteC5, 150},
+    {kNoteA4, 500}, {kNoteF4, 350}, {kNoteC5, 150}, {kNoteA4, 650},
+    {kNoteE5, 500}, {kNoteE5, 500}, {kNoteE5, 500}, {kNoteF5, 350}, {kNoteC5, 150},
+    {kNoteGSharp4, 500}, {kNoteF4, 350}, {kNoteC5, 150}, {kNoteA4, 650},
+};
+
+// 1: Ode to Joy - Beethoven
+static const BuzzerNote kMelodyOdeToJoy[] = {
+    {kNoteE4, 400}, {kNoteE4, 400}, {kNoteF4, 400}, {kNoteG4, 400},
+    {kNoteG4, 400}, {kNoteF4, 400}, {kNoteE4, 400}, {kNoteD4, 400},
+    {kNoteC4, 400}, {kNoteC4, 400}, {kNoteD4, 400}, {kNoteE4, 400},
+    {kNoteE4, 600}, {kNoteD4, 200}, {kNoteD4, 800},
+    {kNoteE4, 400}, {kNoteE4, 400}, {kNoteF4, 400}, {kNoteG4, 400},
+    {kNoteG4, 400}, {kNoteF4, 400}, {kNoteE4, 400}, {kNoteD4, 400},
+    {kNoteC4, 400}, {kNoteC4, 400}, {kNoteD4, 400}, {kNoteE4, 400},
+    {kNoteD4, 600}, {kNoteC4, 200}, {kNoteC4, 800},
+};
+
+// 2: Für Elise - Beethoven
+static const BuzzerNote kMelodyFurElise[] = {
+    {kNoteE5, 150}, {kNoteDS5, 150}, {kNoteE5, 150}, {kNoteDS5, 150}, {kNoteE5, 150},
+    {kNoteB4, 150}, {kNoteD5, 150}, {kNoteC5, 150}, {kNoteA4, 300},
+    {kNoteRest, 150}, {kNoteC4, 150}, {kNoteE4, 150}, {kNoteA4, 150}, {kNoteB4, 300},
+    {kNoteRest, 150}, {kNoteE4, 150}, {kNoteGS4, 150}, {kNoteB4, 150}, {kNoteC5, 300},
+    {kNoteRest, 150}, {kNoteE4, 150},
+    {kNoteE5, 150}, {kNoteDS5, 150}, {kNoteE5, 150}, {kNoteDS5, 150}, {kNoteE5, 150},
+    {kNoteB4, 150}, {kNoteD5, 150}, {kNoteC5, 150}, {kNoteA4, 300},
+    {kNoteRest, 150}, {kNoteC4, 150}, {kNoteE4, 150}, {kNoteA4, 150}, {kNoteB4, 300},
+    {kNoteRest, 150}, {kNoteE4, 150}, {kNoteC5, 150}, {kNoteB4, 150}, {kNoteA4, 450},
+};
+
+// 3: Happy Birthday
+static const BuzzerNote kMelodyHappyBirthday[] = {
+    {kNoteC4, 300}, {kNoteC4, 200}, {kNoteD4, 500}, {kNoteC4, 500}, {kNoteF4, 500}, {kNoteE4, 900},
+    {kNoteC4, 300}, {kNoteC4, 200}, {kNoteD4, 500}, {kNoteC4, 500}, {kNoteG4, 500}, {kNoteF4, 900},
+    {kNoteC4, 300}, {kNoteC4, 200}, {kNoteC5, 500}, {kNoteA4, 500}, {kNoteF4, 500}, {kNoteE4, 500}, {kNoteD4, 800},
+    {kNoteAS4, 300}, {kNoteAS4, 200}, {kNoteA4, 500}, {kNoteF4, 500}, {kNoteG4, 500}, {kNoteF4, 900},
+};
+
+// 4: Twinkle Twinkle Little Star
+static const BuzzerNote kMelodyTwinkle[] = {
+    {kNoteC4, 400}, {kNoteC4, 400}, {kNoteG4, 400}, {kNoteG4, 400},
+    {kNoteA4, 400}, {kNoteA4, 400}, {kNoteG4, 800},
+    {kNoteF4, 400}, {kNoteF4, 400}, {kNoteE4, 400}, {kNoteE4, 400},
+    {kNoteD4, 400}, {kNoteD4, 400}, {kNoteC4, 800},
+    {kNoteG4, 400}, {kNoteG4, 400}, {kNoteF4, 400}, {kNoteF4, 400},
+    {kNoteE4, 400}, {kNoteE4, 400}, {kNoteD4, 800},
+    {kNoteG4, 400}, {kNoteG4, 400}, {kNoteF4, 400}, {kNoteF4, 400},
+    {kNoteE4, 400}, {kNoteE4, 400}, {kNoteD4, 800},
+};
+
+// 5: Jingle Bells
+static const BuzzerNote kMelodyJingleBells[] = {
+    {kNoteE4, 300}, {kNoteE4, 300}, {kNoteE4, 600},
+    {kNoteE4, 300}, {kNoteE4, 300}, {kNoteE4, 600},
+    {kNoteE4, 300}, {kNoteG4, 300}, {kNoteC4, 400}, {kNoteD4, 200}, {kNoteE4, 800},
+    {kNoteF4, 300}, {kNoteF4, 300}, {kNoteF4, 400}, {kNoteF4, 200},
+    {kNoteF4, 300}, {kNoteE4, 300}, {kNoteE4, 300}, {kNoteE4, 150}, {kNoteE4, 150},
+    {kNoteE4, 300}, {kNoteD4, 300}, {kNoteD4, 300}, {kNoteE4, 300}, {kNoteD4, 500}, {kNoteG4, 500},
+};
+
+// 6: Harry Potter Theme (Hedwig's Theme)
+static const BuzzerNote kMelodyHarryPotter[] = {
+    {kNoteB4, 400}, {kNoteE5, 600}, {kNoteG5, 200}, {kNoteFS5, 400}, {kNoteE5, 800},
+    {kNoteB5, 400}, {kNoteA5, 1200},
+    {kNoteFS5, 1200},
+    {kNoteE5, 600}, {kNoteG5, 200}, {kNoteFS5, 400}, {kNoteDS5, 800},
+    {kNoteF5, 400}, {kNoteB4, 1600},
+};
+
+// 7: Tetris (Korobeiniki)
+static const BuzzerNote kMelodyTetris[] = {
+    {kNoteE5, 400}, {kNoteB4, 200}, {kNoteC5, 200}, {kNoteD5, 400}, {kNoteC5, 200}, {kNoteB4, 200},
+    {kNoteA4, 400}, {kNoteA4, 200}, {kNoteC5, 200}, {kNoteE5, 400}, {kNoteD5, 200}, {kNoteC5, 200},
+    {kNoteB4, 600}, {kNoteC5, 200}, {kNoteD5, 400}, {kNoteE5, 400},
+    {kNoteC5, 400}, {kNoteA4, 400}, {kNoteA4, 800},
+    {kNoteD5, 400}, {kNoteF5, 200}, {kNoteA5, 400}, {kNoteG5, 200}, {kNoteF5, 200},
+    {kNoteE5, 600}, {kNoteC5, 200}, {kNoteE5, 400}, {kNoteD5, 200}, {kNoteC5, 200},
+    {kNoteB4, 400}, {kNoteB4, 200}, {kNoteC5, 200}, {kNoteD5, 400}, {kNoteE5, 400},
+    {kNoteC5, 400}, {kNoteA4, 400}, {kNoteA4, 400},
+};
+
+// 8: Never Gonna Give You Up (Rick Roll!)
+static const BuzzerNote kMelodyRickRoll[] = {
+    // "Never gonna give you up"
+    {kNoteD4, 150}, {kNoteE4, 150}, {kNoteG4, 150}, {kNoteE4, 150},
+    {kNoteB4, 450}, {kNoteB4, 450}, {kNoteA4, 600},
+    {kNoteRest, 200},
+    // "Never gonna let you down"
+    {kNoteD4, 150}, {kNoteE4, 150}, {kNoteG4, 150}, {kNoteE4, 150},
+    {kNoteA4, 450}, {kNoteA4, 450}, {kNoteG4, 450}, {kNoteFS4, 150}, {kNoteE4, 300},
+    {kNoteRest, 200},
+    // "Never gonna run around"
+    {kNoteD4, 150}, {kNoteE4, 150}, {kNoteG4, 150}, {kNoteE4, 150},
+    {kNoteG4, 450}, {kNoteA4, 300}, {kNoteFS4, 450},
+    {kNoteRest, 100},
+    {kNoteE4, 250}, {kNoteE4, 150}, {kNoteFS4, 150}, {kNoteE4, 150}, {kNoteD4, 500},
+};
+
+/// Plays a random startup melody (one of 9 songs).
 ///
 /// This is intentionally blocking and should be disabled for flight builds if
 /// startup latency matters more than audible status.
 void PlayStartupMarch() {
-    struct Note {
-        uint16_t frequencyHz;
-        uint16_t durationMs;
-    };
+    // Seed random with analog noise + millis for variety
+    randomSeed(analogRead(0) ^ micros());
+    const uint8_t choice = random(kNumStartupMelodies);
 
-    static const Note kMelody[] = {
-        {440, 500}, {440, 500}, {440, 500}, {349, 350}, {523, 150},
-        {440, 500}, {349, 350}, {523, 150}, {440, 650},
-        {659, 500}, {659, 500}, {659, 500}, {698, 350}, {523, 150},
-        {415, 500}, {349, 350}, {523, 150}, {440, 650},
-    };
+    LOG_PRINT("[buzzer] Playing melody #");
+    LOG_PRINTLN(choice);
+
+    switch (choice) {
+        case 0:
+            PlayMelody(kMelodyImperialMarch, sizeof(kMelodyImperialMarch) / sizeof(kMelodyImperialMarch[0]));
+            break;
+        case 1:
+            PlayMelody(kMelodyOdeToJoy, sizeof(kMelodyOdeToJoy) / sizeof(kMelodyOdeToJoy[0]));
+            break;
+        case 2:
+            PlayMelody(kMelodyFurElise, sizeof(kMelodyFurElise) / sizeof(kMelodyFurElise[0]));
+            break;
+        case 3:
+            PlayMelody(kMelodyHappyBirthday, sizeof(kMelodyHappyBirthday) / sizeof(kMelodyHappyBirthday[0]));
+            break;
+        case 4:
+            PlayMelody(kMelodyTwinkle, sizeof(kMelodyTwinkle) / sizeof(kMelodyTwinkle[0]));
+            break;
+        case 5:
+            PlayMelody(kMelodyJingleBells, sizeof(kMelodyJingleBells) / sizeof(kMelodyJingleBells[0]));
+            break;
+        case 6:
+            PlayMelody(kMelodyHarryPotter, sizeof(kMelodyHarryPotter) / sizeof(kMelodyHarryPotter[0]));
+            break;
+        case 7:
+            PlayMelody(kMelodyTetris, sizeof(kMelodyTetris) / sizeof(kMelodyTetris[0]));
+            break;
+        case 8:
+        default:
+            PlayMelody(kMelodyRickRoll, sizeof(kMelodyRickRoll) / sizeof(kMelodyRickRoll[0]));
+            break;
+    }
+}
+
+/// Plays a 5-second warning siren for failure/reset conditions.
+void PlayFailureSiren() {
+    constexpr uint16_t kLowHz = 660;
+    constexpr uint16_t kHighHz = 1320;
+    constexpr uint16_t kStepMs = 200;
+    constexpr uint32_t kSirenDurationMs = 5000;
 
     pinMode(kBuzzerPin, OUTPUT);
-    for (const Note &note : kMelody) {
-        tone(kBuzzerPin, note.frequencyHz, note.durationMs);
-        delay(note.durationMs + 30);
+
+    uint32_t startMs = millis();
+    while ((millis() - startMs) < kSirenDurationMs) {
+        tone(kBuzzerPin, kLowHz, kStepMs);
+        delay(kStepMs);
+        tone(kBuzzerPin, kHighHz, kStepMs);
+        delay(kStepMs);
     }
     noTone(kBuzzerPin);
 }
@@ -1591,6 +1861,26 @@ static uint32_t g_runtimeSettingsLastRequestId = 0;
 static uint8_t g_runtimeSettingsLastCommandResult = telemetry::kSettingsResultNone;
 static bool g_setupComplete = false;
 
+void HoldBootFlapCommand(float commandedAngleDeg, uint32_t durationMs) {
+    const uint32_t startMs = millis();
+    do {
+        g_flapActuator.Update(millis(), commandedAngleDeg);
+        delay(20);
+    } while ((millis() - startMs) < durationMs);
+}
+
+void RunBootFlapExercise() {
+    constexpr uint32_t kFullActuationHoldMs = 2000;
+    constexpr uint32_t kIntermediateRetractHoldMs = 1000;
+    constexpr uint32_t kHalfActuationHoldMs = 1000;
+    constexpr float kHalfActuationDeg = kServoMaxActuationDeg * 0.5f;
+
+    HoldBootFlapCommand(kServoMaxActuationDeg, kFullActuationHoldMs);
+    HoldBootFlapCommand(0.0f, kIntermediateRetractHoldMs);
+    HoldBootFlapCommand(kHalfActuationDeg, kHalfActuationHoldMs);
+    HoldBootFlapCommand(0.0f, kIntermediateRetractHoldMs);
+}
+
 void ForceTeensyRebootIfSafe(const char *reason) {
     if (!g_setupComplete || flightComputer.Status() == FlightStatus::Ground) {
         ForceTeensyReboot(reason);
@@ -1684,6 +1974,7 @@ static void RetryServiceUntilReady(RetryState &retry,
     uint32_t lastWaitLogMs = 0;
     while (!isReady()) {
         const uint32_t nowMs = millis();
+        BootLedSlowBlink();  // Keep LED blinking during retry loops
         ServiceRetry(nowMs, retry, isReady(), initializer, serviceName);
         if (!isReady() && resetAttempts > 0 && retry.attempts >= resetAttempts) {
             ForceTeensyReboot(serviceName);
@@ -1725,6 +2016,7 @@ static void RetryCfdTableUntilLoaded(CfdTableStorage *storage) {
     uint32_t attempts = 0;
     while (!storage->loaded) {
         ++attempts;
+        BootLedSlowBlink();  // Keep LED blinking during retry loops
         if (LoadCfdTableDuringSetup(storage)) {
             return;
         }
@@ -2426,29 +2718,40 @@ static void LogBarometerDiagnostics(uint32_t nowMs) {
 /// Setup blocks on required startup dependencies so the system does not proceed
 /// until logging, replay/CFD assets, and critical sensors are available.
 void setup() {
-    // pinMode(kStatusLedPin, OUTPUT);
-    // digitalWrite(kStatusLedPin, LOW);
+    // Initialize boot LED immediately - slow blink during boot
+    BootLedBegin();
+    BootLedSlowBlink();
 
     LOG_BEGIN(115200);
-    while (!Serial) {
+    // Wait for serial with timeout - don't block forever on flight without USB
+    constexpr uint32_t kSerialTimeoutMs = 2000;
+    const uint32_t serialWaitStart = millis();
+    while (!Serial && (millis() - serialWaitStart) < kSerialTimeoutMs) {
+        BootLedSlowBlink();
         delay(10);
     }
 
     LogSetupCheckpoint("boot");
+    BootLedSlowBlink();
     LogSetupCheckpoint("preparing SPI buses");
     PrepareSpiBusesForStartup();
     LogSetupCheckpoint("SPI buses ready");
     LogSetupCheckpoint("attaching flap servos");
     g_flapActuator.Begin();
     LogSetupCheckpoint("flap servos initialized");
+    // LogSetupCheckpoint("running flap boot exercise");
+    // RunBootFlapExercise();
+    // LogSetupCheckpoint("flap boot exercise complete");
 
     LogSetupCheckpoint("starting data logger init");
+    BootLedSlowBlink();
     RetryServiceUntilReady(g_dataLoggerRetry,
                            &DataLoggerIsInitialized,
                            &DataLoggerBegin,
                            "data_logger",
                            "data logger unavailable, retrying");
     LogSetupCheckpoint("data logger init complete");
+    BootLedSlowBlink();
 
     LogSetupCheckpoint("checking CSV replay");
     if (kEnableCsvReplay) {
@@ -2462,6 +2765,7 @@ void setup() {
         if (kBnoEnabled) {
             LOG_PRINTLN("Configured BNO sensor: BNO085 over I2C");
             LogSetupCheckpoint("starting BNO init");
+            BootLedSlowBlink();
             RetryServiceUntilReady(g_bnoRetry,
                                    &Bno085SensorIsInitialized,
                                    &StartBnoDuringSetup,
@@ -2469,31 +2773,39 @@ void setup() {
                                    "BNO unavailable, retrying",
                                    kCriticalStartupResetAttempts);
             LogSetupCheckpoint("BNO init complete");
+            BootLedSlowBlink();
         } else {
             LogSetupCheckpoint("BNO disabled");
         }
 
         if (kPulseEnabled) {
             LogSetupCheckpoint("starting Pulse20 init");
+            BootLedSlowBlink();
             StartPulseDuringSetup();
             LogSetupCheckpoint(Ellipse20SensorIsInitialized() ? "Pulse20 init complete" : "Pulse20 unavailable");
+            BootLedSlowBlink();
         } else {
             LogSetupCheckpoint("Pulse20 disabled");
         }
 
         LogSetupCheckpoint("starting ICM-20948 init");
+        BootLedSlowBlink();
         ServiceRetry(millis(), g_icmRetry, Icm20948SensorIsInitialized(), &Icm20948SensorBegin, "icm20948");
         LogSetupCheckpoint(Icm20948SensorIsInitialized() ? "ICM-20948 init complete" : "ICM-20948 unavailable");
+        BootLedSlowBlink();
 
         if (kLsmEnabled) {
             LogSetupCheckpoint("starting LSM9DS1 init");
+            BootLedSlowBlink();
             Lsm9ds1SensorBegin();
             LogSetupCheckpoint(Lsm9ds1SensorIsInitialized() ? "LSM9DS1 init complete" : "LSM9DS1 unavailable");
+            BootLedSlowBlink();
         } else {
             LogSetupCheckpoint("LSM9DS1 disabled");
         }
 
         LogSetupCheckpoint("starting BMP585 init");
+        BootLedSlowBlink();
         RetryServiceUntilReady(g_bmpRetry,
                                &Bmp585SensorIsInitialized,
                                &Bmp585SensorBegin,
@@ -2501,12 +2813,15 @@ void setup() {
                                "BMP585 unavailable, retrying",
                                kCriticalStartupResetAttempts);
         LogSetupCheckpoint("BMP585 init complete");
+        BootLedSlowBlink();
 
     }
 
     LogSetupCheckpoint("loading CFD table");
+    BootLedSlowBlink();
     RetryCfdTableUntilLoaded(&g_cfdTable);
     LogSetupCheckpoint("CFD table loaded");
+    BootLedSlowBlink();
 
     LogSetupCheckpoint("loading runtime settings");
     InitializeRuntimeSettings();
@@ -2575,6 +2890,9 @@ void setup() {
     PlayStartupMarch();
     g_setupComplete = true;
     LogSetupCheckpoint("setup complete");
+
+    // Boot successful - turn LED solid on
+    BootLedSolidOn();
 }
 
 /// Arduino loop entry point.

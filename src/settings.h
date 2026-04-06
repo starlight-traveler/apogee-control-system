@@ -99,10 +99,10 @@ namespace actuation {
 constexpr float kServoMaxActuationDeg = 45.0f;
 constexpr int kServoAttachMinPulseUs = 400;
 constexpr int kServoAttachMaxPulseUs = 2700;
-constexpr int kTopServoClosedPwmUs = 1135;
-constexpr int kTopServoOpenPwmUs = 1744;
+constexpr int kTopServoClosedPwmUs = 1125;
+constexpr int kTopServoOpenPwmUs = 1737;
 constexpr int kBottomServoClosedPwmUs = 2169;
-constexpr int kBottomServoOpenPwmUs = 1585;
+constexpr int kBottomServoOpenPwmUs = 1578;
 // First-order servo/flap response time constant (seconds).
 constexpr float kServoLatencySeconds = 0.66f;
 // Minimum time between commanded PWM updates.
@@ -709,7 +709,7 @@ constexpr float kBnoCoastBlendFactor = 0.1f;
 constexpr float kBnoReferenceCorrectionBlendFactor = 0.20f;
 // Aggressive BNO correction during coast - weight BNO much more heavily to
 // quickly correct any gyro drift accumulated during burn.
-constexpr float kBnoCoastCorrectionBlendFactor = 0.50f;
+constexpr float kBnoCoastCorrectionBlendFactor = 0.66f;
 
 // Burnout correction burst: aggressive accel correction window after burnout
 // to quickly correct gyro drift accumulated during burn phase.
