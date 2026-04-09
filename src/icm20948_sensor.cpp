@@ -75,7 +75,7 @@ bool g_lastAcquireUsedInterrupt = false;
 bool g_interruptConfigured = false;
 float g_crossCheckTrust = 1.0f;
 
-// Outlier detection state (Phase 3.1).
+// Outlier detection state
 bool g_hasPreviousGyro = false;
 float g_previousGyro[3] = {0.0f, 0.0f, 0.0f};
 bool g_hasPreviousAccel = false;
@@ -523,29 +523,6 @@ float DescendingTrust(float value, float fullTrustMax, float zeroTrustMin) {
     return Clamp01((zeroTrustMin - value) / (zeroTrustMin - fullTrustMax));
 }
 
-/// Rotates an Earth-frame vector into the body frame using the stored quaternion convention.
-void RotateEarthToBody(const float q[4], const float earth[3], float body[3]) {
-    const float w = q[0];
-    const float x = q[1];
-    const float y = q[2];
-    const float z = q[3];
-
-    // Match the Earth-to-body basis used by QuaternionFromEarthBasisInBody().
-    const float r00 = 1.0f - 2.0f * (y * y + z * z);
-    const float r01 = 2.0f * (x * y - w * z);
-    const float r02 = 2.0f * (x * z + w * y);
-    const float r10 = 2.0f * (x * y + w * z);
-    const float r11 = 1.0f - 2.0f * (x * x + z * z);
-    const float r12 = 2.0f * (y * z - w * x);
-    const float r20 = 2.0f * (x * z - w * y);
-    const float r21 = 2.0f * (y * z + w * x);
-    const float r22 = 1.0f - 2.0f * (x * x + y * y);
-
-    body[0] = r00 * earth[0] + r01 * earth[1] + r02 * earth[2];
-    body[1] = r10 * earth[0] + r11 * earth[1] + r12 * earth[2];
-    body[2] = r20 * earth[0] + r21 * earth[1] + r22 * earth[2];
-}
-
 /// Rotates a body-frame vector into the Earth frame.
 void RotateBodyToEarth(const float q[4], const float body[3], float earth[3]) {
     const float w = q[0];
@@ -581,6 +558,14 @@ void ApplyMountRotation(float vector[3]) {
     vector[0] = rotated[0];
     vector[1] = rotated[1];
     vector[2] = rotated[2];
+}
+
+void ApplyGyroCalibration(float vector[3]) {
+    float corrected[3] = {0.0f, 0.0f, 0.0f};
+    Apply3x3(settings::sensors::icm20948::kGyroAinv, vector, corrected);
+    vector[0] = corrected[0];
+    vector[1] = corrected[1];
+    vector[2] = corrected[2];
 }
 
 void ApplyMagAxisTransform(float vector[3]) {
@@ -646,6 +631,7 @@ void GetScaledImu(float gyroRadPerSec[3],
                        settings::sensors::icm20948::kGyroTempBiasSlopeRadPerSecPerC[1] * temperatureDeltaC;
     gyroRadPerSec[2] = g_activeGyroRadPerSecPerLsb * (rawGz - gyroOffsetZ) -
                        settings::sensors::icm20948::kGyroTempBiasSlopeRadPerSecPerC[2] * temperatureDeltaC;
+    ApplyGyroCalibration(gyroRadPerSec);
     ApplyMountRotation(gyroRadPerSec);
 
     float rawAccel[3] = {
@@ -696,6 +682,7 @@ void GetScaledImu(float gyroRadPerSec[3],
 /// During coast, implements burnout correction burst to quickly correct gyro drift.
 float ComputeAccelTrust(float accelMagnitudeG, float gyroNorm) {
     float phaseTrust = 0.0f;
+    float flightSuppression = 1.0f;
     switch (g_flightStatus) {
         case FlightStatus::Ground:
             phaseTrust = 1.0f;
@@ -719,6 +706,13 @@ float ComputeAccelTrust(float accelMagnitudeG, float gyroNorm) {
             }
             // After burnout window, maintain moderate trust for ongoing correction
             phaseTrust = settings::ahrs::kCoastAccelTrust;
+            flightSuppression =
+                DescendingTrust(fabsf(accelMagnitudeG - 1.0f),
+                                settings::ahrs::kFlightAccelDeviationFullTrustG,
+                                settings::ahrs::kFlightAccelDeviationZeroTrustG) *
+                DescendingTrust(gyroNorm,
+                                settings::ahrs::kFlightAccelGyroFadeStartRadPerSec,
+                                settings::ahrs::kFlightAccelGyroFadeEndRadPerSec);
             break;
     }
 
@@ -728,7 +722,7 @@ float ComputeAccelTrust(float accelMagnitudeG, float gyroNorm) {
     const float rateTrust = DescendingTrust(gyroNorm,
                                             settings::sensors::icm20948::kAccelCorrectionGyroFadeStartRadPerSec,
                                             settings::sensors::icm20948::kAccelCorrectionGyroFadeEndRadPerSec);
-    return phaseTrust * magnitudeTrust * rateTrust;
+    return phaseTrust * magnitudeTrust * rateTrust * flightSuppression;
 }
 
 float MagTrustPhaseScale() {
@@ -867,29 +861,6 @@ void UpdateGroundAlignment(const float accelNorm[3], float accelTrust, const flo
     }
 }
 
-/// Computes the legacy accel+mag yaw correction used to bootstrap the Earth-field reference.
-bool ComputeBootstrapMagError(const float accelNorm[3], const float magNorm[3], float error[3]) {
-    float measuredEast[3] = {0.0f, 0.0f, 0.0f};
-    Cross3(accelNorm[0], accelNorm[1], accelNorm[2],
-           magNorm[0], magNorm[1], magNorm[2],
-           measuredEast);
-    if (!Normalize3(measuredEast[0], measuredEast[1], measuredEast[2])) {
-        return false;
-    }
-
-    constexpr float kEarthEast[3] = {0.0f, 1.0f, 0.0f};
-    float predictedEast[3] = {0.0f, 0.0f, 0.0f};
-    RotateEarthToBody(g_q, kEarthEast, predictedEast);
-    if (!Normalize3(predictedEast[0], predictedEast[1], predictedEast[2])) {
-        return false;
-    }
-
-    Cross3(measuredEast[0], measuredEast[1], measuredEast[2],
-           predictedEast[0], predictedEast[1], predictedEast[2],
-           error);
-    return true;
-}
-
 /// Returns the phase-specific proportional gain for accelerometer correction.
 /// Returns aggressive gain during burnout correction window.
 float AccelCorrectionGain() {
@@ -999,6 +970,7 @@ void CaptureRailReferenceQuaternion(float accelTrust, float magTrust) {
 }
 
 /// Integrates the quaternion one step using adaptive sensor feedback.
+/// Uses the same error computation algorithm as LSM for consistency.
 void AdaptiveQuaternionUpdate(const float accelNorm[3],
                               float accelTrust,
                               const float gyroRadPerSec[3],
@@ -1011,49 +983,58 @@ void AdaptiveQuaternionUpdate(const float accelNorm[3],
 
     float feedback[3] = {0.0f, 0.0f, 0.0f};
 
-    if (accelTrust > 0.0f) {
-        constexpr float kEarthUp[3] = {0.0f, 0.0f, 1.0f};
-        float predictedGravity[3] = {0.0f, 0.0f, 0.0f};
-        RotateEarthToBody(g_q, kEarthUp, predictedGravity);
+    // Compute error corrections using LSM algorithm.
+    {
+        const float qw = g_q[0];
+        const float qx = g_q[1];
+        const float qy = g_q[2];
+        const float qz = g_q[3];
 
-        float accelError[3] = {0.0f, 0.0f, 0.0f};
-        float accelFeedback[3] = {0.0f, 0.0f, 0.0f};
-        Cross3(accelNorm[0], accelNorm[1], accelNorm[2],
-               predictedGravity[0], predictedGravity[1], predictedGravity[2],
-               accelError);
+        // Compute predicted up vector in body frame directly from quaternion.
+        const float ux = 2.0f * (qx * qz - qw * qy);
+        const float uy = 2.0f * (qw * qx + qy * qz);
+        const float uz = qw * qw - qx * qx - qy * qy + qz * qz;
+
+        // Compute predicted east direction in body frame from accel × mag.
+        float hx = accelNorm[1] * magNorm[2] - accelNorm[2] * magNorm[1];
+        float hy = accelNorm[2] * magNorm[0] - accelNorm[0] * magNorm[2];
+        float hz = accelNorm[0] * magNorm[1] - accelNorm[1] * magNorm[0];
+        float localMagTrust = magTrust;
+        if (!Normalize3(hx, hy, hz)) {
+            localMagTrust = 0.0f;
+            hx = hy = hz = 0.0f;
+        }
+
+        // Expected east from quaternion.
+        const float wx = 2.0f * (qx * qy + qw * qz);
+        const float wy = qw * qw - qx * qx + qy * qy - qz * qz;
+        const float wz = 2.0f * (qy * qz - qw * qx);
+
+        // Compute errors using cross products.
+        float accelError[3] = {
+            accelNorm[1] * uz - accelNorm[2] * uy,
+            accelNorm[2] * ux - accelNorm[0] * uz,
+            accelNorm[0] * uy - accelNorm[1] * ux,
+        };
+        float magError[3] = {
+            hy * wz - hz * wy,
+            hz * wx - hx * wz,
+            hx * wy - hy * wx,
+        };
+
+        // Apply trust-weighted gains.
+        const float accelGain = accelTrust * AccelCorrectionGain();
+        const float magGain = localMagTrust * MagCorrectionGain();
         for (int i = 0; i < 3; ++i) {
-            accelFeedback[i] = accelTrust * AccelCorrectionGain() * accelError[i];
+            accelError[i] *= accelGain;
+            magError[i] *= magGain;
         }
-        LimitVector(accelFeedback, settings::sensors::icm20948::kAccelCorrectionMaxRateRadPerSec);
-        for (int i = 0; i < 3; ++i) {
-            feedback[i] += accelFeedback[i];
-        }
-    }
+        LimitVector(accelError, settings::sensors::icm20948::kAccelCorrectionMaxRateRadPerSec);
+        LimitVector(magError, settings::sensors::icm20948::kMagCorrectionMaxRateRadPerSec);
 
-    if (magTrust > 0.0f) {
-        float magError[3] = {0.0f, 0.0f, 0.0f};
-        float magFeedback[3] = {0.0f, 0.0f, 0.0f};
-        bool haveMagError = false;
-        if (accelTrust > 0.0f) {
-            haveMagError = ComputeBootstrapMagError(accelNorm, magNorm, magError);
-        } else if (g_hasEarthMagReference) {
-            float predictedMag[3] = {0.0f, 0.0f, 0.0f};
-            RotateEarthToBody(g_q, g_magReferenceEarth, predictedMag);
-            Cross3(magNorm[0], magNorm[1], magNorm[2],
-                   predictedMag[0], predictedMag[1], predictedMag[2],
-                   magError);
-            haveMagError = true;
-        }
-
-        if (haveMagError) {
-            for (int i = 0; i < 3; ++i) {
-                magFeedback[i] = magTrust * MagCorrectionGain() * magError[i];
-            }
-            LimitVector(magFeedback, settings::sensors::icm20948::kMagCorrectionMaxRateRadPerSec);
-            for (int i = 0; i < 3; ++i) {
-                feedback[i] += magFeedback[i];
-            }
-        }
+        feedback[0] = accelError[0] + magError[0];
+        feedback[1] = accelError[1] + magError[1];
+        feedback[2] = accelError[2] + magError[2];
     }
 
     if (g_railConstraintActive && g_hasRailReferenceQuaternion) {
@@ -1145,8 +1126,8 @@ void QuaternionToYprDeg(float &yawDeg, float &pitchDeg, float &rollDeg) {
 
     yawDeg = yaw;
     pitchDeg = pitch;
-    // Match the diagnostic/body-frame roll sign used by the bootstrap solve.
-    rollDeg = -roll;
+    // Use same roll sign convention as LSM (no negation).
+    rollDeg = roll;
 }
 
 /// Publishes the last valid ICM sample so the estimator can hold state between

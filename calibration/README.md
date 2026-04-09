@@ -18,6 +18,14 @@ platformio device monitor -b 115200
 ```
 
 The serial programs print calibration data in `settings::sensors::*` format so the results can be pasted into [`src/settings.h`](../src/settings.h).
+They now also print:
+
+- an explicit `kGyroAinv[3][3]` block
+- the fitted `kMountRotation[3][3]`
+- the equivalent fixed mount quaternion as a comment for offline analysis and replay tooling
+
+The current bench workflow fits accel soft-iron / mount rotation and gyro bias / temperature drift. A non-identity `kGyroAinv`
+still requires controlled rate-table style data; the advanced targets therefore print identity there until such data exist.
 
 For the ICM target, repeat the `g` gyro-bias capture at two or more different temperatures if you want it to fit
 `kGyroTempBiasSlopeRadPerSecPerC[3]` instead of printing zeros.

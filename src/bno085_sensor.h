@@ -21,6 +21,9 @@ struct Bno085Sample {
     bool hasGyro = false;
     bool hasQuaternion = false;
     uint32_t sampleMicros = 0;
+    uint32_t accelMicros = 0;
+    uint32_t gyroMicros = 0;
+    uint32_t quaternionMicros = 0;
     float accel[3] = {0.0f, 0.0f, 0.0f};
     float gyro[3] = {0.0f, 0.0f, 0.0f};
     float quaternion[4] = {1.0f, 0.0f, 0.0f, 0.0f};

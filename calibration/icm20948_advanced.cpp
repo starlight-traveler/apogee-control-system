@@ -190,6 +190,18 @@ void Print3x3(const float matrix[3][3]) {
     }
 }
 
+void PrintQuaternion4(const float quaternion[4]) {
+    Serial.print("{");
+    Serial.print(quaternion[0], 6);
+    Serial.print("f, ");
+    Serial.print(quaternion[1], 6);
+    Serial.print("f, ");
+    Serial.print(quaternion[2], 6);
+    Serial.print("f, ");
+    Serial.print(quaternion[3], 6);
+    Serial.print("f}");
+}
+
 void PrintSettingsInsertionGuide() {
     Serial.println("Paste target:");
     Serial.println("  file: src/settings.h");
@@ -197,6 +209,7 @@ void PrintSettingsInsertionGuide() {
     Serial.println("Replace these constants with the values printed below:");
     Serial.println("  kGyroReferenceTemperatureC");
     Serial.println("  kGyroOffset[3]");
+    Serial.println("  kGyroAinv[3][3]");
     Serial.println("  kAccelBias[3]");
     Serial.println("  kAccelAinv[3][3]");
     Serial.println("  kMountRotation[3][3]");
@@ -749,8 +762,16 @@ void PrintRecommendedSettings() {
     Serial.print("f, ");
     Serial.print(gyroOffsetRaw[2], 2);
     Serial.println("f};");
+    Serial.println("// Leave gyro matrix at identity until you have a controlled rate-table calibration.");
+    Serial.println("constexpr float kGyroAinv[3][3] = {");
+    Serial.println("  {1.0f, 0.0f, 0.0f},");
+    Serial.println("  {0.0f, 1.0f, 0.0f},");
+    Serial.println("  {0.0f, 0.0f, 1.0f},");
+    Serial.println("};");
 
     if (haveAccel) {
+        float mountQuaternion[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+        calibration_matrix::RotationMatrixToQuaternion(mountRotation, mountQuaternion);
         Serial.print("constexpr float kAccelBias[3] = {");
         Serial.print(accelBias[0], 2);
         Serial.print("f, ");
@@ -764,6 +785,9 @@ void PrintRecommendedSettings() {
         Serial.println("constexpr float kMountRotation[3][3] = {");
         Print3x3(mountRotation);
         Serial.println("};");
+        Serial.print("// Equivalent fixed mount quaternion [w, x, y, z] = ");
+        PrintQuaternion4(mountQuaternion);
+        Serial.println();
     } else {
         Serial.println("// Accel calibration incomplete. Capture +X/-X/+Y/-Y/+Z/-Z first.");
     }

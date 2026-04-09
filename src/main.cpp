@@ -936,54 +936,54 @@ static void PreferTiltOnlyQuaternion(float quaternion[4], bool &hasQuaternion, c
     hasQuaternion = false;
 }
 
-static bool ZenithDegFromYprDeg(const float yprDeg[3], float &zenithDeg) {
-    constexpr float kDegToRad = 3.14159265358979323846f / 180.0f;
-    const float pitchRad = yprDeg[1] * kDegToRad;
-    const float rollRad = yprDeg[2] * kDegToRad;
-    const float zenithRad = math_utils::EulerToZenith(pitchRad, rollRad);
-    if (!std::isfinite(zenithRad)) {
-        return false;
-    }
-    zenithDeg = fabsf(zenithRad) * (180.0f / 3.14159265358979323846f);
-    return true;
-}
-
-static bool ZenithDegFromQuaternion(const float quaternion[4], float &zenithDeg) {
+static bool GravityVectorFromQuaternion(const float quaternion[4], float gravityBody[3]) {
     math_utils::Quaternion q = math_utils::MakeQuaternion(1.0f, 0.0f, 0.0f, 0.0f);
     if (!LoadValidatedQuaternion(quaternion, q)) {
         return false;
     }
-    float yaw = 0.0f;
-    float pitch = 0.0f;
-    float roll = 0.0f;
-    math_utils::QuaternionToEuler(q, yaw, pitch, roll);
-    const float zenithRad = math_utils::EulerToZenith(pitch, roll);
-    if (!std::isfinite(zenithRad)) {
+    const float w = q.w;
+    const float x = q.x;
+    const float y = q.y;
+    const float z = q.z;
+
+    gravityBody[0] = 2.0f * (x * z + w * y);
+    gravityBody[1] = 2.0f * (y * z - w * x);
+    gravityBody[2] = 1.0f - 2.0f * (x * x + y * y);
+    const float normSq = gravityBody[0] * gravityBody[0] + gravityBody[1] * gravityBody[1] +
+                         gravityBody[2] * gravityBody[2];
+    return std::isfinite(normSq) && normSq > 1.0e-6f;
+}
+
+static bool GravityVectorFromYprDeg(const float yprDeg[3], float gravityBody[3]) {
+    float tiltQuaternion[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+    if (!TiltQuaternionFromYprDeg(yprDeg, tiltQuaternion)) {
         return false;
     }
-    zenithDeg = fabsf(zenithRad) * (180.0f / 3.14159265358979323846f);
-    return true;
+    return GravityVectorFromQuaternion(tiltQuaternion, gravityBody);
 }
 
 static bool TiltDifferenceDegFromYprDeg(const float yprA[3], const float yprB[3], float &differenceDeg) {
-    float zenithA = 0.0f;
-    float zenithB = 0.0f;
-    if (!ZenithDegFromYprDeg(yprA, zenithA) || !ZenithDegFromYprDeg(yprB, zenithB)) {
+    float gravityA[3] = {0.0f, 0.0f, 0.0f};
+    float gravityB[3] = {0.0f, 0.0f, 0.0f};
+    if (!GravityVectorFromYprDeg(yprA, gravityA) || !GravityVectorFromYprDeg(yprB, gravityB)) {
         return false;
     }
-    differenceDeg = fabsf(zenithA - zenithB);
+    const float dot = gravityA[0] * gravityB[0] + gravityA[1] * gravityB[1] + gravityA[2] * gravityB[2];
+    differenceDeg = acosf(math_utils::Clamp(dot, -1.0f, 1.0f)) * (180.0f / 3.14159265358979323846f);
     return true;
 }
 
 static bool TiltDifferenceDegFromQuaternions(const float quaternionA[4],
                                              const float quaternionB[4],
                                              float &differenceDeg) {
-    float zenithA = 0.0f;
-    float zenithB = 0.0f;
-    if (!ZenithDegFromQuaternion(quaternionA, zenithA) || !ZenithDegFromQuaternion(quaternionB, zenithB)) {
+    float gravityA[3] = {0.0f, 0.0f, 0.0f};
+    float gravityB[3] = {0.0f, 0.0f, 0.0f};
+    if (!GravityVectorFromQuaternion(quaternionA, gravityA) ||
+        !GravityVectorFromQuaternion(quaternionB, gravityB)) {
         return false;
     }
-    differenceDeg = fabsf(zenithA - zenithB);
+    const float dot = gravityA[0] * gravityB[0] + gravityA[1] * gravityB[1] + gravityA[2] * gravityB[2];
+    differenceDeg = acosf(math_utils::Clamp(dot, -1.0f, 1.0f)) * (180.0f / 3.14159265358979323846f);
     return true;
 }
 
@@ -1220,11 +1220,11 @@ static void CopyIcmLikeFields(SensorData &dst, const SensorData &src) {
 
 static void CopyBnoFields(SensorData &dst, const Bno085Sample &src) {
     for (int i = 0; i < 3; ++i) {
-        dst.accelBNO[i] = src.accel[i];
-        dst.gyroBNO[i] = src.gyro[i];
+        dst.accelBNO[i] = src.hasAccel ? src.accel[i] : 0.0f;
+        dst.gyroBNO[i] = src.hasGyro ? src.gyro[i] : 0.0f;
     }
     for (int i = 0; i < 4; ++i) {
-        dst.quaternionBNO[i] = src.quaternion[i];
+        dst.quaternionBNO[i] = src.hasQuaternion ? src.quaternion[i] : (i == 0 ? 1.0f : 0.0f);
     }
     dst.hasBnoQuaternion = src.hasQuaternion;
 }
@@ -1279,6 +1279,38 @@ static void SetMainQuaternion(SensorData &data, const math_utils::Quaternion &qu
 ///
 /// The live path aliases the active attitude source into the main quaternion
 /// field and only mirrors BNO accel into ICM slots when the ICM sample is absent.
+static bool BnoComparableWithFastRail(uint32_t nowUs,
+                                      const Bno085Sample &bnoData,
+                                      uint32_t otherSampleMicros,
+                                      uint32_t otherMaxAgeUs,
+                                      bool requireQuaternion = false) {
+    if (!bnoData.hasAccel || !bnoData.hasGyro) {
+        return false;
+    }
+    if (requireQuaternion && !bnoData.hasQuaternion) {
+        return false;
+    }
+    return SamplesComparable(nowUs,
+                             bnoData.accelMicros,
+                             kCrossCheckBnoSampleMaxAgeUs,
+                             otherSampleMicros,
+                             otherMaxAgeUs,
+                             kCrossCheckBnoPairMaxSkewUs) &&
+           SamplesComparable(nowUs,
+                             bnoData.gyroMicros,
+                             kCrossCheckBnoSampleMaxAgeUs,
+                             otherSampleMicros,
+                             otherMaxAgeUs,
+                             kCrossCheckBnoPairMaxSkewUs) &&
+           (!requireQuaternion ||
+            SamplesComparable(nowUs,
+                              bnoData.quaternionMicros,
+                              kCrossCheckBnoSampleMaxAgeUs,
+                              otherSampleMicros,
+                              otherMaxAgeUs,
+                              kCrossCheckBnoPairMaxSkewUs));
+}
+
 static bool AcquireSensorData(SensorData &data) {
     if (g_csvReplay.enabled) {
         return CsvReplayNextSample(data);
@@ -1351,14 +1383,14 @@ static bool AcquireSensorData(SensorData &data) {
             ++g_sensorAcquireStats.lsmCachedHits;
         }
     }
-    if (hasBnoImu && !hasIcmImu) {
+    if (hasBnoImu && !hasIcmImu && bnoData.hasAccel) {
         ++g_sensorAcquireStats.bnoToIcmFallbacks;
         for (int i = 0; i < 3; ++i) {
             data.accelICM[i] = data.accelBNO[i];
         }
-        if (data.hasQuaternion && !data.hasIcmQuaternion) {
+        if (data.hasBnoQuaternion && !data.hasIcmQuaternion) {
             for (int i = 0; i < 4; ++i) {
-                data.icmQuaternion[i] = data.quaternion[i];
+                data.icmQuaternion[i] = data.quaternionBNO[i];
             }
             data.hasIcmQuaternion = true;
         }
@@ -1397,13 +1429,12 @@ static bool AcquireSensorData(SensorData &data) {
         updatedIcmLsmTrust = true;
     }
     const bool compareBnoIcm =
-        hasBnoImu && hasIcmImu && bnoData.hasAccel && bnoData.hasGyro &&
-        SamplesComparable(comparisonNowUs,
-                          bnoData.sampleMicros,
-                          kCrossCheckBnoSampleMaxAgeUs,
-                          icmDiagnostics.lastSampleMicros,
-                          kCrossCheckFastSampleMaxAgeUs,
-                          kCrossCheckBnoPairMaxSkewUs);
+        hasBnoImu && hasIcmImu &&
+        BnoComparableWithFastRail(comparisonNowUs,
+                                  bnoData,
+                                  icmDiagnostics.lastSampleMicros,
+                                  kCrossCheckFastSampleMaxAgeUs,
+                                  false);
     if (compareBnoIcm) {
         float tiltDifferenceDeg = 0.0f;
         const bool hasTiltDifference =
@@ -1425,13 +1456,12 @@ static bool AcquireSensorData(SensorData &data) {
         updatedBnoReferenceTrust = true;
     }
     const bool compareBnoLsm =
-        hasBnoImu && hasLsmImu && bnoData.hasAccel && bnoData.hasGyro &&
-        SamplesComparable(comparisonNowUs,
-                          bnoData.sampleMicros,
-                          kCrossCheckBnoSampleMaxAgeUs,
-                          lsmDiagnostics.lastSampleMicros,
-                          kCrossCheckFastSampleMaxAgeUs,
-                          kCrossCheckBnoPairMaxSkewUs);
+        hasBnoImu && hasLsmImu &&
+        BnoComparableWithFastRail(comparisonNowUs,
+                                  bnoData,
+                                  lsmDiagnostics.lastSampleMicros,
+                                  kCrossCheckFastSampleMaxAgeUs,
+                                  false);
     if (compareBnoLsm) {
         float tiltDifferenceDeg = 0.0f;
         const bool hasTiltDifference =
@@ -1511,13 +1541,12 @@ static bool AcquireSensorData(SensorData &data) {
         updatedIcmLsmTrust = true;
     }
     const bool compareBnoPulse =
-        hasBnoImu && bnoData.hasAccel && bnoData.hasGyro && data.hasPulseQuaternion &&
-        SamplesComparable(comparisonNowUs,
-                          bnoData.sampleMicros,
-                          kCrossCheckBnoSampleMaxAgeUs,
-                          pulseDiagnostics.lastSampleMicros,
-                          kPulseSampleMaxAgeUs,
-                          kCrossCheckBnoPairMaxSkewUs);
+        hasBnoImu && data.hasPulseQuaternion &&
+        BnoComparableWithFastRail(comparisonNowUs,
+                                  bnoData,
+                                  pulseDiagnostics.lastSampleMicros,
+                                  kPulseSampleMaxAgeUs,
+                                  true);
     if (compareBnoPulse) {
         float tiltDifferenceDeg = 0.0f;
         const bool hasTiltDifference =
@@ -1853,6 +1882,8 @@ static float g_actuationLastStateTime = 0.0f;
 static bool g_actuationHasLastControlUpdate = false;
 static uint32_t g_actuationLastControlUpdateMs = 0;
 static float g_actuationLastCommandDeg = 0.0f;
+static bool g_autoActuationFirstMotionReleased = false;
+static bool g_autoActuationSafetyLatched = false;
 static PredictorHorizontalVelocityTracker g_actuationPredictorHorizontalVelocity;
 static RuntimeSettings g_runtimeSettings = RuntimeSettingsDefaults();
 static RuntimeSettingsStorageStatus g_runtimeSettingsStorageStatus;
@@ -1899,6 +1930,64 @@ struct AutoActuationTelemetry {
     float predictorSeedClampedAngularRateRadPerSec = 0.0f;
     float predictorSeedConfidenceFlags = 0.0f;
 };
+
+static bool ShouldBlockFirstAutoActuationMotion(const FilteredState &state,
+                                                FlightStatus status,
+                                                bool hasBaroAgl,
+                                                float baroAltitudeAglMeters) {
+    if (g_autoActuationFirstMotionReleased) {
+        return false;
+    }
+
+    if (status != FlightStatus::Coast) {
+        return true;
+    }
+
+    const double burnoutTime = flightComputer.BurnoutTime();
+    if (burnoutTime <= 0.0) {
+        return true;
+    }
+
+    const double timeSinceBurnout = static_cast<double>(state.time) - burnoutTime;
+    if (timeSinceBurnout < static_cast<double>(settings::actuation::kPostBurnoutHoldoffSeconds)) {
+        return true;
+    }
+
+    if (!hasBaroAgl) {
+        return true;
+    }
+
+    const double altitudeAgreementError =
+        std::fabs(static_cast<double>(state.position[2]) - static_cast<double>(baroAltitudeAglMeters));
+    return altitudeAgreementError >
+           static_cast<double>(settings::actuation::kFirstFlapBaroStateAgreementMeters);
+}
+
+static bool ShouldLatchAutoActuationSafety(const FilteredState &state,
+                                           FlightStatus status,
+                                           bool hasBaroAgl,
+                                           float baroAltitudeAglMeters) {
+    if (status != FlightStatus::Coast) {
+        return false;
+    }
+
+    if (hasBaroAgl) {
+        const double altitudeAgreementError =
+            std::fabs(static_cast<double>(state.position[2]) - static_cast<double>(baroAltitudeAglMeters));
+        if (!std::isfinite(altitudeAgreementError) ||
+            altitudeAgreementError >
+                static_cast<double>(settings::actuation::kCoastBaroStateAgreementMeters)) {
+            return true;
+        }
+    }
+
+    const double coastAccelerationLimit =
+        static_cast<double>(settings::actuation::kCoastMaxUpwardAccelerationMps2);
+    const double inertialAccelerationZ = static_cast<double>(state.inertialAcceleration[2]);
+    const double filteredAccelerationZ = static_cast<double>(state.acceleration[2]);
+    return !std::isfinite(inertialAccelerationZ) || !std::isfinite(filteredAccelerationZ) ||
+           inertialAccelerationZ > coastAccelerationLimit || filteredAccelerationZ > coastAccelerationLimit;
+}
 
 struct RetryState {
     uint32_t nextAttemptMs = 0;
@@ -2328,6 +2417,8 @@ static void ApplyRuntimeSettingsToPredictors() {
     g_actuationPredictorReady = g_cfdTable.loaded;
     g_actuationHasLastZenithSample = false;
     g_actuationHasLastControlUpdate = false;
+    g_autoActuationFirstMotionReleased = false;
+    g_autoActuationSafetyLatched = false;
     ResetPredictorHorizontalVelocityTracker(g_actuationPredictorHorizontalVelocity);
     flightComputer.ReconfigurePredictor(g_runtimeSettings.environment,
                                         g_runtimeSettings.vehicle,
@@ -2883,6 +2974,8 @@ void setup() {
     g_actuationHasLastControlUpdate = false;
     g_actuationLastControlUpdateMs = 0;
     g_actuationLastCommandDeg = 0.0f;
+    g_autoActuationFirstMotionReleased = false;
+    g_autoActuationSafetyLatched = false;
     ResetPredictorHorizontalVelocityTracker(g_actuationPredictorHorizontalVelocity);
     g_lastTimingLogMs = 0;
     g_timingStats = TimingStats{};
@@ -2997,6 +3090,8 @@ void loop() {
             altitudeAglFeet = 0.0f;
         }
     }
+    const bool hasBaroAgl = g_hasPadAltitude;
+    const float altitudeAglMeters = altitudeAglFeet * 0.3048f;
 
     // Barometer innovations are temporarily widened around flap motion so the
     // estimator does not overreact to local pressure disturbances.
@@ -3022,8 +3117,35 @@ void loop() {
     float autoCommandDeg = 0.0f;
     const uint32_t actuationPredictorStartUs = micros();
     if (hasFilteredState) {
-        autoCommandDeg =
-            ComputeAutoActuationCommandDeg(nowMs, state, flightComputer.Status(), g_servoEffectiveDeg, &autoTelemetry);
+        const FlightStatus flightStatus = flightComputer.Status();
+        if (flightStatus == FlightStatus::Ground) {
+            g_autoActuationFirstMotionReleased = false;
+            g_autoActuationSafetyLatched = false;
+        }
+        if (ShouldLatchAutoActuationSafety(state, flightStatus, hasBaroAgl, altitudeAglMeters)) {
+            g_autoActuationSafetyLatched = true;
+        }
+
+        if (!g_autoActuationSafetyLatched) {
+            autoCommandDeg =
+                ComputeAutoActuationCommandDeg(nowMs, state, flightStatus, g_servoEffectiveDeg, &autoTelemetry);
+        }
+        const bool firstMotionRequested =
+            autoCommandDeg > settings::actuation::kServoSettlingAngleEpsilonDeg;
+        if (firstMotionRequested &&
+            ShouldBlockFirstAutoActuationMotion(state, flightStatus, hasBaroAgl, altitudeAglMeters)) {
+            autoCommandDeg = 0.0f;
+            g_actuationLastCommandDeg = 0.0f;
+            g_actuationHasLastControlUpdate = false;
+            autoTelemetry.autoCommandDeg = 0.0f;
+        } else if (g_autoActuationSafetyLatched) {
+            autoCommandDeg = 0.0f;
+            g_actuationLastCommandDeg = 0.0f;
+            g_actuationHasLastControlUpdate = false;
+            autoTelemetry.autoCommandDeg = 0.0f;
+        } else if (firstMotionRequested) {
+            g_autoActuationFirstMotionReleased = true;
+        }
     }
     UpdateMaxTiming(micros() - actuationPredictorStartUs, g_timingStats.maxActuationPredictorUs);
     float commandedActuationDeg = 0.0f;

@@ -267,12 +267,56 @@ inline float EulerToZenith(float pitch, float roll) {
     FastSinCos(roll, sinRoll, cosRoll);
     (void)sinPitch;
     (void)sinRoll;
-    return acosf(cosPitch * cosRoll);
+    // Folded zenith: use |cosZenith| to get tilt from vertical (0-90°)
+    // regardless of sensor mounting convention (whether +Z points to nose or tail)
+    return acosf(fabsf(cosPitch * cosRoll));
 }
 
 inline double EulerToZenith(double pitch, double roll) {
     const double value = Clamp(cos(pitch) * cos(roll), -1.0, 1.0);
-    return acos(value);
+    // Folded zenith: use |cosZenith| to get tilt from vertical (0-90°)
+    return acos(fabs(value));
+}
+
+// ---------------------------------------------------------------------------
+// Direct Quaternion to Zenith (Folded)
+// Computes zenith angle (tilt from vertical) directly from quaternion without
+// intermediate Euler conversion. Uses |cosZenith| to return folded zenith
+// in range [0, π/2] (0-90°), giving actual tilt from vertical regardless of
+// sensor mounting convention (whether +Z points to nose or tail).
+// zenith = acos(|R[2][2]|) where R[2][2] = 1 - 2*(x² + y²)
+// ---------------------------------------------------------------------------
+inline float QuaternionToZenith(const Quaternion &q) {
+    const float cosZenith = 1.0f - 2.0f * (q.x * q.x + q.y * q.y);
+    return acosf(fabsf(Clamp(cosZenith, -1.0f, 1.0f)));
+}
+
+inline double QuaternionToZenith(const Quaterniond &q) {
+    const double cosZenith = 1.0 - 2.0 * (q.x * q.x + q.y * q.y);
+    return acos(fabs(Clamp(cosZenith, -1.0, 1.0)));
+}
+
+inline float QuaternionToZenithArray(const float q[4]) {
+    // q[0]=w, q[1]=x, q[2]=y, q[3]=z
+    const float cosZenith = 1.0f - 2.0f * (q[1] * q[1] + q[2] * q[2]);
+    return acosf(fabsf(Clamp(cosZenith, -1.0f, 1.0f)));
+}
+
+// ---------------------------------------------------------------------------
+// Quaternion Non-Identity Check
+// Returns true if quaternion represents a rotation of at least minAngleRad.
+// Useful for detecting uninitialized or stuck-at-identity quaternions.
+// For a quaternion q, the rotation angle is 2*acos(|w|).
+// ---------------------------------------------------------------------------
+inline bool QuaternionHasRotation(const Quaternion &q, float minAngleRad = 0.01f) {
+    // Rotation angle = 2 * acos(|w|), so |w| < cos(minAngle/2) means rotation > minAngle
+    const float cosHalfMin = cosf(minAngleRad * 0.5f);
+    return fabsf(q.w) < cosHalfMin;
+}
+
+inline bool QuaternionHasRotationArray(const float q[4], float minAngleRad = 0.01f) {
+    const float cosHalfMin = cosf(minAngleRad * 0.5f);
+    return fabsf(q[0]) < cosHalfMin;
 }
 
 // ---------------------------------------------------------------------------

@@ -1,5 +1,7 @@
 #include "bno085_sensor.h"
 
+#include <algorithm>
+
 #include <Arduino.h>
 #include <Wire.h>
 
@@ -19,6 +21,7 @@ constexpr int8_t kBnoInterruptPin = settings::sensors::bno085::kInterruptPin;
 constexpr int8_t kBnoResetPin = settings::sensors::bno085::kResetPin;
 constexpr uint16_t kReportIntervalMs = 5;
 constexpr uint8_t kQuaternionInvalidDropThreshold = 2;
+constexpr uint32_t kFreshSignalMaxAgeUs = settings::sensors::icm20948::crosscheck::kBnoSampleMaxAgeUs;
 
 BNO08x g_bno;
 
@@ -32,6 +35,10 @@ bool g_haveGravity = false;
 bool g_haveMagnetometer = false;
 bool g_lastAcquireFresh = false;
 uint32_t g_lastSampleMicros = 0;
+uint32_t g_lastAccelMicros = 0;
+uint32_t g_lastGyroMicros = 0;
+uint32_t g_lastQuatMicros = 0;
+uint32_t g_lastMagnetometerMicros = 0;
 
 float g_lastAccel[3] = {0.0f, 0.0f, 0.0f};
 float g_lastGyro[3] = {0.0f, 0.0f, 0.0f};
@@ -73,6 +80,14 @@ void ResetCachedState() {
     g_lastMagnetometer[1] = 0.0f;
     g_lastMagnetometer[2] = 0.0f;
     g_lastSampleMicros = 0;
+    g_lastAccelMicros = 0;
+    g_lastGyroMicros = 0;
+    g_lastQuatMicros = 0;
+    g_lastMagnetometerMicros = 0;
+}
+
+bool SignalFresh(uint32_t nowUs, uint32_t lastUpdateUs) {
+    return lastUpdateUs > 0 && (nowUs - lastUpdateUs) <= kFreshSignalMaxAgeUs;
 }
 
 bool InterruptAsserted() {
@@ -202,6 +217,7 @@ void UpdateQuaternion(float real, float i, float j, float k) {
         }
         g_invalidQuaternionStreak = 0;
         g_haveQuaternion = true;
+        g_lastQuatMicros = micros();
         return;
     }
 
@@ -261,23 +277,34 @@ bool ConfigureReports() {
 }
 
 void PublishCachedState(SensorData &out, uint32_t nowUs) {
-    const bool quaternionValid = g_haveQuaternion && math_utils::ValidateQuaternionArray(g_lastQuat);
+    const bool accelFresh = g_haveAccel && SignalFresh(nowUs, g_lastAccelMicros);
+    const bool gyroFresh = g_haveGyro && SignalFresh(nowUs, g_lastGyroMicros);
+    const bool quaternionValid =
+        g_haveQuaternion && SignalFresh(nowUs, g_lastQuatMicros) && math_utils::ValidateQuaternionArray(g_lastQuat);
     out.timestamp = static_cast<float>(nowUs) * 1.0e-6f;
-    if (g_haveAccel) {
+    if (accelFresh) {
         out.accelBNO[0] = g_lastAccel[0];
         out.accelBNO[1] = g_lastAccel[1];
         out.accelBNO[2] = g_lastAccel[2];
         out.accelICM[0] = g_lastAccel[0];
         out.accelICM[1] = g_lastAccel[1];
         out.accelICM[2] = g_lastAccel[2];
+    } else {
+        out.accelBNO[0] = 0.0f;
+        out.accelBNO[1] = 0.0f;
+        out.accelBNO[2] = 0.0f;
     }
-    if (g_haveGyro) {
+    if (gyroFresh) {
         out.gyroBNO[0] = g_lastGyro[0];
         out.gyroBNO[1] = g_lastGyro[1];
         out.gyroBNO[2] = g_lastGyro[2];
         out.gyro[0] = g_lastGyro[0];
         out.gyro[1] = g_lastGyro[1];
         out.gyro[2] = g_lastGyro[2];
+    } else {
+        out.gyroBNO[0] = 0.0f;
+        out.gyroBNO[1] = 0.0f;
+        out.gyroBNO[2] = 0.0f;
     }
     if (quaternionValid) {
         out.quaternionBNO[0] = g_lastQuat[0];
@@ -290,11 +317,18 @@ void PublishCachedState(SensorData &out, uint32_t nowUs) {
         out.quaternion[3] = g_lastQuat[3];
         out.hasBnoQuaternion = true;
         out.hasQuaternion = true;
+    } else {
+        out.quaternionBNO[0] = 1.0f;
+        out.quaternionBNO[1] = 0.0f;
+        out.quaternionBNO[2] = 0.0f;
+        out.quaternionBNO[3] = 0.0f;
+        out.hasBnoQuaternion = false;
     }
 }
 
 bool ConsumeSensorEvent() {
     const uint8_t reportId = g_bno.getSensorEventID();
+    const uint32_t nowUs = micros();
     float x = 0.0f;
     float y = 0.0f;
     float z = 0.0f;
@@ -306,6 +340,7 @@ bool ConsumeSensorEvent() {
             g_lastAccel[1] = y;
             g_lastAccel[2] = z;
             g_haveAccel = true;
+            g_lastAccelMicros = nowUs;
             return true;
         case SENSOR_REPORTID_LINEAR_ACCELERATION:
             TransformIntoBodyFrame(g_bno.getLinAccelX(), g_bno.getLinAccelY(), g_bno.getLinAccelZ(), x, y, z);
@@ -327,6 +362,7 @@ bool ConsumeSensorEvent() {
             g_lastGyro[1] = y;
             g_lastGyro[2] = z;
             g_haveGyro = true;
+            g_lastGyroMicros = nowUs;
             return true;
         case SENSOR_REPORTID_UNCALIBRATED_GYRO:
             if (!g_haveGyro) {
@@ -340,6 +376,7 @@ bool ConsumeSensorEvent() {
                 g_lastGyro[1] = y;
                 g_lastGyro[2] = z;
                 g_haveGyro = true;
+                g_lastGyroMicros = nowUs;
             }
             return true;
         case SENSOR_REPORTID_MAGNETIC_FIELD:
@@ -348,6 +385,7 @@ bool ConsumeSensorEvent() {
             g_lastMagnetometer[1] = y;
             g_lastMagnetometer[2] = z;
             g_haveMagnetometer = true;
+            g_lastMagnetometerMicros = nowUs;
             return true;
         case SENSOR_REPORTID_ROTATION_VECTOR:
             UpdateQuaternion(g_bno.getQuatReal(), g_bno.getQuatI(), g_bno.getQuatJ(), g_bno.getQuatK());
@@ -441,15 +479,18 @@ bool Bno085SensorAcquire(SensorData &out) {
         }
     }
 
-    if (!consumedAny || !(g_haveAccel || g_haveGyro || g_haveQuaternion)) {
+    const uint32_t nowUs = micros();
+    const bool accelFresh = g_haveAccel && SignalFresh(nowUs, g_lastAccelMicros);
+    const bool gyroFresh = g_haveGyro && SignalFresh(nowUs, g_lastGyroMicros);
+    const bool quatFresh =
+        g_haveQuaternion && SignalFresh(nowUs, g_lastQuatMicros) && math_utils::ValidateQuaternionArray(g_lastQuat);
+    if (!consumedAny || !(accelFresh || gyroFresh || quatFresh)) {
         g_lastAcquireFresh = false;
         return false;
     }
-
-    const uint32_t nowUs = micros();
     PublishCachedState(out, nowUs);
     g_lastAcquireFresh = true;
-    g_lastSampleMicros = nowUs;
+    g_lastSampleMicros = std::max(g_lastAccelMicros, std::max(g_lastGyroMicros, g_lastQuatMicros));
     return true;
 }
 
@@ -458,12 +499,16 @@ bool Bno085SensorIsInitialized() {
 }
 
 Bno085Diagnostics Bno085SensorGetDiagnostics() {
+    const uint32_t nowUs = micros();
     Bno085Diagnostics diagnostics;
     diagnostics.transportReady = kBnoEnabled && g_initialized;
-    diagnostics.hasAccel = kBnoEnabled && g_haveAccel;
+    diagnostics.hasAccel = kBnoEnabled && g_haveAccel && SignalFresh(nowUs, g_lastAccelMicros);
     diagnostics.hasGyro = kBnoEnabled && g_haveGyro;
-    diagnostics.hasMag = kBnoEnabled && g_haveMagnetometer;
-    diagnostics.hasQuaternion = kBnoEnabled && g_haveQuaternion && math_utils::ValidateQuaternionArray(g_lastQuat);
+    diagnostics.hasMag =
+        kBnoEnabled && g_haveMagnetometer && SignalFresh(nowUs, g_lastMagnetometerMicros);
+    diagnostics.hasQuaternion =
+        kBnoEnabled && g_haveQuaternion && SignalFresh(nowUs, g_lastQuatMicros) &&
+        math_utils::ValidateQuaternionArray(g_lastQuat);
     diagnostics.lastAcquireFresh = kBnoEnabled && g_lastAcquireFresh;
     diagnostics.accelBodyMps2[0] = g_lastAccel[0];
     diagnostics.accelBodyMps2[1] = g_lastAccel[1];
@@ -502,16 +547,31 @@ Bno085Diagnostics Bno085SensorGetDiagnostics() {
 
 Bno085Sample Bno085SensorGetSample() {
     Bno085Sample sample;
-    sample.hasAccel = kBnoEnabled && g_haveAccel;
-    sample.hasGyro = kBnoEnabled && g_haveGyro;
-    sample.hasQuaternion = kBnoEnabled && g_haveQuaternion && math_utils::ValidateQuaternionArray(g_lastQuat);
-    sample.sampleMicros = kBnoEnabled ? g_lastSampleMicros : 0;
-    for (int i = 0; i < 3; ++i) {
-        sample.accel[i] = g_lastAccel[i];
-        sample.gyro[i] = g_lastGyro[i];
+    const uint32_t nowUs = micros();
+    sample.hasAccel = kBnoEnabled && g_haveAccel && SignalFresh(nowUs, g_lastAccelMicros);
+    sample.hasGyro = kBnoEnabled && g_haveGyro && SignalFresh(nowUs, g_lastGyroMicros);
+    sample.hasQuaternion =
+        kBnoEnabled && g_haveQuaternion && SignalFresh(nowUs, g_lastQuatMicros) &&
+        math_utils::ValidateQuaternionArray(g_lastQuat);
+    sample.accelMicros = sample.hasAccel ? g_lastAccelMicros : 0;
+    sample.gyroMicros = sample.hasGyro ? g_lastGyroMicros : 0;
+    sample.quaternionMicros = sample.hasQuaternion ? g_lastQuatMicros : 0;
+    sample.sampleMicros =
+        std::max(sample.accelMicros, std::max(sample.gyroMicros, sample.quaternionMicros));
+    if (sample.hasAccel) {
+        for (int i = 0; i < 3; ++i) {
+            sample.accel[i] = g_lastAccel[i];
+        }
     }
-    for (int i = 0; i < 4; ++i) {
-        sample.quaternion[i] = g_lastQuat[i];
+    if (sample.hasGyro) {
+        for (int i = 0; i < 3; ++i) {
+            sample.gyro[i] = g_lastGyro[i];
+        }
+    }
+    if (sample.hasQuaternion) {
+        for (int i = 0; i < 4; ++i) {
+            sample.quaternion[i] = g_lastQuat[i];
+        }
     }
     return sample;
 }

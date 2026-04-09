@@ -238,6 +238,51 @@ inline bool PolarDecomposeRight(const float in[3][3], float rotation[3][3], floa
     return true;
 }
 
+inline void RotationMatrixToQuaternion(const float matrix[3][3], float quaternion[4]) {
+    const float trace = matrix[0][0] + matrix[1][1] + matrix[2][2];
+    if (trace > 0.0f) {
+        const float s = sqrtf(trace + 1.0f) * 2.0f;
+        quaternion[0] = 0.25f * s;
+        quaternion[1] = (matrix[2][1] - matrix[1][2]) / s;
+        quaternion[2] = (matrix[0][2] - matrix[2][0]) / s;
+        quaternion[3] = (matrix[1][0] - matrix[0][1]) / s;
+    } else if (matrix[0][0] > matrix[1][1] && matrix[0][0] > matrix[2][2]) {
+        const float s = sqrtf(1.0f + matrix[0][0] - matrix[1][1] - matrix[2][2]) * 2.0f;
+        quaternion[0] = (matrix[2][1] - matrix[1][2]) / s;
+        quaternion[1] = 0.25f * s;
+        quaternion[2] = (matrix[0][1] + matrix[1][0]) / s;
+        quaternion[3] = (matrix[0][2] + matrix[2][0]) / s;
+    } else if (matrix[1][1] > matrix[2][2]) {
+        const float s = sqrtf(1.0f + matrix[1][1] - matrix[0][0] - matrix[2][2]) * 2.0f;
+        quaternion[0] = (matrix[0][2] - matrix[2][0]) / s;
+        quaternion[1] = (matrix[0][1] + matrix[1][0]) / s;
+        quaternion[2] = 0.25f * s;
+        quaternion[3] = (matrix[1][2] + matrix[2][1]) / s;
+    } else {
+        const float s = sqrtf(1.0f + matrix[2][2] - matrix[0][0] - matrix[1][1]) * 2.0f;
+        quaternion[0] = (matrix[1][0] - matrix[0][1]) / s;
+        quaternion[1] = (matrix[0][2] + matrix[2][0]) / s;
+        quaternion[2] = (matrix[1][2] + matrix[2][1]) / s;
+        quaternion[3] = 0.25f * s;
+    }
+
+    const float norm = sqrtf(quaternion[0] * quaternion[0] + quaternion[1] * quaternion[1] +
+                             quaternion[2] * quaternion[2] + quaternion[3] * quaternion[3]);
+    if (norm <= 1.0e-9f) {
+        quaternion[0] = 1.0f;
+        quaternion[1] = 0.0f;
+        quaternion[2] = 0.0f;
+        quaternion[3] = 0.0f;
+        return;
+    }
+
+    const float invNorm = 1.0f / norm;
+    quaternion[0] *= invNorm;
+    quaternion[1] *= invNorm;
+    quaternion[2] *= invNorm;
+    quaternion[3] *= invNorm;
+}
+
 inline bool ComputeMagSoftIronFromSamples(const float (*samples)[3],
                                           uint16_t sampleCount,
                                           const float bias[3],

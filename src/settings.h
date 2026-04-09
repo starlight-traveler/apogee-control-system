@@ -126,7 +126,7 @@ constexpr float kEffortPenalty = 0.20f;
 // Extra cost multiplier when predicted apogee falls below target.
 constexpr float kUndershootPenalty = 2.0f;
 // During flap settling, inflate baro measurement sigma by this multiplier.
-constexpr float kBaroDeweightSigmaScale = 12.0f;
+constexpr float kBaroDeweightSigmaScale = 3.0f;
 // Keep baro in deweighted mode for at least this long after a flap transient.
 constexpr uint32_t kBaroDeweightDurationMs = 300;
 // Nominal/settling innovation gates for baro fusion.
@@ -138,6 +138,18 @@ constexpr float kCoastSoftDisableStartTimeToApogeeS = 2.5f;
 constexpr float kCoastHardDisableTimeToApogeeS = 1.0f;
 // Hard-disable when vertical speed gets this low in coast.
 constexpr float kCoastHardDisableVelocityMps = 25.0f;
+// Keep automatic flaps disabled briefly after burnout so the coast-state
+// estimate can settle before the first deployment decision.
+constexpr float kPostBurnoutHoldoffSeconds = 1.0f;
+// Require baro AGL and estimator altitude to agree this closely before the
+// first automatic flap motion is allowed.
+constexpr float kFirstFlapBaroStateAgreementMeters = 25.0f;
+// Disable automatic coast control if estimator altitude diverges too far from
+// baro AGL after the initial release gate.
+constexpr float kCoastBaroStateAgreementMeters = 50.0f;
+// Disable automatic coast control if the estimator reports implausible upward
+// acceleration after burnout.
+constexpr float kCoastMaxUpwardAccelerationMps2 = 20.0f;
 // Integration step cap for the actuation-side predictor (kept at flight default for accuracy).
 constexpr int kActuationPredictorMaxSteps = APOGEE_PREDICTOR_MAX_STEPS;
 }
@@ -526,7 +538,15 @@ constexpr float kAccelCorrectionMaxRateRadPerSec = 6.0f;
 constexpr float kMagCorrectionMaxRateRadPerSec = 2.5f;
 constexpr float kTotalCorrectionMaxRateRadPerSec = 7.0f;
 
-constexpr float kGyroOffset[3] = {91.85f, 178.88f, -210.18f};
+constexpr float kGyroOffset[3] = {69.15f, 174.46f, -145.84f};
+// Gyro scale/misalignment correction matrix in the rail-aligned sensor frame.
+// The current bench workflow fits bias and temperature drift; leave this as
+// identity until a rate-table style capture is available.
+constexpr float kGyroAinv[3][3] = {
+  {1.0f, 0.0f, 0.0f},
+  {0.0f, 1.0f, 0.0f},
+  {0.0f, 0.0f, 1.0f},
+};
 constexpr float kAccelBias[3] = {-121.00f, -104.50f, -142.00f};
 constexpr float kAccelAinv[3][3] = {
   {1.00626f, -0.00332f, 0.00705f},
@@ -541,11 +561,11 @@ constexpr float kMountRotation[3][3] = {
   {0.0f, 0.0f, 1.0f},
 };
 
-constexpr float kMagBias[3] = {-2277.00f, 4479.00f, -2310.00f};
+constexpr float kMagBias[3] = {-3751.00f, 5702.00f, -6056.00f};
 constexpr float kMagAinv[3][3] = {
-  {0.00036f, 0.00004f, -0.00000f},
-  {0.00004f, 0.00035f, -0.00002f},
-  {-0.00000f, -0.00002f, 0.00030f},
+  {0.00040f, 0.00018f, -0.00005f},
+  {0.00018f, 0.00031f, 0.00010f},
+  {-0.00005f, 0.00010f, 0.00027f},
 };
 }
 
@@ -624,15 +644,41 @@ constexpr float kGyroSaturationFraction = 0.97f;
 constexpr float kAccelCorrectionMaxRateRadPerSec = 6.0f;
 constexpr float kMagCorrectionMaxRateRadPerSec = 2.5f;
 constexpr float kTotalCorrectionMaxRateRadPerSec = 7.0f;
+
+// ICM-20948 advanced calibration
+// Commands:
+//   h  : help
+//   w  : recommended workflow
+//   s  : toggle live stream
+//   c  : print one current sample
+//   g  : start gyro bias capture (repeat at different temps for slope fit)
+//   x  : capture accel face +X up
+//   X  : capture accel face -X up
+//   y  : capture accel face +Y up
+//   Y  : capture accel face -Y up
+//   z  : capture accel face +Z up
+//   Z  : capture accel face -Z up
+//   m  : toggle magnetometer sweep capture
+//   p  : print recommended settings block
+//   d  : print detailed capture dump and quality report
+//   r  : reset all captured calibration data
+
 // Calibrated gyro zero-rate offsets.
-constexpr float kGyroOffset[3] = {74.3f, 153.8f, -5.5f};
+constexpr float kGyroOffset[3] = {-98.76f, 34.99f, 85.17f};
+// Gyro scale/misalignment correction matrix in the calibrated sensor frame.
+// Leave as identity until a controlled rate calibration is available.
+constexpr float kGyroAinv[3][3] = {
+    {1.0f, 0.0f, 0.0f},
+    {0.0f, 1.0f, 0.0f},
+    {0.0f, 0.0f, 1.0f},
+};
 // Calibrated accelerometer hard-iron offsets.
-constexpr float kAccelBias[3] = {79.60f, -18.56f, 383.31f};
+constexpr float kAccelBias[3] = {-118.00f, -498.50f, 454.00f};
 // Calibrated accelerometer soft-iron inverse matrix.
 constexpr float kAccelAinv[3][3] = {
-    {1.00847f, 0.00470f, -0.00428f},
-    {0.00470f, 1.00846f, -0.00328f},
-    {-0.00428f, -0.00328f, 0.99559f},
+  {1.00294f, 0.01977f, 0.01883f},
+  {0.01977f, 0.99843f, 0.04047f},
+  {0.01883f, 0.04047f, 0.99574f},
 };
 // Fixed rotation from calibrated sensor axes into the BNO-defined rocket body
 // frame. The ICM is physically mounted with Y inverted relative to the BNO:
@@ -644,18 +690,17 @@ constexpr float kMountRotation[3][3] = {
     {0.0f, 0.0f, 1.0f},
 };
 // Keep the ICM magnetometer in the same calibrated sensor frame as the
-// accel/gyro. Per the measured rail alignment, the ICM-to-BNO transform is the
-// same simple Y inversion for all three vectors; the mount rotation below
-// handles that body-frame alignment.
+// accel/gyro before applying the common mount rotation. The SparkFun reference
+// workflow and the latest cross-check capture both show that the AK09916 mag
+// needs Y and Z reflected to reconcile with the accel/gyro frame.
 constexpr uint8_t kMagAxisMap[3] = {0, 1, 2};
-constexpr int8_t kMagAxisSign[3] = {1, 1, 1};
+constexpr int8_t kMagAxisSign[3] = {1, -1, -1};
 // Calibrated magnetometer hard-iron offsets.
-constexpr float kMagBias[3] = {-156.70f, -52.79f, -141.07f};
-// Calibrated magnetometer soft-iron inverse matrix.
+constexpr float kMagBias[3] = {88.50f, -511.50f, 2301.50f};
 constexpr float kMagAinv[3][3] = {
-    {1.12823f, -0.01142f, 0.00980f},
-    {-0.01142f, 1.09539f, 0.00927f},
-    {0.00980f, 0.00927f, 1.10625f},
+  {0.00270f, -0.00002f, -0.00124f},
+  {-0.00002f, 0.00205f, 0.00013f},
+  {-0.00124f, 0.00013f, 0.00236f},
 };
 
 namespace crosscheck {
@@ -715,11 +760,17 @@ constexpr float kBnoCoastCorrectionBlendFactor = 0.66f;
 // to quickly correct gyro drift accumulated during burn phase.
 constexpr bool kEnableBurnoutCorrectionBurst = true;
 constexpr float kBurnoutCorrectionWindowSeconds = 1.5f;  // Duration of aggressive correction
-constexpr float kBurnoutCorrectionAccelTrust = 0.8f;     // High accel trust during window
-constexpr float kBurnoutCorrectionAccelGain = 25.0f;     // Aggressive correction gain
+constexpr float kBurnoutCorrectionAccelTrust = 0.45f;    // Moderate trust during window
+constexpr float kBurnoutCorrectionAccelGain = 12.0f;     // Moderate correction gain
 // After burnout window, maintain moderate accel trust during coast for ongoing correction.
-constexpr float kCoastAccelTrust = 0.25f;
-constexpr float kCoastAccelCorrectionGain = 6.0f;
+constexpr float kCoastAccelTrust = 0.12f;
+constexpr float kCoastAccelCorrectionGain = 3.5f;
+// In flight, suppress accel-based tilt correction quickly when the measured
+// magnitude departs from 1 g or angular rates remain elevated.
+constexpr float kFlightAccelDeviationFullTrustG = 0.03f;
+constexpr float kFlightAccelDeviationZeroTrustG = 0.12f;
+constexpr float kFlightAccelGyroFadeStartRadPerSec = 0.20f;
+constexpr float kFlightAccelGyroFadeEndRadPerSec = 1.50f;
 // Rail health thresholds derived from cross-check trust.
 constexpr float kHealthyRailTrust = 0.65f;
 constexpr float kDegradedRailTrust = 0.35f;

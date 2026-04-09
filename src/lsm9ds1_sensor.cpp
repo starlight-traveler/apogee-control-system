@@ -172,6 +172,14 @@ void ApplyMountRotation(float vector[3]) {
     vector[2] = rotated[2];
 }
 
+void ApplyGyroCalibration(float vector[3]) {
+    float corrected[3] = {0.0f, 0.0f, 0.0f};
+    Apply3x3(settings::sensors::lsm9ds1::kGyroAinv, vector, corrected);
+    vector[0] = corrected[0];
+    vector[1] = corrected[1];
+    vector[2] = corrected[2];
+}
+
 void ApplyAxisTransform(float vector[3]) {
     float remapped[3] = {0.0f, 0.0f, 0.0f};
     for (int i = 0; i < 3; ++i) {
@@ -410,6 +418,7 @@ float RescaleCalibrationCounts(float calibrationCounts, float activeLsbPerUnit, 
 /// During coast, implements burnout correction burst to quickly correct gyro drift.
 float ComputeAccelTrust(float accelMagnitudeG, float gyroNorm) {
     float phaseTrust = 0.0f;
+    float flightSuppression = 1.0f;
     switch (g_flightStatus) {
         case FlightStatus::Ground:
             phaseTrust = 1.0f;
@@ -433,6 +442,13 @@ float ComputeAccelTrust(float accelMagnitudeG, float gyroNorm) {
             }
             // After burnout window, maintain moderate trust for ongoing correction
             phaseTrust = settings::ahrs::kCoastAccelTrust;
+            flightSuppression =
+                DescendingTrust(fabsf(accelMagnitudeG - 1.0f),
+                                settings::ahrs::kFlightAccelDeviationFullTrustG,
+                                settings::ahrs::kFlightAccelDeviationZeroTrustG) *
+                DescendingTrust(gyroNorm,
+                                settings::ahrs::kFlightAccelGyroFadeStartRadPerSec,
+                                settings::ahrs::kFlightAccelGyroFadeEndRadPerSec);
             break;
     }
     const float magnitudeTrust = WindowTrust(accelMagnitudeG,
@@ -441,7 +457,7 @@ float ComputeAccelTrust(float accelMagnitudeG, float gyroNorm) {
     const float rateTrust = DescendingTrust(gyroNorm,
                                             settings::sensors::lsm9ds1::kAccelCorrectionGyroFadeStartRadPerSec,
                                             settings::sensors::lsm9ds1::kAccelCorrectionGyroFadeEndRadPerSec);
-    return phaseTrust * magnitudeTrust * rateTrust;
+    return phaseTrust * magnitudeTrust * rateTrust * flightSuppression;
 }
 
 float MagTrustPhaseScale() {
@@ -1004,6 +1020,7 @@ bool Lsm9ds1SensorAcquire(SensorData &out) {
         gyroRaw[2] * g_activeGyroRadPerSecPerLsb -
             settings::sensors::lsm9ds1::kGyroTempBiasSlopeRadPerSecPerC[2] * temperatureDeltaC,
     };
+    ApplyGyroCalibration(gyroRadPerSec);
     ApplyMountRotation(gyroRadPerSec);
 
     float accelRaw[3] = {
