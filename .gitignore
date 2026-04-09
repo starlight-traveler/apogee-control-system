@@ -99,6 +99,7 @@ standalone-c/shortened.csv
 tools/SENS073.BIN
 tools/file.csv
 standalone-c/fullscale_2.csv
+*.csv
 
 # Standalone analysis artifacts (large/generated)
 standalone-c/output*
