@@ -204,6 +204,146 @@ Those simplifications are intentional. The objective is not to produce the most
 elegant academic estimator on paper; it is to produce a flight controller that
 can survive real sensor behavior and still generate defensible apogee decisions.
 
+## Mathematical Notes
+
+These notes are not a full derivation of the firmware. They are the shortest
+set of equations that make the estimator and predictor easier to read.
+
+### 1. Vertical state model
+
+The onboard filter is fundamentally a vertical kinematics estimator with IMU
+acceleration as input and barometric altitude as the main measurement:
+
+$$
+\mathbf{x}_k =
+\begin{bmatrix}
+z_k \\
+v_{z,k}
+\end{bmatrix}
+$$
+
+$$
+\mathbf{x}_{k+1} =
+\begin{bmatrix}
+1 & \Delta t \\
+0 & 1
+\end{bmatrix}
+\mathbf{x}_k
++
+\begin{bmatrix}
+\tfrac{1}{2}\Delta t^2 \\
+\Delta t
+\end{bmatrix}
+a_{z,k}
++
+\mathbf{w}_k
+$$
+
+$$
+y_k =
+\begin{bmatrix}
+1 & 0
+\end{bmatrix}
+\mathbf{x}_k + v_k
+$$
+
+That is the core reason the vertical channel is the most important observable
+state in this repository.
+
+### 2. Body-frame to inertial acceleration
+
+The flight computer does not integrate the raw accelerometer directly. It first
+rotates body-frame acceleration into the simplified inertial frame using zenith:
+
+$$
+\mathbf{a}_I = R_y\left(\theta_z - \frac{\pi}{2}\right)\mathbf{a}_B - \mathbf{g}
+$$
+
+with
+
+$$
+\mathbf{g} =
+\begin{bmatrix}
+0 \\
+0 \\
+g
+\end{bmatrix}
+$$
+
+This is why attitude quality matters even when the predictor is mostly vertical.
+
+### 3. Dynamic pressure and drag
+
+The apogee predictor is built around standard aerodynamic scaling:
+
+$$
+q = \frac{1}{2}\rho V^2
+$$
+
+$$
+D = q C_D A
+$$
+
+$$
+a_D = \frac{D}{m}
+$$
+
+The embedded code does not assume drag is perfectly known. Instead it adapts an
+effective drag scale in coast using the measured acceleration residual.
+
+### 4. Mach number and atmospheric dependence
+
+When Mach-dependent drag adaptation is enabled, the predictor needs both total
+speed and local speed of sound:
+
+$$
+M = \frac{V}{a}
+$$
+
+$$
+a = \sqrt{\gamma R T}
+$$
+
+This connects the atmosphere model directly to aerodynamic prediction instead of
+treating density alone as sufficient.
+
+### 5. Quaternion kinematics
+
+The attitude side of the system is easiest to read if you keep the quaternion
+propagation equation in mind:
+
+$$
+\dot{\mathbf{q}} = \frac{1}{2}\,\Omega(\boldsymbol{\omega})\,\mathbf{q}
+$$
+
+In practice, the firmware uses gyro propagation together with fast-rail
+correction and rail-health checks instead of a full navigation-grade inertial
+solution.
+
+### 6. Barometric altitude
+
+Pressure altitude enters the estimator through the standard atmosphere relation:
+
+$$
+h \approx 44330 \left(1 - \left(\frac{p}{p_0}\right)^{0.1903}\right)
+$$
+
+That is what turns the pressure sensor into the primary bounded vertical
+measurement.
+
+### 7. Rail agreement as an angle between gravity vectors
+
+A useful way to think about rail consistency is not by raw Euler angles, but by
+the angle between unit gravity vectors:
+
+$$
+\Delta \theta = \cos^{-1}\left(\hat{\mathbf{g}}_1 \cdot \hat{\mathbf{g}}_2\right)
+$$
+
+That one equation explains much of the health logic in the multi-IMU pipeline:
+if two rails disagree on the direction of gravity, they disagree on the only
+attitude quantity the apogee predictor really needs.
+
 ## A Useful Way To Read This Repository
 
 If you are approaching this as a controls or rocketry project, read it in this
