@@ -52,7 +52,7 @@ with drag scaling adapted in coast using the residual between measured and
 predicted acceleration:
 
 $$
-\lambda_{k+1} = \operatorname{clip}\left(\lambda_k + \alpha \frac{a_{meas} - a_{pred}}{a_{drag,pred}}\right)
+\lambda_{k+1} = \mathrm{clip}\left(\lambda_k + \alpha \frac{a_{meas} - a_{pred}}{a_{drag,pred}}\right)
 $$
 
 The implementation is intentionally pragmatic rather than fully general:
@@ -220,6 +220,50 @@ order:
    to see what evidence is preserved after the flight.
 5. [`tools/replay/`](/Users/ryanpaillet/Documents/rocketry/acs/apogee-control-system-teensy/tools/replay)
    to understand how the flight is reconstructed offline.
+
+## Recommended Reading
+
+If you want the mathematics behind the repository, these are the most useful
+places to start. They map reasonably well onto the code, even when the embedded
+implementation is intentionally simplified.
+
+### Model rocket aerodynamics and stability
+
+- [James S. Barrowman, *The Practical Calculation of the Aerodynamic Characteristics of Slender Finned Vehicles*](https://ntrs.nasa.gov/archive/nasa/casi.ntrs.nasa.gov/20010047838.pdf)
+  The classic starting point for center of pressure, normal force derivatives,
+  fin-body stability, and why slender-rocket assumptions work as well as they
+  do for much of amateur and high-power rocketry.
+- [Sampo Niskanen, *OpenRocket Technical Documentation*](https://openrocket.info/documentation.html)
+  Probably the best single rocketry-specific reference for practical simulation
+  assumptions, drag estimation, stability margins, and flight phases in a model
+  rocket context.
+
+### State estimation, Kalman filtering, and inertial sensing
+
+- [Brown and Hwang, *Introduction to Random Signals and Applied Kalman Filtering*](https://www.mathworks.com/academia/books/introduction-to-random-signals-and-applied-kalman-filtering-with-matlab-exercises-brown.html)
+  A good bridge between textbook Kalman filtering and the kind of estimator
+  compromises embedded systems actually make.
+- [Titterton and Weston, *Strapdown Inertial Navigation Technology*](https://shop.theiet.org/strapdn-inertial-navig-t-2ed)
+  The right reference if you want to think more rigorously about gyro
+  integration, accelerometer interpretation, error growth, and what IMUs can
+  and cannot tell you in free flight.
+- [Sebastian Madgwick, *An efficient orientation filter for inertial and inertial/magnetic sensor arrays*](https://x-io.co.uk/downloads/madgwick_internal_report.pdf)
+  Useful for quaternion kinematics, low-cost IMU fusion, and the practical side
+  of attitude estimation when computational budget matters.
+
+### Flight dynamics, atmosphere, and predictor assumptions
+
+- [Robert F. Stengel, *Flight Dynamics*](https://collaborate.princeton.edu/en/publications/flight-dynamics/)
+  A strong reference for turning body motion, forces, and attitude into a
+  coherent systems view rather than a pile of disconnected formulas.
+- [*U.S. Standard Atmosphere, 1976*](https://ntrs.nasa.gov/archive/nasa/casi.ntrs.nasa.gov/19770009539.pdf)
+  The baseline atmosphere model behind density, pressure, and temperature
+  relationships used in many simulation and predictor pipelines.
+
+These references are not meant to imply that the firmware is a direct textbook
+implementation. The code is much more pragmatic than that. But if you want to
+understand why the estimator, zenith handling, and apogee predictor are
+structured the way they are, these are the right places to build intuition.
 
 ## Bottom Line
 
