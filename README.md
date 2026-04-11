@@ -52,12 +52,7 @@ with drag scaling adapted in coast using the residual between measured and
 predicted acceleration:
 
 $$
-\lambda_{k+1}
-=
-\mathrm{clip}
-\left(
-\lambda_k + \alpha \frac{a_{meas} - a_{pred}}{a_{drag,pred}}
-\right)
+\lambda_{k+1} = \operatorname{clip}\left(\lambda_k + \alpha \frac{a_{meas} - a_{pred}}{a_{drag,pred}}\right)
 $$
 
 The implementation is intentionally pragmatic rather than fully general:
