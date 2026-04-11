@@ -55,6 +55,9 @@ struct SensorData {
     float predictorSeedClampedAngularRateRadPerSec = 0.0f;
     float predictorSeedConfidenceFlags = 0.0f;
     uint8_t mainQuaternionSource = static_cast<uint8_t>(MainQuaternionSource::None);
+    bool icmSampleFresh = false;
+    bool lsmSampleFresh = false;
+    bool baroSampleFresh = false;
     bool hasBnoQuaternion = false;
     bool hasQuaternion = false;
     bool hasIcmQuaternion = false;

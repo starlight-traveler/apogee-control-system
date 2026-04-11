@@ -159,9 +159,13 @@ float MagGaussPerLsbForRange(uint8_t rangeGauss) {
 }
 
 void Apply3x3(const float matrix[3][3], const float in[3], float out[3]) {
-    out[0] = matrix[0][0] * in[0] + matrix[0][1] * in[1] + matrix[0][2] * in[2];
-    out[1] = matrix[1][0] * in[0] + matrix[1][1] * in[1] + matrix[1][2] * in[2];
-    out[2] = matrix[2][0] * in[0] + matrix[2][1] * in[1] + matrix[2][2] * in[2];
+    const float x = in[0];
+    const float y = in[1];
+    const float z = in[2];
+
+    out[0] = matrix[0][0] * x + matrix[0][1] * y + matrix[0][2] * z;
+    out[1] = matrix[1][0] * x + matrix[1][1] * y + matrix[1][2] * z;
+    out[2] = matrix[2][0] * x + matrix[2][1] * y + matrix[2][2] * z;
 }
 
 void ApplyMountRotation(float vector[3]) {
@@ -628,6 +632,10 @@ void LearnGyroBias(const float gyroRadPerSec[3], float accelTrust, float gyroNor
     }
 }
 
+float Dot3(const float a[3], const float b[3]) {
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+}
+
 void AdaptiveQuaternionUpdate(const float accelNorm[3],
                               float accelTrust,
                               const float gyroRadPerSec[3],
@@ -638,44 +646,71 @@ void AdaptiveQuaternionUpdate(const float accelNorm[3],
         return;
     }
 
-    const float q1 = g_q[0];
-    const float q2 = g_q[1];
-    const float q3 = g_q[2];
-    const float q4 = g_q[3];
+    const float q1 = g_q[0];  // w
+    const float q2 = g_q[1];  // x
+    const float q3 = g_q[2];  // y
+    const float q4 = g_q[3];  // z
 
-    const float ux = 2.0f * (q2 * q4 - q1 * q3);
-    const float uy = 2.0f * (q1 * q2 + q3 * q4);
-    const float uz = q1 * q1 - q2 * q2 - q3 * q3 + q4 * q4;
+    // Rotation matrix columns = Earth basis vectors expressed in body frame.
+    float northBody[3] = {
+        q1 * q1 + q2 * q2 - q3 * q3 - q4 * q4,
+        2.0f * (q2 * q3 + q1 * q4),
+        2.0f * (q2 * q4 - q1 * q3),
+    };
 
-    float hx = accelNorm[1] * magNorm[2] - accelNorm[2] * magNorm[1];
-    float hy = accelNorm[2] * magNorm[0] - accelNorm[0] * magNorm[2];
-    float hz = accelNorm[0] * magNorm[1] - accelNorm[1] * magNorm[0];
-    if (!Normalize3(hx, hy, hz)) {
-        magTrust = 0.0f;
-        hx = hy = hz = 0.0f;
-    }
+    float upBody[3] = {
+        2.0f * (q2 * q4 + q1 * q3),
+        2.0f * (q3 * q4 - q1 * q2),
+        q1 * q1 - q2 * q2 - q3 * q3 + q4 * q4,
+    };
 
-    const float wx = 2.0f * (q2 * q3 + q1 * q4);
-    const float wy = q1 * q1 - q2 * q2 + q3 * q3 - q4 * q4;
-    const float wz = 2.0f * (q3 * q4 - q1 * q2);
-
+    // Tilt correction: predicted up x measured up.
     float accelError[3] = {
-        accelNorm[1] * uz - accelNorm[2] * uy,
-        accelNorm[2] * ux - accelNorm[0] * uz,
-        accelNorm[0] * uy - accelNorm[1] * ux,
+        upBody[1] * accelNorm[2] - upBody[2] * accelNorm[1],
+        upBody[2] * accelNorm[0] - upBody[0] * accelNorm[2],
+        upBody[0] * accelNorm[1] - upBody[1] * accelNorm[0],
     };
-    float magError[3] = {
-        hy * wz - hz * wy,
-        hz * wx - hx * wz,
-        hx * wy - hy * wx,
-    };
+
+    // Yaw-only mag correction so mag cannot tilt pitch/roll.
+    float magError[3] = {0.0f, 0.0f, 0.0f};
+    if (magTrust > 0.0f) {
+        const float magUpDot = Dot3(magNorm, upBody);
+        float magHoriz[3] = {
+            magNorm[0] - magUpDot * upBody[0],
+            magNorm[1] - magUpDot * upBody[1],
+            magNorm[2] - magUpDot * upBody[2],
+        };
+
+        const float northUpDot = Dot3(northBody, upBody);
+        float northHoriz[3] = {
+            northBody[0] - northUpDot * upBody[0],
+            northBody[1] - northUpDot * upBody[1],
+            northBody[2] - northUpDot * upBody[2],
+        };
+
+        if (Normalize3(magHoriz[0], magHoriz[1], magHoriz[2]) &&
+            Normalize3(northHoriz[0], northHoriz[1], northHoriz[2])) {
+            const float yawError =
+                upBody[0] * (northHoriz[1] * magHoriz[2] - northHoriz[2] * magHoriz[1]) +
+                upBody[1] * (northHoriz[2] * magHoriz[0] - northHoriz[0] * magHoriz[2]) +
+                upBody[2] * (northHoriz[0] * magHoriz[1] - northHoriz[1] * magHoriz[0]);
+
+            magError[0] = upBody[0] * yawError;
+            magError[1] = upBody[1] * yawError;
+            magError[2] = upBody[2] * yawError;
+        } else {
+            magTrust = 0.0f;
+        }
+    }
 
     const float accelGain = accelTrust * AccelCorrectionGain();
     const float magGain = magTrust * MagCorrectionGain();
+
     for (int i = 0; i < 3; ++i) {
         accelError[i] *= accelGain;
         magError[i] *= magGain;
     }
+
     LimitVector(accelError, settings::sensors::lsm9ds1::kAccelCorrectionMaxRateRadPerSec);
     LimitVector(magError, settings::sensors::lsm9ds1::kMagCorrectionMaxRateRadPerSec);
 
@@ -700,15 +735,24 @@ void AdaptiveQuaternionUpdate(const float accelNorm[3],
     g_q[2] += (qa * gy - qb * gz + qd * gx);
     g_q[3] += (qa * gz + qb * gy - qc * gx);
 
-    const float invNorm = 1.0f / sqrtf(g_q[0] * g_q[0] + g_q[1] * g_q[1] + g_q[2] * g_q[2] + g_q[3] * g_q[3]);
+    const float norm = sqrtf(g_q[0] * g_q[0] + g_q[1] * g_q[1] +
+                             g_q[2] * g_q[2] + g_q[3] * g_q[3]);
+    if (norm <= 1.0e-9f) {
+        g_hasQuaternionContinuityReference = false;
+        return;
+    }
+
+    const float invNorm = 1.0f / norm;
     g_q[0] *= invNorm;
     g_q[1] *= invNorm;
     g_q[2] *= invNorm;
     g_q[3] *= invNorm;
+
     if (!math_utils::ValidateQuaternionArray(g_q)) {
         g_hasQuaternionContinuityReference = false;
         return;
     }
+
     ApplyQuaternionContinuity();
 }
 

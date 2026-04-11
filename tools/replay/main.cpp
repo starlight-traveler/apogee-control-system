@@ -31,6 +31,7 @@ enum class SampleValueId;
 
 constexpr float kAltimeterMinFeet = 0.0f;
 constexpr float kAltimeterMaxFeet = 6000.0f;
+constexpr float kDegreesToRadians = 0.01745329251994329577f;
 
 enum class FieldId {
     Timestamp,
@@ -162,6 +163,10 @@ struct ReplaySeedIndices {
     std::array<std::optional<std::size_t>, 3> inertialAcceleration{};
     std::optional<std::size_t> zenith;
     std::optional<std::size_t> apogeeEstimate;
+    bool positionZIsFeet = false;
+    bool velocityZIsFeetPerSecond = false;
+    bool zenithIsDegrees = false;
+    bool apogeeEstimateIsFeet = false;
 
     bool HasAnySeedColumns() const {
         return stateTime.has_value() || position[2].has_value() || velocity[2].has_value() ||
@@ -757,13 +762,21 @@ ReplaySeedIndices BuildReplaySeedIndices(const std::vector<std::string> &headers
     ReplaySeedIndices indices;
     indices.hasFilteredState = FindHeaderIndexSingle(headers, "has_filtered_state");
     indices.flightStatus = FindHeaderIndexSingle(headers, "flight_status");
-    indices.stateTime = FindHeaderIndexSingle(headers, "state_time");
+    indices.stateTime = FindHeaderIndex(headers, {"state_time", "sensor_timestamp"});
     indices.position[0] = FindHeaderIndexSingle(headers, "state_position_x");
     indices.position[1] = FindHeaderIndexSingle(headers, "state_position_y");
     indices.position[2] = FindHeaderIndexSingle(headers, "state_position_z");
+    if (!indices.position[2].has_value()) {
+        indices.position[2] = FindHeaderIndexSingle(headers, "state_altitude_agl_feet");
+        indices.positionZIsFeet = indices.position[2].has_value();
+    }
     indices.velocity[0] = FindHeaderIndexSingle(headers, "state_velocity_x");
     indices.velocity[1] = FindHeaderIndexSingle(headers, "state_velocity_y");
     indices.velocity[2] = FindHeaderIndexSingle(headers, "state_velocity_z");
+    if (!indices.velocity[2].has_value()) {
+        indices.velocity[2] = FindHeaderIndexSingle(headers, "state_vertical_velocity_fps");
+        indices.velocityZIsFeetPerSecond = indices.velocity[2].has_value();
+    }
     indices.acceleration[0] = FindHeaderIndexSingle(headers, "state_acceleration_x");
     indices.acceleration[1] = FindHeaderIndexSingle(headers, "state_acceleration_y");
     indices.acceleration[2] = FindHeaderIndexSingle(headers, "state_acceleration_z");
@@ -771,7 +784,15 @@ ReplaySeedIndices BuildReplaySeedIndices(const std::vector<std::string> &headers
     indices.inertialAcceleration[1] = FindHeaderIndexSingle(headers, "state_inertial_acceleration_y");
     indices.inertialAcceleration[2] = FindHeaderIndexSingle(headers, "state_inertial_acceleration_z");
     indices.zenith = FindHeaderIndexSingle(headers, "state_zenith");
+    if (!indices.zenith.has_value()) {
+        indices.zenith = FindHeaderIndexSingle(headers, "state_zenith_deg");
+        indices.zenithIsDegrees = indices.zenith.has_value();
+    }
     indices.apogeeEstimate = FindHeaderIndexSingle(headers, "state_apogee_estimate");
+    if (!indices.apogeeEstimate.has_value()) {
+        indices.apogeeEstimate = FindHeaderIndexSingle(headers, "state_apogee_estimate_feet");
+        indices.apogeeEstimateIsFeet = indices.apogeeEstimate.has_value();
+    }
     return indices;
 }
 
@@ -925,16 +946,24 @@ bool TryPopulateSeededState(const std::vector<std::string> &row,
 
     state = FilteredState{};
     state.time = *stateTime;
-    state.position[2] = *posZ;
-    state.velocity[2] = *velZ;
-    state.zenith = *zenith;
-    state.apogeeEstimate = apogeeEstimate.value_or(*posZ);
+    state.position[2] = indices.positionZIsFeet ? (*posZ * constants::kFeetToMeters) : *posZ;
+    state.velocity[2] = indices.velocityZIsFeetPerSecond ? (*velZ * constants::kFeetToMeters) : *velZ;
+    state.zenith = indices.zenithIsDegrees ? (*zenith * kDegreesToRadians) : *zenith;
+    state.apogeeEstimate = apogeeEstimate.has_value()
+                               ? (indices.apogeeEstimateIsFeet
+                                      ? (*apogeeEstimate * constants::kFeetToMeters)
+                                      : *apogeeEstimate)
+                               : state.position[2];
     for (int i = 0; i < 3; ++i) {
         if (const auto value = ExtractFloat(row, indices.position[i]); value.has_value()) {
-            state.position[i] = *value;
+            state.position[i] = (i == 2 && indices.positionZIsFeet)
+                                    ? (*value * constants::kFeetToMeters)
+                                    : *value;
         }
         if (const auto value = ExtractFloat(row, indices.velocity[i]); value.has_value()) {
-            state.velocity[i] = *value;
+            state.velocity[i] = (i == 2 && indices.velocityZIsFeetPerSecond)
+                                    ? (*value * constants::kFeetToMeters)
+                                    : *value;
         }
         if (const auto value = ExtractFloat(row, indices.acceleration[i]); value.has_value()) {
             state.acceleration[i] = *value;

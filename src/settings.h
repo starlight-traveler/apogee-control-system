@@ -318,7 +318,7 @@ enum class Transport : uint8_t { I2c = 0, Spi = 1 };
 // Master enable for the entire BNO sensor tree.
 constexpr bool kEnabled = true;
 // Select the active BNO-family device used by the firmware.
-constexpr Model kModel = Model::Bno085;
+constexpr Model kModel = Model::Bno055;
 // Select the transport used by the active BNO-family device.
 constexpr Transport kTransport = Transport::I2c;
 }
@@ -332,6 +332,38 @@ constexpr int8_t kResetPin = -1;
 constexpr uint32_t kSampleIntervalUs = 10000;
 // If no complete sample arrives for this long, force a full reinit.
 constexpr uint32_t kDataTimeoutUs = 250000;
+}
+
+namespace wt901 {
+// Enable the WT901 comparison rail on Serial5.
+constexpr bool kEnabled = true;
+// Teensy HardwareSerial instance index: 1 -> Serial1, 2 -> Serial2, etc.
+constexpr uint8_t kSerialPortIndex = 5;
+// Optional explicit RX/TX remap pins for Teensy serial ports. Leave -1 to use
+// the port defaults for Serial5.
+constexpr int8_t kRxPin = -1;
+constexpr int8_t kTxPin = -1;
+// Preferred startup baud. The driver will fall back to an autoscan if this
+// baud does not respond.
+constexpr uint32_t kBaudRate = 230400;
+// Poll cadence used to request an accel/gyro/mag/angle register block without
+// changing the sensor's persistent streaming configuration.
+constexpr uint32_t kPollIntervalUs = 20000;
+// Consider cached WT901 data stale after this long without a fresh response.
+constexpr uint32_t kSampleMaxAgeUs = 200000;
+// The comparison sketch assumes the WT901 is configured for 16g accel output.
+constexpr float kAccelRangeG = 16.0f;
+// The comparison sketch configures the WT901 for 2000 dps gyro output.
+constexpr float kGyroRangeDps = 2000.0f;
+// Placeholder sensor-to-body mapping for the WT901 implementation:
+// body +X = sensor +Z
+// body +Y = sensor -X
+// body +Z = sensor +Y
+constexpr float kMountRotation[3][3] = {
+    {0.0f, 0.0f, 1.0f},
+    {-1.0f, 0.0f, 0.0f},
+    {0.0f, 1.0f, 0.0f},
+};
 }
 
 namespace bno085 {
@@ -470,8 +502,10 @@ constexpr uint8_t kAccelGyroChipSelectPin = 15;
 constexpr uint8_t kMagChipSelectPin = 14;
 // Route the LSM9DS1 accel/gyro data-ready output (INT1) to this pin.
 // Set to -1 to disable interrupt-driven acquisition and fall back to polling.
-constexpr int8_t kInterruptPin = -1;
-constexpr uint32_t kSampleIntervalUs = 5000;
+// The current driver only consumes INT1; INT2 and INT_M are not wired into the
+// hot path yet.
+constexpr int8_t kInterruptPin = 40;
+constexpr uint32_t kSampleIntervalUs = 2000;
 constexpr uint8_t kCalibrationAccelRangeG = 2;
 constexpr uint16_t kCalibrationGyroRangeDps = 245;
 constexpr uint8_t kCalibrationMagRangeGauss = 4;
@@ -500,11 +534,10 @@ constexpr uint8_t kFifoMaxBurstSamplesPerAcquire = 4;
 // Optional library-side hard-iron offset load for sanity checks.
 // Keep false for the normal path; the firmware calibration model remains primary.
 constexpr bool kUseLibraryMagOffsets = false;
-// BNO-defined body basis. The LSM is physically mounted backwards relative
-// to the BNO:
-// - From BNO's POV: LSM +Y points up (same as BNO), LSM +X points left (opposite)
-// - This requires a 180° rotation around the Y-axis applied via kMountRotation
-// The axis map/sign stays identity; the mount rotation handles frame alignment.
+// Sensor-to-body mapping:
+// body +X = sensor +Z
+// body +Y = sensor -Y
+// body +Z = sensor +X
 constexpr uint8_t kAxisMap[3] = {0, 1, 2};
 constexpr int8_t kAxisSign[3] = {1, 1, 1};
 constexpr float kMagDeclinationDeg = -14.84f;
@@ -553,12 +586,14 @@ constexpr float kAccelAinv[3][3] = {
   {-0.00332f, 1.00802f, -0.02086f},
   {0.00705f, -0.02086f, 1.00402f},
 };
-// LSM is mounted backwards relative to BNO: X points left instead of right.
-// Transform: BNO_X = -LSM_X, BNO_Y = LSM_Y, BNO_Z = LSM_Z
+// Sensor-to-body mapping:
+// body +X = sensor +Z
+// body +Y = sensor -Y
+// body +Z = sensor +X
 constexpr float kMountRotation[3][3] = {
-  {-1.0f, 0.0f, 0.0f},
-  {0.0f, 1.0f, 0.0f},
   {0.0f, 0.0f, 1.0f},
+  {0.0f, -1.0f, 0.0f},
+  {1.0f, 0.0f, 0.0f},
 };
 
 constexpr float kMagBias[3] = {-3751.00f, 5702.00f, -6056.00f};
@@ -574,9 +609,9 @@ namespace icm20948 {
 constexpr uint8_t kChipSelectPin = 25;
 // Route the ICM-20948 INT pin here for raw-data-ready interrupt driven reads.
 // Set to -1 to leave the driver in polling mode.
-constexpr int8_t kInterruptPin = -1;
+constexpr int8_t kInterruptPin = 24;
 // Fresh-sample pacing used by the firmware's ICM acquisition path.
-constexpr uint32_t kSampleIntervalUs = 5000;
+constexpr uint32_t kSampleIntervalUs = 2000;
 // Stored calibration constants were fit at the library default ranges below.
 // If you update these references, the hard-coded bias terms must match.
 constexpr uint8_t kCalibrationAccelRangeG = 2;
@@ -596,6 +631,14 @@ constexpr uint8_t kGyroSampleRateDivider = 4;
 constexpr bool kEnableDlpFilter = true;
 constexpr uint8_t kAccelDlpFilterSetting = 2;
 constexpr uint8_t kGyroDlpFilterSetting = 2;
+// Optional DMP quaternion path. When enabled, the ICM driver will prefer the
+// chip's DMP quaternion output over the custom flight-phase observer.
+constexpr bool kUseDmpQuaternion = true;
+// Quat6 is a 6-axis game rotation vector (gyro + accel). Quat9 also brings in
+// the magnetometer, which is not currently trusted as much for zenith.
+constexpr bool kUseDmpQuat9 = false;
+// DMP ODR interval register value. Zero requests the fastest available rate.
+constexpr uint16_t kDmpQuatOdrInterval = 0;
 // Local magnetic declination used for compass yaw correction.
 constexpr float kMagDeclinationDeg = -14.84f;
 // Hold the last trusted pad attitude for a short bounded window after burn
@@ -680,14 +723,14 @@ constexpr float kAccelAinv[3][3] = {
   {0.01977f, 0.99843f, 0.04047f},
   {0.01883f, 0.04047f, 0.99574f},
 };
-// Fixed rotation from calibrated sensor axes into the BNO-defined rocket body
-// frame. The ICM is physically mounted with Y inverted relative to the BNO:
-// - From BNO's POV: ICM +Y points down, ICM +X points right (same as BNO)
-// Transform: BNO_X = ICM_X, BNO_Y = -ICM_Y, BNO_Z = ICM_Z
+// Fixed rotation from calibrated sensor axes into the rocket body frame:
+// body +X = sensor +Z
+// body +Y = sensor -Y
+// body +Z = sensor -X
 constexpr float kMountRotation[3][3] = {
-    {1.0f, 0.0f, 0.0f},
-    {0.0f, -1.0f, 0.0f},
     {0.0f, 0.0f, 1.0f},
+    {0.0f, -1.0f, 0.0f},
+    {-1.0f, 0.0f, 0.0f},
 };
 // Keep the ICM magnetometer in the same calibrated sensor frame as the
 // accel/gyro before applying the common mount rotation. The SparkFun reference

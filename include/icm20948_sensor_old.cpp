@@ -20,9 +20,6 @@ constexpr float kGToMps2 = 9.80665f;
 constexpr float kPi = 3.14159265358979323846f;
 constexpr float kRadToDeg = 57.295779513082320876f;
 constexpr uint8_t kQuaternionInvalidDropThreshold = 2;
-constexpr uint8_t kDmpFastSampleRateDivider = 4;  // 225 Hz fast-DMP mode from SparkFun Example10.
-constexpr float kDmpQuaternionScale = 1073741824.0f;  // 2^30
-constexpr uint8_t kDmpMaxDrainFrames = 8;
 
 ICM_20948_SPI g_icm;
 volatile bool g_dataReadyInterrupt = false;
@@ -76,7 +73,6 @@ bool g_lastAcquireFresh = false;
 bool g_lastAcquireUsedCache = false;
 bool g_lastAcquireUsedInterrupt = false;
 bool g_interruptConfigured = false;
-bool g_dmpQuaternionActive = false;
 float g_crossCheckTrust = 1.0f;
 
 // Outlier detection state
@@ -100,45 +96,6 @@ void DataReadyISR() {
 
 bool Normalize3(float &x, float &y, float &z);
 void Cross3(float ax, float ay, float az, float bx, float by, float bz, float out[3]);
-bool QuaternionFromEarthBasisInBody(const float northBody[3],
-                                    const float eastBody[3],
-                                    const float upBody[3],
-                                    float quaternion[4]);
-
-void ApplyMountRotation(const float in[3], float out[3]) {
-    for (int row = 0; row < 3; ++row) {
-        out[row] = settings::sensors::icm20948::kMountRotation[row][0] * in[0] +
-                   settings::sensors::icm20948::kMountRotation[row][1] * in[1] +
-                   settings::sensors::icm20948::kMountRotation[row][2] * in[2];
-    }
-}
-
-bool QuaternionFromUpVector(const float upIn[3], float quaternion[4]) {
-    float upBody[3] = {upIn[0], upIn[1], upIn[2]};
-    if (!Normalize3(upBody[0], upBody[1], upBody[2])) {
-        return false;
-    }
-
-    float northSeed[3] = {1.0f, 0.0f, 0.0f};
-    if (fabsf(upBody[0]) > 0.9f) {
-        northSeed[0] = 0.0f;
-        northSeed[1] = 1.0f;
-    }
-
-    float eastBody[3] = {0.0f, 0.0f, 0.0f};
-    Cross3(upBody[0], upBody[1], upBody[2], northSeed[0], northSeed[1], northSeed[2], eastBody);
-    if (!Normalize3(eastBody[0], eastBody[1], eastBody[2])) {
-        return false;
-    }
-
-    float northBody[3] = {0.0f, 0.0f, 0.0f};
-    Cross3(eastBody[0], eastBody[1], eastBody[2], upBody[0], upBody[1], upBody[2], northBody);
-    if (!Normalize3(northBody[0], northBody[1], northBody[2])) {
-        return false;
-    }
-
-    return QuaternionFromEarthBasisInBody(northBody, eastBody, upBody, quaternion);
-}
 
 /// Clamps a scalar into [-1, 1] before inverse-trig use.
 inline float ClampUnit(float value) {
@@ -295,79 +252,6 @@ ICM_20948_GYRO_CONFIG_1_FS_SEL_e GyroFullScaleEnum(uint16_t rangeDps) {
             return dps250;
     }
 }
-
-#if defined(ICM_20948_USE_DMP)
-uint8_t DmpGyroLevel(uint16_t rangeDps) {
-    switch (rangeDps) {
-        case 250:
-            return 0;
-        case 500:
-            return 1;
-        case 1000:
-            return 2;
-        case 2000:
-            return 3;
-        default:
-            return 3;
-    }
-}
-
-// SparkFun documents the 4g pair only: ACC_SCALE=0x04000000 and
-// ACC_SCALE2=0x00040000. The DMP keeps 1g at 2^25 internally, so when FSR
-// increases ACC_SCALE must grow proportionally while ACC_SCALE2 shrinks by the
-// same factor to keep exported raw units matched to the configured range.
-uint32_t DmpAccelScaleValue(uint8_t rangeG) {
-    switch (rangeG) {
-        case 2:
-            return 0x02000000u;
-        case 4:
-            return 0x04000000u;
-        case 8:
-            return 0x08000000u;
-        case 16:
-            return 0x10000000u;
-        default:
-            return 0x04000000u;
-    }
-}
-
-uint32_t DmpAccelScale2Value(uint8_t rangeG) {
-    switch (rangeG) {
-        case 2:
-            return 0x00080000u;
-        case 4:
-            return 0x00040000u;
-        case 8:
-            return 0x00020000u;
-        case 16:
-            return 0x00010000u;
-        default:
-            return 0x00040000u;
-    }
-}
-
-uint32_t DmpGyroFullScaleValue(uint16_t rangeDps) {
-    switch (rangeDps) {
-        case 250:
-            return 0x02000000u;
-        case 500:
-            return 0x04000000u;
-        case 1000:
-            return 0x08000000u;
-        case 2000:
-            return 0x10000000u;
-        default:
-            return 0x10000000u;
-    }
-}
-
-void EncodeBigEndianU32(uint32_t value, unsigned char bytes[4]) {
-    bytes[0] = static_cast<unsigned char>((value >> 24) & 0xffu);
-    bytes[1] = static_cast<unsigned char>((value >> 16) & 0xffu);
-    bytes[2] = static_cast<unsigned char>((value >> 8) & 0xffu);
-    bytes[3] = static_cast<unsigned char>(value & 0xffu);
-}
-#endif
 
 /// Returns the raw-count equivalent of a calibration term at the active range.
 float RescaleCalibrationCounts(float calibrationCounts, float activeLsbPerUnit, float calibrationLsbPerUnit) {
@@ -1246,81 +1130,6 @@ void QuaternionToYprDeg(float &yawDeg, float &pitchDeg, float &rollDeg) {
     rollDeg = roll;
 }
 
-bool ExtractDmpQuaternion(const icm_20948_DMP_data_t &data, float quaternion[4]) {
-    float q1 = 0.0f;
-    float q2 = 0.0f;
-    float q3 = 0.0f;
-    bool hasQuaternion = false;
-
-    if (settings::sensors::icm20948::kUseDmpQuat9 && (data.header & DMP_header_bitmap_Quat9) > 0) {
-        q1 = static_cast<float>(data.Quat9.Data.Q1) / kDmpQuaternionScale;
-        q2 = static_cast<float>(data.Quat9.Data.Q2) / kDmpQuaternionScale;
-        q3 = static_cast<float>(data.Quat9.Data.Q3) / kDmpQuaternionScale;
-        hasQuaternion = true;
-    } else if ((data.header & DMP_header_bitmap_Quat6) > 0) {
-        q1 = static_cast<float>(data.Quat6.Data.Q1) / kDmpQuaternionScale;
-        q2 = static_cast<float>(data.Quat6.Data.Q2) / kDmpQuaternionScale;
-        q3 = static_cast<float>(data.Quat6.Data.Q3) / kDmpQuaternionScale;
-        hasQuaternion = true;
-    } else if ((data.header & DMP_header_bitmap_Quat9) > 0) {
-        q1 = static_cast<float>(data.Quat9.Data.Q1) / kDmpQuaternionScale;
-        q2 = static_cast<float>(data.Quat9.Data.Q2) / kDmpQuaternionScale;
-        q3 = static_cast<float>(data.Quat9.Data.Q3) / kDmpQuaternionScale;
-        hasQuaternion = true;
-    }
-
-    if (!hasQuaternion) {
-        return false;
-    }
-
-    const float q0Squared = 1.0f - (q1 * q1 + q2 * q2 + q3 * q3);
-    if (q0Squared < -1.0e-3f) {
-        return false;
-    }
-    const float q0 = sqrtf(q0Squared > 0.0f ? q0Squared : 0.0f);
-    const math_utils::Quaternion sensorQuat =
-        math_utils::Normalize(math_utils::MakeQuaternion(q0, q1, q2, q3));
-
-    float upSensor[3] = {
-        2.0f * (sensorQuat.x * sensorQuat.z + sensorQuat.w * sensorQuat.y),
-        2.0f * (sensorQuat.y * sensorQuat.z - sensorQuat.w * sensorQuat.x),
-        1.0f - 2.0f * (sensorQuat.x * sensorQuat.x + sensorQuat.y * sensorQuat.y),
-    };
-    float upBody[3] = {0.0f, 0.0f, 0.0f};
-    ApplyMountRotation(upSensor, upBody);
-    if (!Normalize3(upBody[0], upBody[1], upBody[2])) {
-        return false;
-    }
-
-    return QuaternionFromUpVector(upBody, quaternion);
-}
-
-bool TryReadDmpQuaternion(float quaternion[4]) {
-    if (!g_dmpQuaternionActive) {
-        return false;
-    }
-
-    bool foundQuaternion = false;
-    for (uint8_t frame = 0; frame < kDmpMaxDrainFrames; ++frame) {
-        icm_20948_DMP_data_t data = {};
-        g_icm.readDMPdataFromFIFO(&data);
-        const ICM_20948_Status_e status = g_icm.status;
-        if (status == ICM_20948_Stat_FIFONoDataAvail || status == ICM_20948_Stat_NoData) {
-            break;
-        }
-        if (status != ICM_20948_Stat_Ok && status != ICM_20948_Stat_FIFOMoreDataAvail) {
-            return false;
-        }
-        if (ExtractDmpQuaternion(data, quaternion)) {
-            foundQuaternion = true;
-        }
-        if (status != ICM_20948_Stat_FIFOMoreDataAvail) {
-            break;
-        }
-    }
-    return foundQuaternion;
-}
-
 /// Publishes the last valid ICM sample so the estimator can hold state between
 /// hardware updates instead of seeing a missing IMU sample.
 bool PopulateFromCache(SensorData &out, uint32_t nowUs) {
@@ -1424,39 +1233,6 @@ bool ConfigureSampleRate() {
     return true;
 }
 
-bool ConfigureDmpQuaternion() {
-    g_dmpQuaternionActive = false;
-    if (!settings::sensors::icm20948::kUseDmpQuaternion) {
-        return true;
-    }
-
-    bool success = true;
-    success &= (g_icm.initializeDMP() == ICM_20948_Stat_Ok);
-    if (settings::sensors::icm20948::kUseDmpQuat9) {
-        success &= (g_icm.enableDMPSensor(INV_ICM20948_SENSOR_ORIENTATION) == ICM_20948_Stat_Ok);
-        success &= (g_icm.setDMPODRrate(DMP_ODR_Reg_Quat9, settings::sensors::icm20948::kDmpQuatOdrInterval) ==
-                    ICM_20948_Stat_Ok);
-    } else {
-        success &= (g_icm.enableDMPSensor(INV_ICM20948_SENSOR_GAME_ROTATION_VECTOR) == ICM_20948_Stat_Ok);
-        success &= (g_icm.setDMPODRrate(DMP_ODR_Reg_Quat6, settings::sensors::icm20948::kDmpQuatOdrInterval) ==
-                    ICM_20948_Stat_Ok);
-    }
-    success &= (g_icm.enableFIFO() == ICM_20948_Stat_Ok);
-    success &= (g_icm.enableDMP() == ICM_20948_Stat_Ok);
-    success &= (g_icm.resetDMP() == ICM_20948_Stat_Ok);
-    success &= (g_icm.resetFIFO() == ICM_20948_Stat_Ok);
-
-    if (!success) {
-        LOG_PRINTLN("ICM-20948: DMP quaternion setup failed; falling back to software fusion");
-        return false;
-    }
-
-    LOG_PRINTLN(settings::sensors::icm20948::kUseDmpQuat9 ? "ICM-20948: using DMP Quat9"
-                                                          : "ICM-20948: using DMP Quat6");
-    g_dmpQuaternionActive = true;
-    return true;
-}
-
 bool ConfigureInterrupt() {
     if (kInterruptPin < 0) {
         return true;
@@ -1484,16 +1260,9 @@ bool ConfigureInterrupt() {
         LOG_PRINTLN("ICM-20948: clearInterrupts failed");
         return false;
     }
-    if (g_dmpQuaternionActive) {
-        if (g_icm.intEnableDMP(true) != ICM_20948_Stat_Ok) {
-            LOG_PRINTLN("ICM-20948: intEnableDMP failed");
-            return false;
-        }
-    } else {
-        if (g_icm.intEnableRawDataReady(true) != ICM_20948_Stat_Ok) {
-            LOG_PRINTLN("ICM-20948: intEnableRawDataReady failed");
-            return false;
-        }
+    if (g_icm.intEnableRawDataReady(true) != ICM_20948_Stat_Ok) {
+        LOG_PRINTLN("ICM-20948: intEnableRawDataReady failed");
+        return false;
     }
 
     attachInterrupt(digitalPinToInterrupt(kInterruptPin), DataReadyISR, FALLING);
@@ -1502,275 +1271,6 @@ bool ConfigureInterrupt() {
 }
 
 }  // namespace
-
-#if defined(ICM_20948_USE_DMP)
-ICM_20948_Status_e ICM_20948::initializeDMP(void) {
-    if (_device._dmp_firmware_available != true) {
-        debugPrint(F("ICM_20948::startupDMP: DMP is not available. Please check that you have uncommented line 29 (#define ICM_20948_USE_DMP) in ICM_20948_C.h..."));
-        return ICM_20948_Stat_DMPNotSupported;
-    }
-
-    const uint8_t accelRangeG = settings::sensors::icm20948::kAccelRangeG;
-    const uint16_t gyroRangeDps = settings::sensors::icm20948::kGyroRangeDps;
-    const ICM_20948_ACCEL_CONFIG_FS_SEL_e accelFullScale = AccelFullScaleEnum(accelRangeG);
-    const ICM_20948_GYRO_CONFIG_1_FS_SEL_e gyroFullScale = GyroFullScaleEnum(gyroRangeDps);
-    const uint8_t gyroLevel = DmpGyroLevel(gyroRangeDps);
-
-    ICM_20948_Status_e result = ICM_20948_Stat_Ok;
-    ICM_20948_Status_e worstResult = ICM_20948_Stat_Ok;
-
-    result = i2cControllerConfigurePeripheral(0, MAG_AK09916_I2C_ADDR, AK09916_REG_RSV2, 10, true, true, false, true,
-                                              true);
-    if (result > worstResult) {
-        worstResult = result;
-    }
-    result = i2cControllerConfigurePeripheral(1, MAG_AK09916_I2C_ADDR, AK09916_REG_CNTL2, 1, false, true, false, false,
-                                              false, AK09916_mode_single);
-    if (result > worstResult) {
-        worstResult = result;
-    }
-
-    result = setBank(3);
-    if (result > worstResult) {
-        worstResult = result;
-    }
-    uint8_t mstODRconfig = 0x04;
-    result = write(AGB3_REG_I2C_MST_ODR_CONFIG, &mstODRconfig, 1);
-    if (result > worstResult) {
-        worstResult = result;
-    }
-
-    result = setClockSource(ICM_20948_Clock_Auto);
-    if (result > worstResult) {
-        worstResult = result;
-    }
-
-    result = setBank(0);
-    if (result > worstResult) {
-        worstResult = result;
-    }
-    uint8_t pwrMgmt2 = 0x40;
-    result = write(AGB0_REG_PWR_MGMT_2, &pwrMgmt2, 1);
-    if (result > worstResult) {
-        worstResult = result;
-    }
-
-    result = setSampleMode(ICM_20948_Internal_Mst, ICM_20948_Sample_Mode_Cycled);
-    if (result > worstResult) {
-        worstResult = result;
-    }
-    result = enableFIFO(false);
-    if (result > worstResult) {
-        worstResult = result;
-    }
-    result = enableDMP(false);
-    if (result > worstResult) {
-        worstResult = result;
-    }
-
-    ICM_20948_fss_t fullScaleSettings = {};
-    fullScaleSettings.a = accelFullScale;
-    fullScaleSettings.g = gyroFullScale;
-    result = setFullScale((ICM_20948_Internal_Acc | ICM_20948_Internal_Gyr), fullScaleSettings);
-    if (result > worstResult) {
-        worstResult = result;
-    }
-    result = enableDLPF(ICM_20948_Internal_Gyr, true);
-    if (result > worstResult) {
-        worstResult = result;
-    }
-
-    result = setBank(0);
-    if (result > worstResult) {
-        worstResult = result;
-    }
-    uint8_t zero = 0;
-    result = write(AGB0_REG_FIFO_EN_1, &zero, 1);
-    if (result > worstResult) {
-        worstResult = result;
-    }
-    result = write(AGB0_REG_FIFO_EN_2, &zero, 1);
-    if (result > worstResult) {
-        worstResult = result;
-    }
-    result = intEnableRawDataReady(false);
-    if (result > worstResult) {
-        worstResult = result;
-    }
-    result = resetFIFO();
-    if (result > worstResult) {
-        worstResult = result;
-    }
-
-    ICM_20948_smplrt_t sampleRate = {};
-    sampleRate.g = kDmpFastSampleRateDivider;
-    sampleRate.a = kDmpFastSampleRateDivider;
-    result = setSampleRate((ICM_20948_Internal_Acc | ICM_20948_Internal_Gyr), sampleRate);
-    if (result > worstResult) {
-        worstResult = result;
-    }
-
-    result = setDMPstartAddress();
-    if (result > worstResult) {
-        worstResult = result;
-    }
-    result = loadDMPFirmware();
-    if (result > worstResult) {
-        worstResult = result;
-    }
-    result = setDMPstartAddress();
-    if (result > worstResult) {
-        worstResult = result;
-    }
-
-    result = setBank(0);
-    if (result > worstResult) {
-        worstResult = result;
-    }
-    uint8_t fix = 0x48;
-    result = write(AGB0_REG_HW_FIX_DISABLE, &fix, 1);
-    if (result > worstResult) {
-        worstResult = result;
-    }
-    uint8_t fifoPrio = 0xE4;
-    result = write(AGB0_REG_SINGLE_FIFO_PRIORITY_SEL, &fifoPrio, 1);
-    if (result > worstResult) {
-        worstResult = result;
-    }
-
-    unsigned char accScale[4];
-    EncodeBigEndianU32(DmpAccelScaleValue(accelRangeG), accScale);
-    result = writeDMPmems(ACC_SCALE, 4, &accScale[0]);
-    if (result > worstResult) {
-        worstResult = result;
-    }
-    unsigned char accScale2[4];
-    EncodeBigEndianU32(DmpAccelScale2Value(accelRangeG), accScale2);
-    result = writeDMPmems(ACC_SCALE2, 4, &accScale2[0]);
-    if (result > worstResult) {
-        worstResult = result;
-    }
-
-    const unsigned char mountMultiplierZero[4] = {0x00, 0x00, 0x00, 0x00};
-    const unsigned char mountMultiplierPlus[4] = {0x09, 0x99, 0x99, 0x99};
-    const unsigned char mountMultiplierMinus[4] = {0xF6, 0x66, 0x66, 0x67};
-    result = writeDMPmems(CPASS_MTX_00, 4, &mountMultiplierPlus[0]);
-    if (result > worstResult) {
-        worstResult = result;
-    }
-    result = writeDMPmems(CPASS_MTX_01, 4, &mountMultiplierZero[0]);
-    if (result > worstResult) {
-        worstResult = result;
-    }
-    result = writeDMPmems(CPASS_MTX_02, 4, &mountMultiplierZero[0]);
-    if (result > worstResult) {
-        worstResult = result;
-    }
-    result = writeDMPmems(CPASS_MTX_10, 4, &mountMultiplierZero[0]);
-    if (result > worstResult) {
-        worstResult = result;
-    }
-    result = writeDMPmems(CPASS_MTX_11, 4, &mountMultiplierMinus[0]);
-    if (result > worstResult) {
-        worstResult = result;
-    }
-    result = writeDMPmems(CPASS_MTX_12, 4, &mountMultiplierZero[0]);
-    if (result > worstResult) {
-        worstResult = result;
-    }
-    result = writeDMPmems(CPASS_MTX_20, 4, &mountMultiplierZero[0]);
-    if (result > worstResult) {
-        worstResult = result;
-    }
-    result = writeDMPmems(CPASS_MTX_21, 4, &mountMultiplierZero[0]);
-    if (result > worstResult) {
-        worstResult = result;
-    }
-    result = writeDMPmems(CPASS_MTX_22, 4, &mountMultiplierMinus[0]);
-    if (result > worstResult) {
-        worstResult = result;
-    }
-
-    const unsigned char b2sMountMultiplierZero[4] = {0x00, 0x00, 0x00, 0x00};
-    const unsigned char b2sMountMultiplierPlus[4] = {0x40, 0x00, 0x00, 0x00};
-    result = writeDMPmems(B2S_MTX_00, 4, &b2sMountMultiplierPlus[0]);
-    if (result > worstResult) {
-        worstResult = result;
-    }
-    result = writeDMPmems(B2S_MTX_01, 4, &b2sMountMultiplierZero[0]);
-    if (result > worstResult) {
-        worstResult = result;
-    }
-    result = writeDMPmems(B2S_MTX_02, 4, &b2sMountMultiplierZero[0]);
-    if (result > worstResult) {
-        worstResult = result;
-    }
-    result = writeDMPmems(B2S_MTX_10, 4, &b2sMountMultiplierZero[0]);
-    if (result > worstResult) {
-        worstResult = result;
-    }
-    result = writeDMPmems(B2S_MTX_11, 4, &b2sMountMultiplierPlus[0]);
-    if (result > worstResult) {
-        worstResult = result;
-    }
-    result = writeDMPmems(B2S_MTX_12, 4, &b2sMountMultiplierZero[0]);
-    if (result > worstResult) {
-        worstResult = result;
-    }
-    result = writeDMPmems(B2S_MTX_20, 4, &b2sMountMultiplierZero[0]);
-    if (result > worstResult) {
-        worstResult = result;
-    }
-    result = writeDMPmems(B2S_MTX_21, 4, &b2sMountMultiplierZero[0]);
-    if (result > worstResult) {
-        worstResult = result;
-    }
-    result = writeDMPmems(B2S_MTX_22, 4, &b2sMountMultiplierPlus[0]);
-    if (result > worstResult) {
-        worstResult = result;
-    }
-
-    result = setGyroSF(kDmpFastSampleRateDivider, gyroLevel);
-    if (result > worstResult) {
-        worstResult = result;
-    }
-    unsigned char gyroFullScaleValue[4];
-    EncodeBigEndianU32(DmpGyroFullScaleValue(gyroRangeDps), gyroFullScaleValue);
-    result = writeDMPmems(GYRO_FULLSCALE, 4, &gyroFullScaleValue[0]);
-    if (result > worstResult) {
-        worstResult = result;
-    }
-
-    const unsigned char accelOnlyGain[4] = {0x00, 0xE8, 0xBA, 0x2E};
-    result = writeDMPmems(ACCEL_ONLY_GAIN, 4, &accelOnlyGain[0]);
-    if (result > worstResult) {
-        worstResult = result;
-    }
-    const unsigned char accelAlphaVar[4] = {0x3D, 0x27, 0xD2, 0x7D};
-    result = writeDMPmems(ACCEL_ALPHA_VAR, 4, &accelAlphaVar[0]);
-    if (result > worstResult) {
-        worstResult = result;
-    }
-    const unsigned char accelAVar[4] = {0x02, 0xD8, 0x2D, 0x83};
-    result = writeDMPmems(ACCEL_A_VAR, 4, &accelAVar[0]);
-    if (result > worstResult) {
-        worstResult = result;
-    }
-
-    const unsigned char accelCalRate[2] = {0x00, 0x00};
-    result = writeDMPmems(ACCEL_CAL_RATE, 2, &accelCalRate[0]);
-    if (result > worstResult) {
-        worstResult = result;
-    }
-    const unsigned char compassRate[2] = {0x00, 0x45};
-    result = writeDMPmems(CPASS_TIME_BUFFER, 2, &compassRate[0]);
-    if (result > worstResult) {
-        worstResult = result;
-    }
-
-    return worstResult;
-}
-#endif
 
 /// Initializes the ICM-20948 over SPI.
 bool Icm20948SensorBegin() {
@@ -1781,7 +1281,6 @@ bool Icm20948SensorBegin() {
 
     g_dataReadyInterrupt = false;
     g_interruptConfigured = false;
-    g_dmpQuaternionActive = false;
     SPI1.begin();
     g_icm.begin(kChipSelectPin, SPI1);
     if (g_icm.status != ICM_20948_Stat_Ok) {
@@ -1799,9 +1298,6 @@ bool Icm20948SensorBegin() {
     }
     if (!ConfigureSampleRate()) {
         return false;
-    }
-    if (!ConfigureDmpQuaternion()) {
-        g_dmpQuaternionActive = false;
     }
     if (!ConfigureInterrupt()) {
         LOG_PRINTLN("ICM-20948: interrupt setup failed; continuing in polling mode");
@@ -1949,11 +1445,7 @@ bool Icm20948SensorAcquire(SensorData &out) {
     g_lastAcquireUsedInterrupt = false;
 
     const uint32_t nowUs = micros();
-    if (!g_dmpQuaternionActive) {
-        UpdateRailConstraintState(nowUs);
-    } else {
-        g_railConstraintActive = false;
-    }
+    UpdateRailConstraintState(nowUs);
     if (g_lastSampleUs != 0 && (nowUs - g_lastSampleUs) < kSampleIntervalUs) {
         return PopulateFromCache(out, nowUs);
     }
@@ -1966,35 +1458,24 @@ bool Icm20948SensorAcquire(SensorData &out) {
     }
     interrupts();
 
-    float dmpQuaternion[4] = {1.0f, 0.0f, 0.0f, 0.0f};
-    if (g_dmpQuaternionActive) {
-        if (!TryReadDmpQuaternion(dmpQuaternion)) {
-            return PopulateFromCache(out, nowUs);
+    bool shouldRead = false;
+    if (g_interruptConfigured) {
+        shouldRead = interruptTriggered;
+        if (!shouldRead && g_icm.dataReady()) {
+            shouldRead = true;
         }
-        g_lastSampleUs = nowUs;
-        g_icm.getAGMT();
-        g_lastAcquireFresh = true;
-        g_lastAcquireUsedInterrupt = interruptTriggered;
     } else {
-        bool shouldRead = false;
-        if (g_interruptConfigured) {
-            shouldRead = interruptTriggered;
-            if (!shouldRead && g_icm.dataReady()) {
-                shouldRead = true;
-            }
-        } else {
-            shouldRead = g_icm.dataReady();
-        }
-
-        if (!shouldRead) {
-            return PopulateFromCache(out, nowUs);
-        }
-
-        g_lastSampleUs = nowUs;
-        g_icm.getAGMT();
-        g_lastAcquireFresh = true;
-        g_lastAcquireUsedInterrupt = interruptTriggered;
+        shouldRead = g_icm.dataReady();
     }
+
+    if (!shouldRead) {
+        return PopulateFromCache(out, nowUs);
+    }
+
+    g_lastSampleUs = nowUs;
+    g_icm.getAGMT();
+    g_lastAcquireFresh = true;
+    g_lastAcquireUsedInterrupt = interruptTriggered;
 
     if (out.timestamp == 0.0f) {
         out.timestamp = static_cast<float>(nowUs) * 1.0e-6f;
@@ -2099,30 +1580,20 @@ bool Icm20948SensorAcquire(SensorData &out) {
     const float startupMagTrust = localMagTrust * effectiveGyroSaturationTrust * gyroOutlierTrust;
     const float accelTrust = startupAccelTrust * g_crossCheckTrust;
     const float magTrust = startupMagTrust * g_crossCheckTrust;
-    if (g_dmpQuaternionActive) {
-        for (int i = 0; i < 4; ++i) {
-            g_q[i] = dmpQuaternion[i];
-        }
-        g_groundAlignmentReady = true;
-        g_lastBootstrapYprValid = false;
-        g_invalidQuaternionStreak = 0;
-        ApplyQuaternionContinuity();
-    } else {
-        UpdateBootstrapYprDiagnostics(accelCalNorm, magCalNorm);
-        UpdateMagMagnitudeReference(magMagnitude, startupMagTrust);
-        UpdateGroundAlignment(accelCalNorm, startupAccelTrust, magCalNorm, startupMagTrust, gyroNorm);
+    UpdateBootstrapYprDiagnostics(accelCalNorm, magCalNorm);
+    UpdateMagMagnitudeReference(magMagnitude, startupMagTrust);
+    UpdateGroundAlignment(accelCalNorm, startupAccelTrust, magCalNorm, startupMagTrust, gyroNorm);
 
-        if (g_groundAlignmentReady && !gyroSaturated) {
-            // Re-enable pad-time magnetic correction now that the direct body-frame
-            // mag diagnostics show the ICM field vector points in the same general
-            // direction as the trusted LSM rail.
-            const float correctionMagTrust = startupMagTrust;
-            AdaptiveQuaternionUpdate(accelCalNorm, startupAccelTrust, gyroCal, magCalNorm, correctionMagTrust, dt);
-            UpdateEarthMagReference(magCalNorm, startupAccelTrust, correctionMagTrust);
-            CaptureRailReferenceQuaternion(startupAccelTrust, correctionMagTrust);
-        }
-        LearnGyroBias(gyroCal, startupAccelTrust, gyroNorm, dt);
+    if (g_groundAlignmentReady && !gyroSaturated) {
+        // Re-enable pad-time magnetic correction now that the direct body-frame
+        // mag diagnostics show the ICM field vector points in the same general
+        // direction as the trusted LSM rail.
+        const float correctionMagTrust = startupMagTrust;
+        AdaptiveQuaternionUpdate(accelCalNorm, startupAccelTrust, gyroCal, magCalNorm, correctionMagTrust, dt);
+        UpdateEarthMagReference(magCalNorm, startupAccelTrust, correctionMagTrust);
+        CaptureRailReferenceQuaternion(startupAccelTrust, correctionMagTrust);
     }
+    LearnGyroBias(gyroCal, startupAccelTrust, gyroNorm, dt);
     const bool quaternionValidNow = math_utils::ValidateQuaternionArray(g_q);
     if (quaternionValidNow) {
         g_invalidQuaternionStreak = 0;

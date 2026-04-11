@@ -26,21 +26,64 @@ struct LogRecordHeader {
 
 /// Telemetry payload written for each main-loop sample.
 ///
-/// `SensorData` and `FilteredState` sizes are part of the on-disk schema and
-/// must stay aligned with the decoder descriptor table.
+/// This compact payload keeps only the flight-critical rails, barometer,
+/// main quaternion selection, flap state, and predictor outputs needed for
+/// replay and post-flight diagnosis.
+struct LoggedTelemetrySample {
+    float timestamp = 0.0f;
+    float altitudeFeet = 0.0f;
+    float accelIcm[3] = {0.0f, 0.0f, 0.0f};
+    float gyroIcm[3] = {0.0f, 0.0f, 0.0f};
+    float quaternionMain[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+    float quaternionIcm[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+    float accelLsm[3] = {0.0f, 0.0f, 0.0f};
+    float gyroLsm[3] = {0.0f, 0.0f, 0.0f};
+    float quaternionLsm[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+    float flapCommandDeg = 0.0f;
+    float flapEffectiveDeg = 0.0f;
+    float altitudeAglFeet = 0.0f;
+    float verticalVelocityFps = 0.0f;
+    float zenithDeg = 0.0f;
+    float apogeeEstimateFeet = 0.0f;
+    float accelBno[3] = {0.0f, 0.0f, 0.0f};
+    float gyroBno[3] = {0.0f, 0.0f, 0.0f};
+    float quaternionBno[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+    float bnoYprDeg[3] = {0.0f, 0.0f, 0.0f};
+    float accelWt901[3] = {0.0f, 0.0f, 0.0f};
+    float wt901YprDeg[3] = {0.0f, 0.0f, 0.0f};
+    float gyroWt901[3] = {0.0f, 0.0f, 0.0f};
+    float quaternionWt901[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+    uint8_t mainQuaternionSource = 0;
+    uint8_t hasQuaternion = 0;
+    uint8_t hasIcmQuaternion = 0;
+    uint8_t hasLsmQuaternion = 0;
+    uint8_t icmAccelSaturated = 0;
+    uint8_t icmGyroSaturated = 0;
+    uint8_t actuationIsSettling = 0;
+    uint8_t hasBnoQuaternion = 0;
+    uint8_t hasBnoYpr = 0;
+    uint8_t hasWt901Accel = 0;
+    uint8_t hasWt901Ypr = 0;
+    uint8_t hasWt901Gyro = 0;
+    uint8_t hasWt901Quaternion = 0;
+    uint8_t reserved[3] = {0u, 0u, 0u};
+};
+
+/// Telemetry payload written for each main-loop sample.
 struct TelemetryLogRecord {
     LogRecordHeader header;
-    SensorData sensor;
-    FilteredState state;
+    LoggedTelemetrySample sample;
 };
 
 /// Event payload written for sparse flight events.
 struct EventLogRecord {
     LogRecordHeader header;
     float timestamp = 0.0f;
-    float altitudeMeters = 0.0f;
-    float verticalVelocity = 0.0f;
-    float apogeeEstimate = 0.0f;
+    float altitudeAglFeet = 0.0f;
+    float verticalVelocityFps = 0.0f;
+    float apogeeEstimateFeet = 0.0f;
+    float flapCommandDeg = 0.0f;
+    float flapEffectiveDeg = 0.0f;
 };
 
 /// File preamble written once at the top of every binary log.
@@ -73,14 +116,18 @@ bool DataLoggerBegin();
 /// Appends one telemetry record to the RAM buffer.
 void DataLoggerLogTelemetry(const SensorData &sensor,
                             FlightStatus status,
-                            const FilteredState *state);
+                            const FilteredState *state,
+                            float flapCommandDeg,
+                            float flapEffectiveDeg);
 /// Appends a high-priority event record and requests an earlier sync.
 void DataLoggerLogEvent(FlightEventType type,
                         FlightStatus status,
                         float timestamp,
-                        float altitudeMeters,
-                        float verticalVelocity,
-                        float apogeeEstimate);
+                        float altitudeAglFeet,
+                        float verticalVelocityFps,
+                        float apogeeEstimateFeet,
+                        float flapCommandDeg,
+                        float flapEffectiveDeg);
 /// Flushes and syncs the current log file immediately.
 void DataLoggerForceSync();
 /// Services buffered writes and deferred syncs from the main loop.

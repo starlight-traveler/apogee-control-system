@@ -281,14 +281,10 @@ void PublishCachedState(SensorData &out, uint32_t nowUs) {
     const bool gyroFresh = g_haveGyro && SignalFresh(nowUs, g_lastGyroMicros);
     const bool quaternionValid =
         g_haveQuaternion && SignalFresh(nowUs, g_lastQuatMicros) && math_utils::ValidateQuaternionArray(g_lastQuat);
-    out.timestamp = static_cast<float>(nowUs) * 1.0e-6f;
     if (accelFresh) {
         out.accelBNO[0] = g_lastAccel[0];
         out.accelBNO[1] = g_lastAccel[1];
         out.accelBNO[2] = g_lastAccel[2];
-        out.accelICM[0] = g_lastAccel[0];
-        out.accelICM[1] = g_lastAccel[1];
-        out.accelICM[2] = g_lastAccel[2];
     } else {
         out.accelBNO[0] = 0.0f;
         out.accelBNO[1] = 0.0f;
@@ -298,9 +294,6 @@ void PublishCachedState(SensorData &out, uint32_t nowUs) {
         out.gyroBNO[0] = g_lastGyro[0];
         out.gyroBNO[1] = g_lastGyro[1];
         out.gyroBNO[2] = g_lastGyro[2];
-        out.gyro[0] = g_lastGyro[0];
-        out.gyro[1] = g_lastGyro[1];
-        out.gyro[2] = g_lastGyro[2];
     } else {
         out.gyroBNO[0] = 0.0f;
         out.gyroBNO[1] = 0.0f;
@@ -311,12 +304,7 @@ void PublishCachedState(SensorData &out, uint32_t nowUs) {
         out.quaternionBNO[1] = g_lastQuat[1];
         out.quaternionBNO[2] = g_lastQuat[2];
         out.quaternionBNO[3] = g_lastQuat[3];
-        out.quaternion[0] = g_lastQuat[0];
-        out.quaternion[1] = g_lastQuat[1];
-        out.quaternion[2] = g_lastQuat[2];
-        out.quaternion[3] = g_lastQuat[3];
         out.hasBnoQuaternion = true;
-        out.hasQuaternion = true;
     } else {
         out.quaternionBNO[0] = 1.0f;
         out.quaternionBNO[1] = 0.0f;

@@ -7,7 +7,7 @@
 #include <string.h>
 #include <SPI.h>
 
-#include "bno085_sensor.h"
+#include "bno_sensor.h"
 #include "bmp585_sensor.h"
 #include "cfd_table.h"
 #include "constants.h"
@@ -25,6 +25,7 @@
 #include "settings.h"
 #include "status_leds.h"
 #include "synced_flap_actuation.h"
+#include "wt901_sensor.h"
 
 namespace {
 
@@ -46,12 +47,21 @@ constexpr float kBarometerAgreementThresholdFeet = settings::sensors::ms5611::kA
 constexpr bool kBnoEnabled = settings::sensors::bno::kEnabled;
 constexpr bool kLsmEnabled = settings::sensors::lsm9ds1::kEnabled;
 constexpr bool kPulseEnabled = settings::sensors::ellipse20::kEnabled;
-constexpr int8_t kBnoResetPin = settings::sensors::bno085::kResetPin;
-constexpr uint32_t kBnoResetPulseDelayMs = settings::sensors::bno085::kResetPulseDelayMs;
-constexpr uint32_t kBnoPostResetBootDelayMs = settings::sensors::bno085::kPostResetBootDelayMs;
+constexpr bool kWt901Enabled = settings::sensors::wt901::kEnabled;
+constexpr int8_t kBnoResetPin = settings::sensors::bno::kModel == settings::sensors::bno::Model::Bno085
+                                    ? settings::sensors::bno085::kResetPin
+                                    : settings::sensors::bno055::kResetPin;
+constexpr uint32_t kBnoResetPulseDelayMs = settings::sensors::bno::kModel == settings::sensors::bno::Model::Bno085
+                                               ? settings::sensors::bno085::kResetPulseDelayMs
+                                               : 0;
+constexpr uint32_t kBnoPostResetBootDelayMs = settings::sensors::bno::kModel == settings::sensors::bno::Model::Bno085
+                                                  ? settings::sensors::bno085::kPostResetBootDelayMs
+                                                  : 0;
 constexpr uint8_t kBmpChipSelectPin = 35;
 constexpr uint8_t kMs5611ChipSelectPin = settings::sensors::ms5611::kChipSelectPin;
-constexpr uint8_t kBnoChipSelectPin = settings::sensors::bno085::kChipSelectPin;
+constexpr int kBnoChipSelectPin = settings::sensors::bno::kModel == settings::sensors::bno::Model::Bno085
+                                      ? settings::sensors::bno085::kChipSelectPin
+                                      : -1;
 constexpr uint8_t kIcmChipSelectPin = settings::sensors::icm20948::kChipSelectPin;
 constexpr uint8_t kLsmAccelGyroChipSelectPin = settings::sensors::lsm9ds1::kAccelGyroChipSelectPin;
 constexpr uint8_t kLsmMagChipSelectPin = settings::sensors::lsm9ds1::kMagChipSelectPin;
@@ -80,7 +90,6 @@ constexpr uint32_t kCrossCheckBnoSampleMaxAgeUs = settings::sensors::icm20948::c
 constexpr uint32_t kCrossCheckBnoPairMaxSkewUs = settings::sensors::icm20948::crosscheck::kBnoPairMaxSkewUs;
 constexpr float kHealthyRailTrust = settings::ahrs::kHealthyRailTrust;
 constexpr float kDegradedRailTrust = settings::ahrs::kDegradedRailTrust;
-constexpr float kBnoReferenceCorrectionBlendFactor = settings::ahrs::kBnoReferenceCorrectionBlendFactor;
 
 enum class SensorRailHealth : uint8_t {
     Unavailable = 0,
@@ -88,6 +97,32 @@ enum class SensorRailHealth : uint8_t {
     Stale = 2,
     Degraded = 3,
     Healthy = 4,
+};
+
+struct RailHealthThresholds {
+    float tiltErrorHealthyDeg = 0.0f;
+    float tiltErrorDegradedDeg = 0.0f;
+    float tiltRmsHealthyDeg = 0.0f;
+    float tiltRmsDegradedDeg = 0.0f;
+    float tiltRateHealthyDegPerSec = 0.0f;
+    float tiltRateDegradedDegPerSec = 0.0f;
+    float accelMagnitudeHealthyG = 0.0f;
+    float accelMagnitudeDegradedG = 0.0f;
+    bool useTiltRms = false;
+    bool useTiltRate = false;
+    bool useAccelMagnitude = false;
+};
+
+struct RailHealthState {
+    bool hasPreviousTilt = false;
+    float previousTiltVector[3] = {0.0f, 0.0f, 1.0f};
+    uint32_t previousSampleUs = 0;
+    bool hasTiltRms = false;
+    float tiltRmsSqDeg = 0.0f;
+    float lastTiltErrorDeg = INFINITY;
+    float lastTiltRmsDeg = INFINITY;
+    float lastTiltRateJumpDegPerSec = INFINITY;
+    float lastAccelMagnitudeErrorG = INFINITY;
 };
 
 enum class SystemError : uint8_t {
@@ -276,7 +311,7 @@ bool StartBnoDuringSetup() {
     if (!kBnoEnabled) {
         return false;
     }
-    return Bno085SensorBegin();
+    return BnoSensorBegin();
 }
 
 bool StartPulseDuringSetup() {
@@ -847,10 +882,21 @@ static SensorComparisonStats g_sensorComparisonStats;
 static float g_icmLsmCrossCheckTrust = 1.0f;
 static float g_bnoReferenceCrossCheckTrust = 1.0f;
 static float g_pulseCrossCheckTrust = 1.0f;
+static float g_icmRailTrust = 1.0f;
+static float g_lsmRailTrust = 1.0f;
+static float g_bnoRailTrust = 1.0f;
+static float g_pulseRailTrust = 1.0f;
 static SensorRailHealth g_icmHealth = SensorRailHealth::Unavailable;
 static SensorRailHealth g_lsmHealth = SensorRailHealth::Unavailable;
 static SensorRailHealth g_bnoHealth = SensorRailHealth::Unavailable;
 static SensorRailHealth g_pulseHealth = SensorRailHealth::Unavailable;
+static RailHealthState g_icmRailState;
+static RailHealthState g_lsmRailState;
+static RailHealthState g_bnoRailState;
+static RailHealthState g_pulseRailState;
+static bool g_haveMainQuaternionReference = false;
+static float g_lastMainQuaternion[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+static FlightStatus g_healthPhase = FlightStatus::Ground;
 
 // Trust hysteresis state: track previous trust direction to reduce oscillation.
 static float g_icmLsmPreviousTrust = 1.0f;
@@ -960,6 +1006,189 @@ static bool GravityVectorFromYprDeg(const float yprDeg[3], float gravityBody[3])
         return false;
     }
     return GravityVectorFromQuaternion(tiltQuaternion, gravityBody);
+}
+
+static bool Normalize3(float vector[3]) {
+    const float normSq = vector[0] * vector[0] + vector[1] * vector[1] + vector[2] * vector[2];
+    if (!std::isfinite(normSq) || normSq <= 1.0e-6f) {
+        return false;
+    }
+    const float invNorm = 1.0f / sqrtf(normSq);
+    vector[0] *= invNorm;
+    vector[1] *= invNorm;
+    vector[2] *= invNorm;
+    return true;
+}
+
+static float AngleBetweenUnitVectorsDeg(const float a[3], const float b[3]) {
+    const float dot = a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+    return acosf(std::clamp(dot, -1.0f, 1.0f)) * (180.0f / 3.14159265358979323846f);
+}
+
+static bool GravityVectorFromAccelBody(const float accelBody[3], float gravityBody[3]) {
+    gravityBody[0] = accelBody[0];
+    gravityBody[1] = accelBody[1];
+    gravityBody[2] = accelBody[2];
+    return Normalize3(gravityBody);
+}
+
+static bool RailTiltVectorForPhase(const float accelBody[3],
+                                   bool hasAccel,
+                                   const float quaternion[4],
+                                   bool hasQuaternion,
+                                   FlightStatus phase,
+                                   float gravityBody[3]) {
+    const bool preferAccel = (phase == FlightStatus::Ground || phase == FlightStatus::Descent);
+    if (preferAccel) {
+        if (hasAccel && GravityVectorFromAccelBody(accelBody, gravityBody)) {
+            return true;
+        }
+        return hasQuaternion && GravityVectorFromQuaternion(quaternion, gravityBody);
+    }
+    if (hasQuaternion && GravityVectorFromQuaternion(quaternion, gravityBody)) {
+        return true;
+    }
+    return hasAccel && GravityVectorFromAccelBody(accelBody, gravityBody);
+}
+
+static RailHealthThresholds RailHealthThresholdsForPhase(FlightStatus phase) {
+    switch (phase) {
+        case FlightStatus::Ground:
+            return RailHealthThresholds{5.0f, 15.0f, 4.0f, 10.0f, 45.0f, 180.0f, 0.15f, 0.40f, true, false, true};
+        case FlightStatus::Burn:
+            return RailHealthThresholds{15.0f, 35.0f, 12.0f, 25.0f, 240.0f, 900.0f, 1000.0f, 2000.0f, false, false, false};
+        case FlightStatus::Coast:
+        case FlightStatus::Overshoot:
+            return RailHealthThresholds{10.0f, 25.0f, 8.0f, 18.0f, 120.0f, 360.0f, 1000.0f, 2000.0f, true, true, false};
+        case FlightStatus::Descent:
+            return RailHealthThresholds{6.0f, 18.0f, 5.0f, 12.0f, 75.0f, 240.0f, 0.20f, 0.50f, true, true, true};
+    }
+    return RailHealthThresholds{};
+}
+
+static float MetricDescendingTrust(float value, float fullTrustMax, float zeroTrustMin) {
+    if (value <= fullTrustMax) {
+        return 1.0f;
+    }
+    if (value >= zeroTrustMin || !(zeroTrustMin > fullTrustMax)) {
+        return 0.0f;
+    }
+    return (zeroTrustMin - value) / (zeroTrustMin - fullTrustMax);
+}
+
+static float UpdateRailTrust(RailHealthState &state,
+                             bool hasTiltVector,
+                             const float tiltVector[3],
+                             bool hasAccel,
+                             const float accelBody[3],
+                             uint32_t sampleUs,
+                             bool hasReference,
+                             const float referenceGravity[3],
+                             FlightStatus phase) {
+    const RailHealthThresholds thresholds = RailHealthThresholdsForPhase(phase);
+
+    if (hasTiltVector && hasReference) {
+        state.lastTiltErrorDeg = AngleBetweenUnitVectorsDeg(tiltVector, referenceGravity);
+        const float dtSeconds = (state.previousSampleUs != 0 && sampleUs > state.previousSampleUs)
+                                    ? static_cast<float>(sampleUs - state.previousSampleUs) * 1.0e-6f
+                                    : 0.0f;
+        if (state.hasPreviousTilt && dtSeconds > 1.0e-4f) {
+            state.lastTiltRateJumpDegPerSec =
+                AngleBetweenUnitVectorsDeg(tiltVector, state.previousTiltVector) / dtSeconds;
+        } else {
+            state.lastTiltRateJumpDegPerSec = 0.0f;
+        }
+        const float alpha = (dtSeconds > 0.0f) ? std::clamp(dtSeconds / (0.35f + dtSeconds), 0.05f, 1.0f) : 1.0f;
+        const float errorSq = state.lastTiltErrorDeg * state.lastTiltErrorDeg;
+        if (!state.hasTiltRms) {
+            state.tiltRmsSqDeg = errorSq;
+            state.hasTiltRms = true;
+        } else {
+            state.tiltRmsSqDeg += alpha * (errorSq - state.tiltRmsSqDeg);
+        }
+        state.lastTiltRmsDeg = sqrtf(std::max(0.0f, state.tiltRmsSqDeg));
+        state.previousTiltVector[0] = tiltVector[0];
+        state.previousTiltVector[1] = tiltVector[1];
+        state.previousTiltVector[2] = tiltVector[2];
+        state.hasPreviousTilt = true;
+        state.previousSampleUs = sampleUs;
+    } else {
+        state.lastTiltErrorDeg = INFINITY;
+        state.lastTiltRateJumpDegPerSec = INFINITY;
+        state.lastTiltRmsDeg = state.hasTiltRms ? sqrtf(std::max(0.0f, state.tiltRmsSqDeg)) : INFINITY;
+    }
+
+    if (hasAccel) {
+        const float magnitudeG =
+            sqrtf(accelBody[0] * accelBody[0] + accelBody[1] * accelBody[1] + accelBody[2] * accelBody[2]) /
+            constants::kGravity;
+        state.lastAccelMagnitudeErrorG = fabsf(magnitudeG - 1.0f);
+    } else {
+        state.lastAccelMagnitudeErrorG = INFINITY;
+    }
+
+    if (!hasReference || !hasTiltVector) {
+        return 1.0f;
+    }
+
+    float trust = 1.0f;
+    trust = std::min(trust,
+                     MetricDescendingTrust(state.lastTiltErrorDeg,
+                                          thresholds.tiltErrorHealthyDeg,
+                                          thresholds.tiltErrorDegradedDeg));
+    if (thresholds.useTiltRms && state.hasTiltRms) {
+        trust = std::min(trust,
+                         MetricDescendingTrust(state.lastTiltRmsDeg,
+                                              thresholds.tiltRmsHealthyDeg,
+                                              thresholds.tiltRmsDegradedDeg));
+    }
+    if (thresholds.useTiltRate && std::isfinite(state.lastTiltRateJumpDegPerSec)) {
+        trust = std::min(trust,
+                         MetricDescendingTrust(state.lastTiltRateJumpDegPerSec,
+                                              thresholds.tiltRateHealthyDegPerSec,
+                                              thresholds.tiltRateDegradedDegPerSec));
+    }
+    if (thresholds.useAccelMagnitude && std::isfinite(state.lastAccelMagnitudeErrorG)) {
+        trust = std::min(trust,
+                         MetricDescendingTrust(state.lastAccelMagnitudeErrorG,
+                                              thresholds.accelMagnitudeHealthyG,
+                                              thresholds.accelMagnitudeDegradedG));
+    }
+    return std::clamp(trust, 0.0f, 1.0f);
+}
+
+static bool ZenithDegFromAccelBody(const float accelBody[3], float &zenithDeg) {
+    const float normSq = accelBody[0] * accelBody[0] + accelBody[1] * accelBody[1] + accelBody[2] * accelBody[2];
+    if (!std::isfinite(normSq) || normSq <= 1.0e-6f) {
+        return false;
+    }
+    const float norm = sqrtf(normSq);
+    const float cosZenith = std::fabs(accelBody[2] / norm);
+    zenithDeg = acosf(std::clamp(cosZenith, 0.0f, 1.0f)) * (180.0f / 3.14159265358979323846f);
+    return std::isfinite(zenithDeg);
+}
+
+static bool ZenithDifferenceDegFromAccelBody(const float accelA[3], const float accelB[3], float &differenceDeg) {
+    float zenithA = 0.0f;
+    float zenithB = 0.0f;
+    if (!ZenithDegFromAccelBody(accelA, zenithA) || !ZenithDegFromAccelBody(accelB, zenithB)) {
+        return false;
+    }
+    differenceDeg = fabsf(zenithA - zenithB);
+    return std::isfinite(differenceDeg);
+}
+
+static bool AccelVectorAngleDeg(const float accelA[3], const float accelB[3], float &angleDeg) {
+    const float normASq = accelA[0] * accelA[0] + accelA[1] * accelA[1] + accelA[2] * accelA[2];
+    const float normBSq = accelB[0] * accelB[0] + accelB[1] * accelB[1] + accelB[2] * accelB[2];
+    if (!std::isfinite(normASq) || !std::isfinite(normBSq) || normASq <= 1.0e-6f || normBSq <= 1.0e-6f) {
+        return false;
+    }
+    const float invNormA = 1.0f / sqrtf(normASq);
+    const float invNormB = 1.0f / sqrtf(normBSq);
+    const float dot = (accelA[0] * accelB[0] + accelA[1] * accelB[1] + accelA[2] * accelB[2]) * invNormA * invNormB;
+    angleDeg = acosf(std::clamp(dot, -1.0f, 1.0f)) * (180.0f / 3.14159265358979323846f);
+    return std::isfinite(angleDeg);
 }
 
 static bool TiltDifferenceDegFromYprDeg(const float yprA[3], const float yprB[3], float &differenceDeg) {
@@ -1115,8 +1344,8 @@ static bool ComputeIcmLsmTiltDifference(const SensorData &icmData,
     return false;
 }
 
-static bool ComputeBnoIcmTiltDifference(const Bno085Sample &bnoData,
-                                        const Bno085Diagnostics &bnoDiagnostics,
+static bool ComputeBnoIcmTiltDifference(const BnoSample &bnoData,
+                                        const BnoDiagnostics &bnoDiagnostics,
                                         const SensorData &icmData,
                                         const Icm20948Diagnostics &icmDiagnostics,
                                         float &differenceDeg) {
@@ -1129,8 +1358,8 @@ static bool ComputeBnoIcmTiltDifference(const Bno085Sample &bnoData,
     return false;
 }
 
-static bool ComputeBnoLsmTiltDifference(const Bno085Sample &bnoData,
-                                        const Bno085Diagnostics &bnoDiagnostics,
+static bool ComputeBnoLsmTiltDifference(const BnoSample &bnoData,
+                                        const BnoDiagnostics &bnoDiagnostics,
                                         const SensorData &lsmData,
                                         const Lsm9ds1Diagnostics &lsmDiagnostics,
                                         float &differenceDeg) {
@@ -1169,7 +1398,7 @@ static float ComputeLsmPulseCrossCheckTrust(const SensorData &lsmData, const Sen
     return ApplyTiltTrust(baseTrust, hasTiltDifference, tiltDifferenceDeg);
 }
 
-static float ComputeBnoPulseCrossCheckTrust(const Bno085Sample &bnoData, const SensorData &pulseData) {
+static float ComputeBnoPulseCrossCheckTrust(const BnoSample &bnoData, const SensorData &pulseData) {
     const float baseTrust = ComputeCrossCheckTrust(bnoData.accel,
                                                    bnoData.gyro,
                                                    pulseData.accelPulse,
@@ -1218,7 +1447,7 @@ static void CopyIcmLikeFields(SensorData &dst, const SensorData &src) {
     dst.icmRailConstrained = src.icmRailConstrained;
 }
 
-static void CopyBnoFields(SensorData &dst, const Bno085Sample &src) {
+static void CopyBnoFields(SensorData &dst, const BnoSample &src) {
     for (int i = 0; i < 3; ++i) {
         dst.accelBNO[i] = src.hasAccel ? src.accel[i] : 0.0f;
         dst.gyroBNO[i] = src.hasGyro ? src.gyro[i] : 0.0f;
@@ -1268,6 +1497,10 @@ static void SetMainQuaternion(SensorData &data, const float quaternion[4], MainQ
     data.quaternion[3] = tiltQuaternion[3];
     data.hasQuaternion = true;
     data.mainQuaternionSource = static_cast<uint8_t>(source);
+    for (int i = 0; i < 4; ++i) {
+        g_lastMainQuaternion[i] = tiltQuaternion[i];
+    }
+    g_haveMainQuaternionReference = true;
 }
 
 static void SetMainQuaternion(SensorData &data, const math_utils::Quaternion &quaternion, MainQuaternionSource source) {
@@ -1277,10 +1510,10 @@ static void SetMainQuaternion(SensorData &data, const math_utils::Quaternion &qu
 
 /// Acquires one sensor sample from replay or live hardware.
 ///
-/// The live path aliases the active attitude source into the main quaternion
-/// field and only mirrors BNO accel into ICM slots when the ICM sample is absent.
+/// The live path aliases the active critical attitude source into the main quaternion
+/// field while keeping comparison rails isolated from the estimator path.
 static bool BnoComparableWithFastRail(uint32_t nowUs,
-                                      const Bno085Sample &bnoData,
+                                      const BnoSample &bnoData,
                                       uint32_t otherSampleMicros,
                                       uint32_t otherMaxAgeUs,
                                       bool requireQuaternion = false) {
@@ -1329,14 +1562,19 @@ static bool AcquireSensorData(SensorData &data) {
     if (pulseDiagnostics.hasImu || pulseDiagnostics.hasQuaternion || pulseDiagnostics.hasYpr) {
         CopyPulseFields(data, pulseData);
     }
-    const bool hasBnoImu = kBnoEnabled ? Bno085SensorAcquire(data) : false;
-    const Bno085Sample bnoData = kBnoEnabled ? Bno085SensorGetSample() : Bno085Sample{};
-    const Bno085Diagnostics bnoDiagnostics = kBnoEnabled ? Bno085SensorGetDiagnostics() : Bno085Diagnostics{};
+    const bool hasBnoImu = kBnoEnabled ? BnoSensorAcquire(data) : false;
+    const BnoSample bnoData = kBnoEnabled ? BnoSensorGetSample() : BnoSample{};
+    const BnoDiagnostics bnoDiagnostics = kBnoEnabled ? BnoSensorGetDiagnostics() : BnoDiagnostics{};
     const bool hasIcmImu = Icm20948SensorAcquire(data);
     const Icm20948Diagnostics icmDiagnostics = Icm20948SensorGetDiagnostics();
+    if (kWt901Enabled) {
+        Wt901SensorAcquire();
+    }
     SensorData lsmData;
     const bool hasLsmImu = kLsmEnabled ? Lsm9ds1SensorAcquire(lsmData) : false;
     const Lsm9ds1Diagnostics lsmDiagnostics = kLsmEnabled ? Lsm9ds1SensorGetDiagnostics() : Lsm9ds1Diagnostics{};
+    data.icmSampleFresh = hasIcmImu && icmDiagnostics.lastAcquireFresh;
+    data.lsmSampleFresh = hasLsmImu && lsmDiagnostics.lastAcquireFresh;
     const uint32_t comparisonNowUs = micros();
     if (bnoData.hasAccel || bnoData.hasGyro || bnoData.hasQuaternion) {
         CopyBnoFields(data, bnoData);
@@ -1381,18 +1619,6 @@ static bool AcquireSensorData(SensorData &data) {
             ++g_sensorAcquireStats.lsmFreshHits;
         } else if (lsmDiagnostics.lastAcquireUsedCache) {
             ++g_sensorAcquireStats.lsmCachedHits;
-        }
-    }
-    if (hasBnoImu && !hasIcmImu && bnoData.hasAccel) {
-        ++g_sensorAcquireStats.bnoToIcmFallbacks;
-        for (int i = 0; i < 3; ++i) {
-            data.accelICM[i] = data.accelBNO[i];
-        }
-        if (data.hasBnoQuaternion && !data.hasIcmQuaternion) {
-            for (int i = 0; i < 4; ++i) {
-                data.icmQuaternion[i] = data.quaternionBNO[i];
-            }
-            data.hasIcmQuaternion = true;
         }
     }
     bool updatedBnoReferenceTrust = false;
@@ -1659,9 +1885,161 @@ static bool AcquireSensorData(SensorData &data) {
                                     bnoRecent,
                                     compareBnoIcm || compareBnoLsm,
                                     g_bnoReferenceCrossCheckTrust);
-    Icm20948SensorSetCrossCheckTrust(g_icmLsmCrossCheckTrust);
+    float referenceGravity[3] = {0.0f, 0.0f, 0.0f};
+    bool hasReferenceGravity = false;
+    float icmTiltVector[3] = {0.0f, 0.0f, 0.0f};
+    float lsmTiltVector[3] = {0.0f, 0.0f, 0.0f};
+    float bnoTiltVector[3] = {0.0f, 0.0f, 0.0f};
+    float pulseTiltVector[3] = {0.0f, 0.0f, 0.0f};
+    const bool hasIcmTiltVector =
+        RailTiltVectorForPhase(data.accelICM, true, data.icmQuaternion, data.hasIcmQuaternion, g_healthPhase, icmTiltVector);
+    const bool hasLsmTiltVector =
+        RailTiltVectorForPhase(lsmData.accelICM,
+                               lsmDiagnostics.hasAccel,
+                               lsmData.icmQuaternion,
+                               lsmData.hasIcmQuaternion,
+                               g_healthPhase,
+                               lsmTiltVector);
+    const bool hasBnoTiltVector =
+        RailTiltVectorForPhase(bnoDiagnostics.accelBodyMps2,
+                               bnoDiagnostics.hasAccel,
+                               data.quaternionBNO,
+                               data.hasBnoQuaternion,
+                               g_healthPhase,
+                               bnoTiltVector);
+    const bool hasPulseTiltVector =
+        RailTiltVectorForPhase(pulseData.accelPulse,
+                               pulseDiagnostics.hasImu,
+                               pulseData.quaternionPulse,
+                               data.hasPulseQuaternion,
+                               g_healthPhase,
+                               pulseTiltVector);
+    float fastConsensusGravity[3] = {0.0f, 0.0f, 0.0f};
+    bool hasFastConsensus = false;
+    bool fastConsensusReacquire = false;
+    if (hasIcmTiltVector && hasLsmTiltVector) {
+        fastConsensusGravity[0] = icmTiltVector[0] + lsmTiltVector[0];
+        fastConsensusGravity[1] = icmTiltVector[1] + lsmTiltVector[1];
+        fastConsensusGravity[2] = icmTiltVector[2] + lsmTiltVector[2];
+        if (Normalize3(fastConsensusGravity)) {
+            hasFastConsensus = true;
+            const float fastAgreementDeg = AngleBetweenUnitVectorsDeg(icmTiltVector, lsmTiltVector);
+            const float reacquireThresholdDeg =
+                (g_healthPhase == FlightStatus::Ground) ? 6.0f :
+                (g_healthPhase == FlightStatus::Burn) ? 10.0f : 8.0f;
+            fastConsensusReacquire = fastAgreementDeg <= reacquireThresholdDeg;
+        }
+    } else if (g_healthPhase == FlightStatus::Ground) {
+        if (hasIcmTiltVector) {
+            fastConsensusGravity[0] = icmTiltVector[0];
+            fastConsensusGravity[1] = icmTiltVector[1];
+            fastConsensusGravity[2] = icmTiltVector[2];
+            hasFastConsensus = true;
+        } else if (hasLsmTiltVector) {
+            fastConsensusGravity[0] = lsmTiltVector[0];
+            fastConsensusGravity[1] = lsmTiltVector[1];
+            fastConsensusGravity[2] = lsmTiltVector[2];
+            hasFastConsensus = true;
+        }
+    }
+
+    if (g_healthPhase == FlightStatus::Ground) {
+        if (hasFastConsensus) {
+            referenceGravity[0] = fastConsensusGravity[0];
+            referenceGravity[1] = fastConsensusGravity[1];
+            referenceGravity[2] = fastConsensusGravity[2];
+            hasReferenceGravity = true;
+        }
+    } else if (g_healthPhase == FlightStatus::Burn) {
+        if (hasFastConsensus) {
+            referenceGravity[0] = fastConsensusGravity[0];
+            referenceGravity[1] = fastConsensusGravity[1];
+            referenceGravity[2] = fastConsensusGravity[2];
+            hasReferenceGravity = true;
+        }
+    } else {
+        hasReferenceGravity = g_haveMainQuaternionReference &&
+                              GravityVectorFromQuaternion(g_lastMainQuaternion, referenceGravity);
+        if (!hasReferenceGravity && hasFastConsensus) {
+            referenceGravity[0] = fastConsensusGravity[0];
+            referenceGravity[1] = fastConsensusGravity[1];
+            referenceGravity[2] = fastConsensusGravity[2];
+            hasReferenceGravity = true;
+        }
+    }
+
+    g_icmRailTrust = UpdateRailTrust(g_icmRailState,
+                                     hasIcmTiltVector,
+                                     icmTiltVector,
+                                     true,
+                                     data.accelICM,
+                                     icmDiagnostics.lastSampleMicros,
+                                     hasReferenceGravity,
+                                     referenceGravity,
+                                     g_healthPhase);
+    g_lsmRailTrust = UpdateRailTrust(g_lsmRailState,
+                                     hasLsmTiltVector,
+                                     lsmTiltVector,
+                                     lsmDiagnostics.hasAccel,
+                                     lsmData.accelICM,
+                                     lsmDiagnostics.lastSampleMicros,
+                                     hasReferenceGravity,
+                                     referenceGravity,
+                                     g_healthPhase);
+    g_bnoRailTrust = UpdateRailTrust(g_bnoRailState,
+                                     hasBnoTiltVector,
+                                     bnoTiltVector,
+                                     bnoDiagnostics.hasAccel,
+                                     bnoDiagnostics.accelBodyMps2,
+                                     bnoData.sampleMicros,
+                                     hasReferenceGravity,
+                                     referenceGravity,
+                                     g_healthPhase);
+    g_pulseRailTrust = UpdateRailTrust(g_pulseRailState,
+                                       hasPulseTiltVector,
+                                       pulseTiltVector,
+                                       pulseDiagnostics.hasImu,
+                                       pulseData.accelPulse,
+                                       pulseDiagnostics.lastSampleMicros,
+                                       hasReferenceGravity,
+                                       referenceGravity,
+                                       g_healthPhase);
+    if (fastConsensusReacquire) {
+        g_icmRailTrust = std::max(g_icmRailTrust, 0.98f);
+        g_lsmRailTrust = std::max(g_lsmRailTrust, 0.98f);
+    }
+
+    g_icmHealth = ResolveRailHealth(g_icmHealth,
+                                    icmDiagnostics.initialized,
+                                    icmDiagnostics.alignmentReady && data.hasIcmQuaternion,
+                                    icmRecent,
+                                    hasReferenceGravity,
+                                    g_icmRailTrust);
+    g_lsmHealth = ResolveRailHealth(g_lsmHealth,
+                                    lsmDiagnostics.initialized,
+                                    lsmDiagnostics.alignmentReady && lsmData.hasIcmQuaternion,
+                                    lsmRecent,
+                                    hasReferenceGravity,
+                                    g_lsmRailTrust);
+    g_bnoHealth = ResolveRailHealth(g_bnoHealth,
+                                    kBnoEnabled && bnoData.hasAccel && bnoData.hasGyro,
+                                    bnoData.hasQuaternion,
+                                    bnoRecent,
+                                    hasReferenceGravity,
+                                    g_bnoRailTrust);
+    g_pulseHealth = ResolveRailHealth(g_pulseHealth,
+                                      pulseDiagnostics.initialized && pulseDiagnostics.hasImu,
+                                      pulseDiagnostics.alignmentReady && data.hasPulseQuaternion,
+                                      pulseRecent,
+                                      hasReferenceGravity,
+                                      g_pulseRailTrust);
+
+    g_icmLsmCrossCheckTrust = std::min(g_icmRailTrust, g_lsmRailTrust);
+    g_bnoReferenceCrossCheckTrust = g_bnoRailTrust;
+    g_pulseCrossCheckTrust = g_pulseRailTrust;
+    Icm20948SensorSetCrossCheckTrust(g_icmRailTrust);
     if (kLsmEnabled) {
-        Lsm9ds1SensorSetCrossCheckTrust(g_icmLsmCrossCheckTrust);
+        Lsm9ds1SensorSetCrossCheckTrust(g_lsmRailTrust);
     }
     if (hasLsmImu && !hasIcmImu) {
         ++g_sensorAcquireStats.lsmToIcmFallbacks;
@@ -1674,160 +2052,56 @@ static bool AcquireSensorData(SensorData &data) {
     if (settings::ahrs::kEnableQuaternionBlending) {
         const bool icmHealthy = data.hasIcmQuaternion && g_icmHealth == SensorRailHealth::Healthy;
         const bool lsmHealthy = lsmData.hasIcmQuaternion && g_lsmHealth == SensorRailHealth::Healthy;
-        const bool bnoHealthy = data.hasBnoQuaternion && g_bnoHealth == SensorRailHealth::Healthy;
-        const bool pulseHealthy = data.hasPulseQuaternion && g_pulseHealth == SensorRailHealth::Healthy;
         const bool icmUsable = data.hasIcmQuaternion &&
                                g_icmHealth != SensorRailHealth::Unavailable &&
                                g_icmHealth != SensorRailHealth::Stale;
         const bool lsmUsable = lsmData.hasIcmQuaternion &&
                                g_lsmHealth != SensorRailHealth::Unavailable &&
                                g_lsmHealth != SensorRailHealth::Stale;
-        const bool pulseUsable = data.hasPulseQuaternion &&
-                                 g_pulseHealth != SensorRailHealth::Unavailable &&
-                                 g_pulseHealth != SensorRailHealth::Stale;
-
-        // Multi-source weighted blending: Pulse is primary (highest quality),
-        // with optional blending from ICM/LSM when healthy, scaled by trust.
-        // Weight assignments: Pulse gets base weight 1.0, others get scaled by their trust.
-        constexpr float kPulseBaseWeight = 1.0f;
-        constexpr float kSecondaryBlendScale = 0.3f;  // How much to blend in secondary sources.
-
         math_utils::Quaternion blendedQuat = {1.0f, 0.0f, 0.0f, 0.0f};
-        float totalWeight = 0.0f;
-        MainQuaternionSource primarySource = MainQuaternionSource::None;
-        bool hasBlendedMultiple = false;
+        bool hasFastQuaternion = false;
 
-        // Start with the highest-quality healthy source as primary.
-        if (pulseHealthy) {
+        if (icmHealthy && lsmHealthy && g_icmLsmCrossCheckTrust >= settings::ahrs::kMinBlendTrust) {
             blendedQuat = math_utils::Normalize(math_utils::MakeQuaternion(
-                data.quaternionPulse[0], data.quaternionPulse[1],
-                data.quaternionPulse[2], data.quaternionPulse[3]));
-            totalWeight = kPulseBaseWeight * g_pulseCrossCheckTrust;
-            primarySource = MainQuaternionSource::Pulse;
-
-            // Blend in ICM if healthy and agreeing (high trust).
-            if (icmHealthy && g_icmLsmCrossCheckTrust >= settings::ahrs::kMinBlendTrust) {
-                math_utils::Quaternion icmQuat = math_utils::Normalize(math_utils::MakeQuaternion(
-                    data.icmQuaternion[0], data.icmQuaternion[1],
-                    data.icmQuaternion[2], data.icmQuaternion[3]));
-                const float icmWeight = kSecondaryBlendScale * g_icmLsmCrossCheckTrust;
-                const float blendFactor = icmWeight / (totalWeight + icmWeight);
-                blendedQuat = math_utils::Slerp(blendedQuat, icmQuat, blendFactor);
-                totalWeight += icmWeight;
-                hasBlendedMultiple = true;
-            }
-            // Blend in LSM if healthy and agreeing (high trust).
-            if (lsmHealthy && g_icmLsmCrossCheckTrust >= settings::ahrs::kMinBlendTrust) {
-                math_utils::Quaternion lsmQuat = math_utils::Normalize(math_utils::MakeQuaternion(
-                    lsmData.icmQuaternion[0], lsmData.icmQuaternion[1],
-                    lsmData.icmQuaternion[2], lsmData.icmQuaternion[3]));
-                const float lsmWeight = kSecondaryBlendScale * g_icmLsmCrossCheckTrust;
-                const float blendFactor = lsmWeight / (totalWeight + lsmWeight);
-                blendedQuat = math_utils::Slerp(blendedQuat, lsmQuat, blendFactor);
-                totalWeight += lsmWeight;
-                hasBlendedMultiple = true;
-            }
+                data.icmQuaternion[0], data.icmQuaternion[1],
+                data.icmQuaternion[2], data.icmQuaternion[3]));
+            const math_utils::Quaternion lsmQuat = math_utils::Normalize(math_utils::MakeQuaternion(
+                lsmData.icmQuaternion[0], lsmData.icmQuaternion[1],
+                lsmData.icmQuaternion[2], lsmData.icmQuaternion[3]));
+            blendedQuat = math_utils::Slerp(blendedQuat, lsmQuat, 0.5f);
+            SetMainQuaternion(data, blendedQuat, MainQuaternionSource::Blended);
+            hasFastQuaternion = true;
         } else if (icmHealthy) {
-            blendedQuat = math_utils::Normalize(math_utils::MakeQuaternion(
-                data.icmQuaternion[0], data.icmQuaternion[1],
-                data.icmQuaternion[2], data.icmQuaternion[3]));
-            totalWeight = g_icmLsmCrossCheckTrust;
-            primarySource = MainQuaternionSource::Icm;
-
-            // Blend in LSM if healthy.
-            if (lsmHealthy && g_icmLsmCrossCheckTrust >= settings::ahrs::kMinBlendTrust) {
-                math_utils::Quaternion lsmQuat = math_utils::Normalize(math_utils::MakeQuaternion(
-                    lsmData.icmQuaternion[0], lsmData.icmQuaternion[1],
-                    lsmData.icmQuaternion[2], lsmData.icmQuaternion[3]));
-                const float lsmWeight = g_icmLsmCrossCheckTrust;
-                const float blendFactor = lsmWeight / (totalWeight + lsmWeight);
-                blendedQuat = math_utils::Slerp(blendedQuat, lsmQuat, blendFactor);
-                totalWeight += lsmWeight;
-                hasBlendedMultiple = true;
-            }
-            // Blend in Pulse if usable (not healthy, but still valid).
-            if (pulseUsable && g_pulseCrossCheckTrust >= settings::ahrs::kMinBlendTrust) {
-                math_utils::Quaternion pulseQuat = math_utils::Normalize(math_utils::MakeQuaternion(
-                    data.quaternionPulse[0], data.quaternionPulse[1],
-                    data.quaternionPulse[2], data.quaternionPulse[3]));
-                const float pulseWeight = kSecondaryBlendScale * g_pulseCrossCheckTrust;
-                const float blendFactor = pulseWeight / (totalWeight + pulseWeight);
-                blendedQuat = math_utils::Slerp(blendedQuat, pulseQuat, blendFactor);
-                totalWeight += pulseWeight;
-                hasBlendedMultiple = true;
-            }
+            SetMainQuaternion(data, data.icmQuaternion, MainQuaternionSource::Icm);
+            hasFastQuaternion = true;
         } else if (lsmHealthy) {
-            blendedQuat = math_utils::Normalize(math_utils::MakeQuaternion(
-                lsmData.icmQuaternion[0], lsmData.icmQuaternion[1],
-                lsmData.icmQuaternion[2], lsmData.icmQuaternion[3]));
-            totalWeight = g_icmLsmCrossCheckTrust;
-            primarySource = MainQuaternionSource::Lsm;
-
-            // Blend in Pulse if usable.
-            if (pulseUsable && g_pulseCrossCheckTrust >= settings::ahrs::kMinBlendTrust) {
-                math_utils::Quaternion pulseQuat = math_utils::Normalize(math_utils::MakeQuaternion(
-                    data.quaternionPulse[0], data.quaternionPulse[1],
-                    data.quaternionPulse[2], data.quaternionPulse[3]));
-                const float pulseWeight = kSecondaryBlendScale * g_pulseCrossCheckTrust;
-                const float blendFactor = pulseWeight / (totalWeight + pulseWeight);
-                blendedQuat = math_utils::Slerp(blendedQuat, pulseQuat, blendFactor);
-                totalWeight += pulseWeight;
-                hasBlendedMultiple = true;
-            }
-        } else if (pulseUsable) {
-            blendedQuat = math_utils::Normalize(math_utils::MakeQuaternion(
-                data.quaternionPulse[0], data.quaternionPulse[1],
-                data.quaternionPulse[2], data.quaternionPulse[3]));
-            totalWeight = g_pulseCrossCheckTrust;
-            primarySource = MainQuaternionSource::Pulse;
-        } else if (icmUsable) {
+            SetMainQuaternion(data, lsmData.icmQuaternion, MainQuaternionSource::Lsm);
+            hasFastQuaternion = true;
+        } else if (icmUsable && lsmUsable && g_icmLsmCrossCheckTrust >= settings::ahrs::kMinBlendTrust) {
             blendedQuat = math_utils::Normalize(math_utils::MakeQuaternion(
                 data.icmQuaternion[0], data.icmQuaternion[1],
                 data.icmQuaternion[2], data.icmQuaternion[3]));
-            totalWeight = g_icmLsmCrossCheckTrust;
-            primarySource = MainQuaternionSource::Icm;
-        } else if (lsmUsable) {
-            blendedQuat = math_utils::Normalize(math_utils::MakeQuaternion(
+            const math_utils::Quaternion lsmQuat = math_utils::Normalize(math_utils::MakeQuaternion(
                 lsmData.icmQuaternion[0], lsmData.icmQuaternion[1],
                 lsmData.icmQuaternion[2], lsmData.icmQuaternion[3]));
-            totalWeight = g_icmLsmCrossCheckTrust;
-            primarySource = MainQuaternionSource::Lsm;
-        }
-
-        const bool hasFastQuaternion = totalWeight > 0.0f;
-
-        if (hasFastQuaternion && bnoHealthy) {
-            math_utils::Quaternion bnoQuat = math_utils::Normalize(math_utils::MakeQuaternion(
-                data.quaternionBNO[0], data.quaternionBNO[1], data.quaternionBNO[2], data.quaternionBNO[3]));
-            const float correctionBlend =
-                std::clamp(kBnoReferenceCorrectionBlendFactor * g_bnoReferenceCrossCheckTrust, 0.0f, 1.0f);
-            const math_utils::Quaternion corrected =
-                math_utils::Slerp(blendedQuat, bnoQuat, correctionBlend);
-            const MainQuaternionSource finalSource =
-                (hasBlendedMultiple || correctionBlend > 0.0f) ? MainQuaternionSource::Blended : primarySource;
-            SetMainQuaternion(data, corrected, finalSource);
-        } else if (hasFastQuaternion) {
-            const MainQuaternionSource finalSource =
-                hasBlendedMultiple ? MainQuaternionSource::Blended : primarySource;
-            SetMainQuaternion(data, blendedQuat, finalSource);
-        } else if (bnoHealthy) {
-            SetMainQuaternion(data, data.quaternionBNO, MainQuaternionSource::Bno);
-        } else if (pulseUsable) {
-            SetMainQuaternion(data, data.quaternionPulse, MainQuaternionSource::Pulse);
+            blendedQuat = math_utils::Slerp(blendedQuat, lsmQuat, 0.5f);
+            SetMainQuaternion(data, blendedQuat, MainQuaternionSource::Blended);
+            hasFastQuaternion = true;
         } else if (icmUsable) {
             SetMainQuaternion(data, data.icmQuaternion, MainQuaternionSource::Icm);
+            hasFastQuaternion = true;
         } else if (lsmUsable) {
             SetMainQuaternion(data, lsmData.icmQuaternion, MainQuaternionSource::Lsm);
-        } else if (data.hasBnoQuaternion) {
-            SetMainQuaternion(data, data.quaternionBNO, MainQuaternionSource::Bno);
+            hasFastQuaternion = true;
+        }
+
+        if (!hasFastQuaternion && icmHealthy) {
+            SetMainQuaternion(data, data.icmQuaternion, MainQuaternionSource::Icm);
+        } else if (!hasFastQuaternion && lsmUsable) {
+            SetMainQuaternion(data, lsmData.icmQuaternion, MainQuaternionSource::Lsm);
         }
     } else if (!data.hasQuaternion) {
-        // Fallback priority: Pulse → ICM → LSM
-        if (data.hasPulseQuaternion &&
-            g_pulseHealth != SensorRailHealth::Unavailable &&
-            g_pulseHealth != SensorRailHealth::Stale) {
-            SetMainQuaternion(data, data.quaternionPulse, MainQuaternionSource::Pulse);
-        } else if (data.hasIcmQuaternion &&
+        if (data.hasIcmQuaternion &&
                    g_icmHealth != SensorRailHealth::Unavailable &&
                    g_icmHealth != SensorRailHealth::Stale) {
             SetMainQuaternion(data, data.icmQuaternion, MainQuaternionSource::Icm);
@@ -1837,21 +2111,15 @@ static bool AcquireSensorData(SensorData &data) {
             SetMainQuaternion(data, lsmData.icmQuaternion, MainQuaternionSource::Lsm);
         }
     }
-    if (!data.hasQuaternion &&
-        kPulseUseAsMainQuaternionFallback &&
-        data.hasPulseQuaternion &&
-        g_pulseHealth != SensorRailHealth::Unavailable &&
-        g_pulseHealth != SensorRailHealth::Stale) {
-        SetMainQuaternion(data, data.quaternionPulse, MainQuaternionSource::Pulse);
-    }
     const bool hasAltimeter = Bmp585SensorAcquire(data);
+    data.baroSampleFresh = hasAltimeter;
     if (hasAltimeter) {
         ++g_sensorAcquireStats.bmpHits;
     }
     // Secondary barometer disabled for now.
     // const bool hasMs5611 = Ms5611SensorAcquire();
     const bool hasSensorData =
-        hasBnoImu || hasPulseFresh || hasIcmImu || hasLsmImu || hasAltimeter || pulseRecent;
+        data.icmSampleFresh || data.lsmSampleFresh || data.baroSampleFresh;
     if (!hasSensorData) {
         ++g_sensorAcquireStats.noDataLoops;
     }
@@ -2126,264 +2394,152 @@ static void LogTimingDiagnostics(uint32_t nowMs) {
     if ((nowMs - g_lastTimingLogMs) < kTimingLogIntervalMs) {
         return;
     }
+    const uint32_t intervalMs = (g_lastTimingLogMs == 0) ? kTimingLogIntervalMs : (nowMs - g_lastTimingLogMs);
+    const float intervalSec = static_cast<float>(intervalMs) * 1.0e-3f;
     g_lastTimingLogMs = nowMs;
 
-    const DataLoggerDiagnostics logger = DataLoggerGetDiagnostics();
-    const Bno085Diagnostics bno = kBnoEnabled ? Bno085SensorGetDiagnostics() : Bno085Diagnostics{};
+    const BnoDiagnostics bno = kBnoEnabled ? BnoSensorGetDiagnostics() : BnoDiagnostics{};
     const Icm20948Diagnostics icm = Icm20948SensorGetDiagnostics();
     const Lsm9ds1Diagnostics lsm = kLsmEnabled ? Lsm9ds1SensorGetDiagnostics() : Lsm9ds1Diagnostics{};
-    const Ellipse20Diagnostics pulse = kPulseEnabled ? Ellipse20SensorGetDiagnostics() : Ellipse20Diagnostics{};
-    LOG_PRINT("[timing] loop_us=");
-    LOG_PRINT(g_timingStats.maxLoopUs);
-    LOG_PRINT(" sensor_us=");
-    LOG_PRINT(g_timingStats.maxSensorAcquireUs);
-    LOG_PRINT(" est_us=");
-    LOG_PRINT(g_timingStats.maxEstimatorUs);
-    LOG_PRINT(" act_us=");
-    LOG_PRINT(g_timingStats.maxActuationPredictorUs);
-    LOG_PRINT(" log_us=");
-    LOG_PRINT(g_timingStats.maxLoggerServiceUs);
-    LOG_PRINT(" sd_write_us=");
-    LOG_PRINT(logger.maxWriteDurationUs);
-    LOG_PRINT(" sd_sync_us=");
-    LOG_PRINT(logger.maxSyncDurationUs);
-    LOG_PRINT(" log_drop=");
-    LOG_PRINT(logger.droppedTelemetryRecords);
-    LOG_PRINT(" log_buf=");
-    LOG_PRINT(static_cast<unsigned long>(logger.bufferedBytes));
-    LOG_PRINT(" sensors=");
-    LOG_PRINT(bno.transportReady ? "bno" : "-");
-    LOG_PRINT('(');
-    LOG_PRINT(bno.hasAccel ? 'a' : '-');
-    LOG_PRINT(bno.hasGyro ? 'g' : '-');
-    LOG_PRINT(bno.hasQuaternion ? 'q' : '-');
-    LOG_PRINT(')');
-    LOG_PRINT('/');
-    LOG_PRINT(icm.initialized ? "icm" : "-");
-    LOG_PRINT('(');
-    LOG_PRINT(icm.alignmentReady ? 'q' : '-');
-    LOG_PRINT(icm.lastAcquireFresh ? 'f' : (icm.lastAcquireUsedCache ? 'c' : '-'));
-    LOG_PRINT(icm.interruptConfigured ? 'I' : '-');
-    LOG_PRINT(icm.lastAcquireUsedInterrupt ? 'i' : '-');
-    LOG_PRINT(')');
-    LOG_PRINT('/');
-    LOG_PRINT(lsm.initialized ? "lsm" : "-");
-    LOG_PRINT('(');
-    LOG_PRINT(lsm.alignmentReady ? 'q' : '-');
-    LOG_PRINT(lsm.lastAcquireFresh ? 'f' : (lsm.lastAcquireUsedCache ? 'c' : '-'));
-    LOG_PRINT(lsm.interruptConfigured ? 'I' : '-');
-    LOG_PRINT(lsm.lastAcquireUsedInterrupt ? 'i' : (lsm.fifoEnabled ? 'F' : '-'));
-    LOG_PRINT(lsm.hasAccel ? 'a' : '-');
-    LOG_PRINT(lsm.hasGyro ? 'g' : '-');
-    LOG_PRINT(')');
-    LOG_PRINT('/');
-    LOG_PRINT(pulse.initialized ? "pulse" : "-");
-    LOG_PRINT('(');
-    LOG_PRINT(pulse.alignmentReady ? 'q' : '-');
-    LOG_PRINT(pulse.lastAcquireFresh ? 'f' : (pulse.lastAcquireUsedCache ? 'c' : '-'));
-    LOG_PRINT(pulse.hasImu ? 'i' : '-');
-    LOG_PRINT(pulse.hasMag ? 'm' : '-');
-    LOG_PRINT(')');
-    LOG_PRINT('/');
-    LOG_PRINT(Bmp585SensorIsInitialized() ? "bmp" : "-");
-    LOG_PRINT(" acq=");
-    LOG_PRINT("b:");
-    LOG_PRINT(g_sensorAcquireStats.bnoHits);
-    LOG_PRINT('/');
-    LOG_PRINT(g_sensorAcquireStats.loops);
-    LOG_PRINT(" i:");
-    LOG_PRINT(g_sensorAcquireStats.icmHits);
-    LOG_PRINT('/');
-    LOG_PRINT(g_sensorAcquireStats.loops);
-    LOG_PRINT("(f");
-    LOG_PRINT(g_sensorAcquireStats.icmFreshHits);
-    LOG_PRINT(" c");
-    LOG_PRINT(g_sensorAcquireStats.icmCachedHits);
+    const Wt901Diagnostics wt = kWt901Enabled ? Wt901SensorGetDiagnostics() : Wt901Diagnostics{};
+    auto printVec3 = [](const float values[3], uint8_t decimals) {
+        LOG_PRINT("(");
+        LOG_PRINT(values[0], decimals);
+        LOG_PRINT(",");
+        LOG_PRINT(values[1], decimals);
+        LOG_PRINT(",");
+        LOG_PRINT(values[2], decimals);
+        LOG_PRINT(")");
+    };
+    auto printZenith = [&](const float accelBody[3]) {
+        float zenithDeg = 0.0f;
+        if (!ZenithDegFromAccelBody(accelBody, zenithDeg)) {
+            LOG_PRINT("na");
+            return;
+        }
+        LOG_PRINT(zenithDeg, 1);
+    };
+    auto printPairMetric = [&](const float accelA[3], bool validA, const float accelB[3], bool validB, bool zenithOnly) {
+        if (!validA || !validB) {
+            LOG_PRINT("na");
+            return;
+        }
+        float valueDeg = 0.0f;
+        const bool ok = zenithOnly ? ZenithDifferenceDegFromAccelBody(accelA, accelB, valueDeg)
+                                   : AccelVectorAngleDeg(accelA, accelB, valueDeg);
+        if (!ok) {
+            LOG_PRINT("na");
+            return;
+        }
+        LOG_PRINT(valueDeg, 1);
+    };
+    auto printHealth = [&](char label, SensorRailHealth health, float trust, bool enabled) {
+        LOG_PRINT(label);
+        LOG_PRINT(":");
+        if (!enabled) {
+            LOG_PRINT("-");
+            return;
+        }
+        LOG_PRINT(HealthCode(health));
+        LOG_PRINT("/");
+        LOG_PRINT(trust, 2);
+    };
+
+    LOG_PRINT("[imu]");
+    LOG_PRINT(" iacc=");
+    printVec3(icm.accelBodyMps2, 2);
+    LOG_PRINT(" bacc=");
+    printVec3(bno.accelBodyMps2, 2);
+    LOG_PRINT(" lacc=");
+    printVec3(lsm.accelBodyMps2, 2);
+    LOG_PRINT(" wacc=");
+    if (wt.hasAccel) {
+        printVec3(wt.accelBodyMps2, 2);
+    } else {
+        LOG_PRINT("na");
+    }
+    LOG_PRINT(" izen=");
+    printZenith(icm.accelBodyMps2);
+    LOG_PRINT(" bzen=");
+    printZenith(bno.accelBodyMps2);
+    LOG_PRINT(" lzen=");
+    printZenith(lsm.accelBodyMps2);
+    LOG_PRINT(" wzen=");
+    if (wt.hasAccel) {
+        printZenith(wt.accelBodyMps2);
+    } else {
+        LOG_PRINT("na");
+    }
+    LOG_PRINT(" zdif=(ib:");
+    printPairMetric(icm.accelBodyMps2, true, bno.accelBodyMps2, bno.hasAccel, true);
+    LOG_PRINT(",il:");
+    printPairMetric(icm.accelBodyMps2, true, lsm.accelBodyMps2, lsm.hasAccel, true);
+    LOG_PRINT(",bl:");
+    printPairMetric(bno.accelBodyMps2, bno.hasAccel, lsm.accelBodyMps2, lsm.hasAccel, true);
+    LOG_PRINT(",iw:");
+    printPairMetric(icm.accelBodyMps2, true, wt.accelBodyMps2, wt.hasAccel, true);
+    LOG_PRINT(",bw:");
+    printPairMetric(bno.accelBodyMps2, bno.hasAccel, wt.accelBodyMps2, wt.hasAccel, true);
+    LOG_PRINT(",lw:");
+    printPairMetric(lsm.accelBodyMps2, lsm.hasAccel, wt.accelBodyMps2, wt.hasAccel, true);
     LOG_PRINT(")");
-    LOG_PRINT(" u:");
-    LOG_PRINT(g_sensorAcquireStats.pulseHits);
-    LOG_PRINT('/');
-    LOG_PRINT(g_sensorAcquireStats.loops);
-    LOG_PRINT(" l:");
-    LOG_PRINT(g_sensorAcquireStats.lsmHits);
-    LOG_PRINT('/');
-    LOG_PRINT(g_sensorAcquireStats.loops);
-    LOG_PRINT("(f");
-    LOG_PRINT(g_sensorAcquireStats.lsmFreshHits);
-    LOG_PRINT(" c");
+    LOG_PRINT(" adif=(ib:");
+    printPairMetric(icm.accelBodyMps2, true, bno.accelBodyMps2, bno.hasAccel, false);
+    LOG_PRINT(",il:");
+    printPairMetric(icm.accelBodyMps2, true, lsm.accelBodyMps2, lsm.hasAccel, false);
+    LOG_PRINT(",bl:");
+    printPairMetric(bno.accelBodyMps2, bno.hasAccel, lsm.accelBodyMps2, lsm.hasAccel, false);
+    LOG_PRINT(",iw:");
+    printPairMetric(icm.accelBodyMps2, true, wt.accelBodyMps2, wt.hasAccel, false);
+    LOG_PRINT(",bw:");
+    printPairMetric(bno.accelBodyMps2, bno.hasAccel, wt.accelBodyMps2, wt.hasAccel, false);
+    LOG_PRINT(",lw:");
+    printPairMetric(lsm.accelBodyMps2, lsm.hasAccel, wt.accelBodyMps2, wt.hasAccel, false);
+    LOG_PRINT(")");
+    LOG_PRINT(" health=(");
+    printHealth('i', g_icmHealth, g_icmRailTrust, true);
+    LOG_PRINT(",");
+    printHealth('l', g_lsmHealth, g_lsmRailTrust, kLsmEnabled);
+    LOG_PRINT(",");
+    printHealth('b', g_bnoHealth, g_bnoRailTrust, kBnoEnabled);
+    LOG_PRINT(",");
+    printHealth('p', g_pulseHealth, g_pulseRailTrust, kPulseEnabled);
+    LOG_PRINT(")");
+    LOG_PRINTLN("");
+
+    const uint32_t freshEstimatorLoops = g_sensorAcquireStats.loops - g_sensorAcquireStats.noDataLoops;
+    auto printCountRate = [&](const char *label, uint32_t count) {
+        LOG_PRINT(label);
+        LOG_PRINT(":");
+        LOG_PRINT(count);
+        LOG_PRINT("@");
+        LOG_PRINT(intervalSec > 0.0f ? (static_cast<float>(count) / intervalSec) : 0.0f, 1);
+    };
+
+    LOG_PRINT("[rate]");
+    LOG_PRINT(" dt=");
+    LOG_PRINT(intervalSec, 2);
+    LOG_PRINT("s");
+    LOG_PRINT(" fresh=(");
+    printCountRate("i", g_sensorAcquireStats.icmFreshHits);
+    LOG_PRINT(",");
+    printCountRate("l", g_sensorAcquireStats.lsmFreshHits);
+    LOG_PRINT(",");
+    printCountRate("b", g_sensorAcquireStats.bmpHits);
+    LOG_PRINT(",");
+    printCountRate("est", freshEstimatorLoops);
+    LOG_PRINT(")");
+    LOG_PRINT(" cached=(");
+    LOG_PRINT("i:");
+    LOG_PRINT(g_sensorAcquireStats.icmCachedHits);
+    LOG_PRINT(",");
+    LOG_PRINT("l:");
     LOG_PRINT(g_sensorAcquireStats.lsmCachedHits);
     LOG_PRINT(")");
-    LOG_PRINT(" p:");
-    LOG_PRINT(g_sensorAcquireStats.bmpHits);
-    LOG_PRINT('/');
+    LOG_PRINT(" loops=");
     LOG_PRINT(g_sensorAcquireStats.loops);
-    LOG_PRINT(" miss:");
-    LOG_PRINT(g_sensorAcquireStats.noDataLoops);
-    LOG_PRINT(" fb:");
-    LOG_PRINT(g_sensorAcquireStats.bnoToIcmFallbacks);
-    LOG_PRINT("+");
-    LOG_PRINT(g_sensorAcquireStats.lsmToIcmFallbacks);
-    LOG_PRINT(" cmp:il=");
-    LOG_PRINT(g_sensorComparisonStats.icmLsm.samples);
-    LOG_PRINT(" ib=");
-    LOG_PRINT(g_sensorComparisonStats.icmBno.samples);
-    LOG_PRINT(" lb=");
-    LOG_PRINT(g_sensorComparisonStats.lsmBno.samples);
-    LOG_PRINT(" ip=");
-    LOG_PRINT(g_sensorComparisonStats.icmPulse.samples);
-    LOG_PRINT(" lp=");
-    LOG_PRINT(g_sensorComparisonStats.lsmPulse.samples);
-    LOG_PRINT(" pb=");
-    LOG_PRINT(g_sensorComparisonStats.pulseBno.samples);
-    LOG_PRINT(" q=");
-    LOG_PRINT(g_sensorComparisonStats.icmLsm.maxQuaternionAngleDeg, 1);
-    LOG_PRINT("/");
-    LOG_PRINT(g_sensorComparisonStats.icmBno.maxQuaternionAngleDeg, 1);
-    LOG_PRINT("/");
-    LOG_PRINT(g_sensorComparisonStats.lsmBno.maxQuaternionAngleDeg, 1);
-    LOG_PRINT("/");
-    LOG_PRINT(g_sensorComparisonStats.icmPulse.maxQuaternionAngleDeg, 1);
-    LOG_PRINT("/");
-    LOG_PRINT(g_sensorComparisonStats.lsmPulse.maxQuaternionAngleDeg, 1);
-    LOG_PRINT("/");
-    LOG_PRINT(g_sensorComparisonStats.pulseBno.maxQuaternionAngleDeg, 1);
-    LOG_PRINT(" a=");
-    LOG_PRINT(g_sensorComparisonStats.icmLsm.maxAccelDiffMps2, 2);
-    LOG_PRINT("/");
-    LOG_PRINT(g_sensorComparisonStats.icmBno.maxAccelDiffMps2, 2);
-    LOG_PRINT("/");
-    LOG_PRINT(g_sensorComparisonStats.lsmBno.maxAccelDiffMps2, 2);
-    LOG_PRINT("/");
-    LOG_PRINT(g_sensorComparisonStats.icmPulse.maxAccelDiffMps2, 2);
-    LOG_PRINT("/");
-    LOG_PRINT(g_sensorComparisonStats.lsmPulse.maxAccelDiffMps2, 2);
-    LOG_PRINT("/");
-    LOG_PRINT(g_sensorComparisonStats.pulseBno.maxAccelDiffMps2, 2);
-    LOG_PRINT(" g=");
-    LOG_PRINT(g_sensorComparisonStats.icmLsm.maxGyroDiffRadPerSec, 2);
-    LOG_PRINT("/");
-    LOG_PRINT(g_sensorComparisonStats.icmBno.maxGyroDiffRadPerSec, 2);
-    LOG_PRINT("/");
-    LOG_PRINT(g_sensorComparisonStats.lsmBno.maxGyroDiffRadPerSec, 2);
-    LOG_PRINT("/");
-    LOG_PRINT(g_sensorComparisonStats.icmPulse.maxGyroDiffRadPerSec, 2);
-    LOG_PRINT("/");
-    LOG_PRINT(g_sensorComparisonStats.lsmPulse.maxGyroDiffRadPerSec, 2);
-    LOG_PRINT("/");
-    LOG_PRINT(g_sensorComparisonStats.pulseBno.maxGyroDiffRadPerSec, 2);
-    LOG_PRINT(" h=");
-    LOG_PRINT(HealthCode(g_icmHealth));
-    LOG_PRINT("/");
-    LOG_PRINT(HealthCode(g_lsmHealth));
-    LOG_PRINT("/");
-    LOG_PRINT(HealthCode(g_bnoHealth));
-    LOG_PRINT("/");
-    LOG_PRINT(HealthCode(g_pulseHealth));
-    LOG_PRINT(" t=");
-    LOG_PRINT(g_icmLsmCrossCheckTrust, 2);
-    LOG_PRINT("/");
-    LOG_PRINT(g_bnoReferenceCrossCheckTrust, 2);
-    LOG_PRINT("/");
-    LOG_PRINT(g_pulseCrossCheckTrust, 2);
-    LOG_PRINT(" lsmdbg=m");
-    LOG_PRINT(lsm.hasMag ? '1' : '0');
-    LOG_PRINT(" ga=");
-    LOG_PRINT(lsm.groundAlignmentSampleCount);
-    LOG_PRINT("/");
-    LOG_PRINT(settings::sensors::lsm9ds1::kGroundAlignmentMinSamples);
-    LOG_PRINT(" at=");
-    LOG_PRINT(lsm.lastAccelTrust, 2);
-    LOG_PRINT(" mt=");
-    LOG_PRINT(lsm.lastMagTrust, 2);
-    LOG_PRINT(" am=");
-    LOG_PRINT(lsm.lastAccelMagnitudeG, 2);
-    LOG_PRINT(" mm=");
-    LOG_PRINT(lsm.lastMagMagnitude, 1);
-    LOG_PRINT(" mr=");
-    LOG_PRINT(lsm.magReferenceNorm, 1);
-    LOG_PRINT(" byaw=");
-    LOG_PRINT(bno.yprDeg[0], 1);
-    LOG_PRINT(" iboot=");
-    if (icm.hasBootstrapYpr) {
-        LOG_PRINT("(");
-        LOG_PRINT(icm.bootstrapYprDeg[0], 1);
-        LOG_PRINT(",");
-        LOG_PRINT(icm.bootstrapYprDeg[1], 1);
-        LOG_PRINT(",");
-        LOG_PRINT(icm.bootstrapYprDeg[2], 1);
-        LOG_PRINT(")");
-    } else {
-        LOG_PRINT("na");
-    }
-    LOG_PRINT(" lboot=");
-    if (lsm.hasBootstrapYpr) {
-        LOG_PRINT("(");
-        LOG_PRINT(lsm.bootstrapYprDeg[0], 1);
-        LOG_PRINT(",");
-        LOG_PRINT(lsm.bootstrapYprDeg[1], 1);
-        LOG_PRINT(",");
-        LOG_PRINT(lsm.bootstrapYprDeg[2], 1);
-        LOG_PRINT(")");
-    } else {
-        LOG_PRINT("na");
-    }
-    LOG_PRINT(" bboot=");
-    if (bno.hasBootstrapYpr) {
-        LOG_PRINT("(");
-        LOG_PRINT(bno.bootstrapYprDeg[0], 1);
-        LOG_PRINT(",");
-        LOG_PRINT(bno.bootstrapYprDeg[1], 1);
-        LOG_PRINT(",");
-        LOG_PRINT(bno.bootstrapYprDeg[2], 1);
-        LOG_PRINT(")");
-    } else {
-        LOG_PRINT("na");
-    }
-    LOG_PRINT(" iaccg=(");
-    LOG_PRINT(icm.accelPreMountG[0], 2);
-    LOG_PRINT(",");
-    LOG_PRINT(icm.accelPreMountG[1], 2);
-    LOG_PRINT(",");
-    LOG_PRINT(icm.accelPreMountG[2], 2);
-    LOG_PRINT(")");
-    LOG_PRINT(" iacc=(");
-    LOG_PRINT(icm.accelBodyMps2[0], 2);
-    LOG_PRINT(",");
-    LOG_PRINT(icm.accelBodyMps2[1], 2);
-    LOG_PRINT(",");
-    LOG_PRINT(icm.accelBodyMps2[2], 2);
-    LOG_PRINT(")");
-    LOG_PRINT(" imag0=(");
-    LOG_PRINT(icm.magPreAxis[0], 2);
-    LOG_PRINT(",");
-    LOG_PRINT(icm.magPreAxis[1], 2);
-    LOG_PRINT(",");
-    LOG_PRINT(icm.magPreAxis[2], 2);
-    LOG_PRINT(")");
-    LOG_PRINT(" imag=(");
-    LOG_PRINT(icm.magBody[0], 2);
-    LOG_PRINT(",");
-    LOG_PRINT(icm.magBody[1], 2);
-    LOG_PRINT(",");
-    LOG_PRINT(icm.magBody[2], 2);
-    LOG_PRINT(")");
-    LOG_PRINT(" lmag=(");
-    LOG_PRINT(lsm.magBody[0], 2);
-    LOG_PRINT(",");
-    LOG_PRINT(lsm.magBody[1], 2);
-    LOG_PRINT(",");
-    LOG_PRINT(lsm.magBody[2], 2);
-    LOG_PRINT(")");
-    LOG_PRINT(" bmag=(");
-    LOG_PRINT(bno.magBody[0], 2);
-    LOG_PRINT(",");
-    LOG_PRINT(bno.magBody[1], 2);
-    LOG_PRINT(",");
-    LOG_PRINT(bno.magBody[2], 2);
-    LOG_PRINT(")");
-    LOG_PRINT(" logger=");
-    LOG_PRINT(logger.initialized ? "ok" : "down");
-    LOG_PRINTLN("");
+    LOG_PRINT(" nodata=");
+    LOG_PRINTLN(g_sensorAcquireStats.noDataLoops);
 
     g_timingStats = TimingStats{};
     g_sensorAcquireStats = SensorAcquireStats{};
@@ -2724,7 +2880,7 @@ static void ServiceStatusLeds(uint32_t nowMs, bool manualOverrideActive) {
     // In replay mode missing sensors are not treated as a hardware fault.
     const bool faultActive =
         !DataLoggerIsInitialized() ||
-        (!g_csvReplay.enabled && ((kBnoEnabled && !Bno085SensorIsInitialized()) || !Bmp585SensorIsInitialized()));
+        (!g_csvReplay.enabled && ((kBnoEnabled && !BnoSensorIsInitialized()) || !Bmp585SensorIsInitialized()));
     StatusLedsSetFault(faultActive);
     StatusLedsSetFlightStatus(flightComputer.Status());
     StatusLedsSetComms(NetworkTelemetryConnected(), NetworkTelemetrySubscriberActive());
@@ -2854,13 +3010,16 @@ void setup() {
 
     if (!g_csvReplay.enabled) {
         if (kBnoEnabled) {
-            LOG_PRINTLN("Configured BNO sensor: BNO085 over I2C");
+            LOG_PRINT("Configured BNO sensor: ");
+            LOG_PRINT(BnoSensorModelName());
+            LOG_PRINT(" over ");
+            LOG_PRINTLN(BnoSensorTransportName());
             LogSetupCheckpoint("starting BNO init");
             BootLedSlowBlink();
             RetryServiceUntilReady(g_bnoRetry,
-                                   &Bno085SensorIsInitialized,
+                                   &BnoSensorIsInitialized,
                                    &StartBnoDuringSetup,
-                                   "bno085",
+                                   "bno",
                                    "BNO unavailable, retrying",
                                    kCriticalStartupResetAttempts);
             LogSetupCheckpoint("BNO init complete");
@@ -2877,6 +3036,16 @@ void setup() {
             BootLedSlowBlink();
         } else {
             LogSetupCheckpoint("Pulse20 disabled");
+        }
+
+        if (kWt901Enabled) {
+            LogSetupCheckpoint("starting WT901 init");
+            BootLedSlowBlink();
+            Wt901SensorBegin();
+            LogSetupCheckpoint(Wt901SensorIsInitialized() ? "WT901 init complete" : "WT901 unavailable");
+            BootLedSlowBlink();
+        } else {
+            LogSetupCheckpoint("WT901 disabled");
         }
 
         LogSetupCheckpoint("starting ICM-20948 init");
@@ -3004,9 +3173,9 @@ void loop() {
 
     if (!g_csvReplay.enabled) {
         if (kBnoEnabled) {
-            ServiceRetry(nowMs, g_bnoRetry, Bno085SensorIsInitialized(), &StartBnoDuringSetup, "bno085");
-            if (!Bno085SensorIsInitialized() && g_bnoRetry.attempts >= kCriticalStartupResetAttempts) {
-                ForceTeensyRebootIfSafe("bno085");
+            ServiceRetry(nowMs, g_bnoRetry, BnoSensorIsInitialized(), &StartBnoDuringSetup, "bno");
+            if (!BnoSensorIsInitialized() && g_bnoRetry.attempts >= kCriticalStartupResetAttempts) {
+                ForceTeensyRebootIfSafe("bno");
             }
         }
         ServiceRetry(nowMs, g_dataLoggerRetry, DataLoggerIsInitialized(), &DataLoggerBegin, "data_logger");
@@ -3021,6 +3190,9 @@ void loop() {
 
     if (!g_csvReplay.enabled) {
         ServiceRetry(nowMs, g_icmRetry, Icm20948SensorIsInitialized(), &Icm20948SensorBegin, "icm20948");
+        if (kWt901Enabled && !Wt901SensorIsInitialized()) {
+            Wt901SensorBegin();
+        }
         if (kLsmEnabled && !Lsm9ds1SensorIsInitialized()) {
             Lsm9ds1SensorBegin();
         }
@@ -3060,6 +3232,7 @@ void loop() {
         ServiceStatusLeds(nowMs, false);
     }
 
+    g_healthPhase = flightComputer.Status();
     SensorData data;
     const uint32_t sensorAcquireStartUs = micros();
     const bool hasSensorData = AcquireSensorData(data);
@@ -3169,7 +3342,8 @@ void loop() {
     data.predictorSeedConfidenceFlags = autoTelemetry.predictorSeedConfidenceFlags;
 
     if (!g_csvReplay.enabled) {
-        DataLoggerLogTelemetry(data, flightComputer.Status(), hasFilteredState ? &state : nullptr);
+        DataLoggerLogTelemetry(
+            data, flightComputer.Status(), hasFilteredState ? &state : nullptr, g_servoCommandDeg, g_servoEffectiveDeg);
     }
 
     if (hasFilteredState) {
@@ -3178,33 +3352,40 @@ void loop() {
             DataLoggerLogEvent(FlightEventType::StageChange,
                                status,
                                state.time,
-                               state.position[2],
-                               state.velocity[2],
-                               state.apogeeEstimate);
+                               state.position[2] * constants::kMetersToFeet,
+                               state.velocity[2] * constants::kMetersToFeet,
+                               state.apogeeEstimate * constants::kMetersToFeet,
+                               g_servoCommandDeg,
+                               g_servoEffectiveDeg);
             g_lastLoggedStatus = status;
             g_hasLoggedStatus = true;
         }
     }
 
     const float eventTimestamp = hasFilteredState ? state.time : data.timestamp;
-    const float eventAltitudeMeters = hasFilteredState ? state.position[2] : 0.0f;
-    const float eventVerticalVelocity = hasFilteredState ? state.velocity[2] : 0.0f;
-    const float eventApogeeEstimate = hasFilteredState ? state.apogeeEstimate : 0.0f;
+    const float eventAltitudeFeet = hasFilteredState ? (state.position[2] * constants::kMetersToFeet) : 0.0f;
+    const float eventVerticalVelocityFps = hasFilteredState ? (state.velocity[2] * constants::kMetersToFeet) : 0.0f;
+    const float eventApogeeEstimateFeet =
+        hasFilteredState ? (state.apogeeEstimate * constants::kMetersToFeet) : 0.0f;
     if (g_flapActuator.ConsumeActuationEvent()) {
         DataLoggerLogEvent(FlightEventType::FlapActuated,
                            flightComputer.Status(),
                            eventTimestamp,
-                           eventAltitudeMeters,
-                           eventVerticalVelocity,
-                           eventApogeeEstimate);
+                           eventAltitudeFeet,
+                           eventVerticalVelocityFps,
+                           eventApogeeEstimateFeet,
+                           g_servoCommandDeg,
+                           g_servoEffectiveDeg);
     }
     if (g_flapActuator.ConsumeSettlingTimerFiredEvent()) {
         DataLoggerLogEvent(FlightEventType::FlapSettlingTimerFired,
                            flightComputer.Status(),
                            eventTimestamp,
-                           eventAltitudeMeters,
-                           eventVerticalVelocity,
-                           eventApogeeEstimate);
+                           eventAltitudeFeet,
+                           eventVerticalVelocityFps,
+                           eventApogeeEstimateFeet,
+                           g_servoCommandDeg,
+                           g_servoEffectiveDeg);
     }
 
     if (g_flapActuator.IsSettling()) {
@@ -3217,16 +3398,16 @@ void loop() {
         LOG_PRINT(state.time, 3);
         LOG_PRINT(" alt=");
         LOG_PRINT(data.altitudeFeet, 2);
-        LOG_PRINT(" z=");
-        LOG_PRINT(state.position[2], 2);
-        LOG_PRINT(" vz=");
-        LOG_PRINT(state.velocity[2], 2);
+        LOG_PRINT(" zft=");
+        LOG_PRINT(state.position[2] * constants::kMetersToFeet, 2);
+        LOG_PRINT(" vzfps=");
+        LOG_PRINT(state.velocity[2] * constants::kMetersToFeet, 2);
         LOG_PRINT(" az=");
         LOG_PRINT(state.acceleration[2], 2);
         LOG_PRINT(" iaz=");
         LOG_PRINT(state.inertialAcceleration[2], 2);
-        LOG_PRINT(" apg=");
-        LOG_PRINT(state.apogeeEstimate, 2);
+        LOG_PRINT(" apgft=");
+        LOG_PRINT(state.apogeeEstimate * constants::kMetersToFeet, 2);
         LOG_PRINT(" cmd=");
         LOG_PRINT(g_servoCommandDeg, 1);
         LOG_PRINT(" eff=");

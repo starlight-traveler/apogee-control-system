@@ -15,9 +15,10 @@ from typing import BinaryIO, Iterable, Iterator, Tuple
 
 
 _RECORD_HEADER_STRUCT = struct.Struct("<BBBB")
-_SENSOR_STRUCT = struct.Struct("<ff fff fff ffff fff ffff fff ff fffff ???x")
-_FILTERED_STRUCT = struct.Struct("<f fff fff fff fff f f")
-_EVENT_PAYLOAD_STRUCT = struct.Struct("<ffff")
+_LOG_PREAMBLE_STRUCT = struct.Struct("<8sHH40s12s")
+_LOG_MAGIC = b"ACSNDRT1"
+_TELEMETRY_STRUCT = struct.Struct("<58f16B")
+_EVENT_PAYLOAD_STRUCT = struct.Struct("<6f")
 
 _FLIGHT_STATUS_NAMES = {
     0: "ground",
@@ -33,64 +34,94 @@ _EVENT_TYPE_NAMES = {
     2: "flap_settling_timer_fired",
 }
 
-_SENSOR_FIELD_NAMES = [
+_TELEMETRY_FLOAT_FIELD_NAMES = [
     "sensor_timestamp",
     "sensor_altitude_feet",
-    "sensor_accel_bno_x",
-    "sensor_accel_bno_y",
-    "sensor_accel_bno_z",
     "sensor_accel_icm_x",
     "sensor_accel_icm_y",
     "sensor_accel_icm_z",
+    "sensor_gyro_x",
+    "sensor_gyro_y",
+    "sensor_gyro_z",
     "sensor_quat_w",
     "sensor_quat_x",
     "sensor_quat_y",
     "sensor_quat_z",
-    "sensor_gyro_x",
-    "sensor_gyro_y",
-    "sensor_gyro_z",
     "sensor_icm_quat_w",
     "sensor_icm_quat_x",
     "sensor_icm_quat_y",
     "sensor_icm_quat_z",
-    "sensor_icm_yaw_deg",
-    "sensor_icm_pitch_deg",
-    "sensor_icm_roll_deg",
-    "sensor_altimeter_sigma_scale",
-    "sensor_altimeter_gate_sigma",
-    "sensor_auto_cmd_deg",
-    "sensor_optimizer_best_predicted_apogee_m",
-    "sensor_optimizer_best_cost",
-    "sensor_optimizer_time_to_apogee_s",
-    "sensor_actuation_is_settling",
+    "sensor_accel_lsm_x",
+    "sensor_accel_lsm_y",
+    "sensor_accel_lsm_z",
+    "sensor_gyro_lsm_x",
+    "sensor_gyro_lsm_y",
+    "sensor_gyro_lsm_z",
+    "sensor_lsm_quat_w",
+    "sensor_lsm_quat_x",
+    "sensor_lsm_quat_y",
+    "sensor_lsm_quat_z",
+    "sensor_flap_command_deg",
+    "sensor_flap_effective_deg",
+    "state_altitude_agl_feet",
+    "state_vertical_velocity_fps",
+    "state_zenith_deg",
+    "state_apogee_estimate_feet",
+    "sensor_accel_bno_x",
+    "sensor_accel_bno_y",
+    "sensor_accel_bno_z",
+    "sensor_gyro_bno_x",
+    "sensor_gyro_bno_y",
+    "sensor_gyro_bno_z",
+    "sensor_bno_quat_w",
+    "sensor_bno_quat_x",
+    "sensor_bno_quat_y",
+    "sensor_bno_quat_z",
+    "sensor_bno_yaw_deg",
+    "sensor_bno_pitch_deg",
+    "sensor_bno_roll_deg",
+    "sensor_accel_wt901_x",
+    "sensor_accel_wt901_y",
+    "sensor_accel_wt901_z",
+    "sensor_wt901_yaw_deg",
+    "sensor_wt901_pitch_deg",
+    "sensor_wt901_roll_deg",
+    "sensor_gyro_wt901_x",
+    "sensor_gyro_wt901_y",
+    "sensor_gyro_wt901_z",
+    "sensor_wt901_quat_w",
+    "sensor_wt901_quat_x",
+    "sensor_wt901_quat_y",
+    "sensor_wt901_quat_z",
+]
+
+_TELEMETRY_U8_FIELD_NAMES = [
+    "sensor_main_quaternion_source",
+]
+
+_TELEMETRY_BOOL_FIELD_NAMES = [
     "sensor_has_quaternion",
     "sensor_has_icm_quaternion",
-    "sensor_has_icm_ypr",
+    "sensor_has_lsm_quaternion",
+    "sensor_icm_accel_saturated",
+    "sensor_icm_gyro_saturated",
+    "sensor_actuation_is_settling",
+    "sensor_has_bno_quaternion",
+    "sensor_has_bno_ypr",
+    "sensor_has_wt901_accel",
+    "sensor_has_wt901_ypr",
+    "sensor_has_wt901_gyro",
+    "sensor_has_wt901_quaternion",
 ]
 
-_FILTERED_FIELD_NAMES = [
-    "state_time",
-    "state_position_x",
-    "state_position_y",
-    "state_position_z",
-    "state_velocity_x",
-    "state_velocity_y",
-    "state_velocity_z",
-    "state_acceleration_x",
-    "state_acceleration_y",
-    "state_acceleration_z",
-    "state_inertial_acceleration_x",
-    "state_inertial_acceleration_y",
-    "state_inertial_acceleration_z",
-    "state_zenith",
-    "state_apogee_estimate",
+_TELEMETRY_FIELD_NAMES = [
+    "flight_status",
+    "flight_status_raw",
+    "has_filtered_state",
+    *_TELEMETRY_FLOAT_FIELD_NAMES,
+    *_TELEMETRY_U8_FIELD_NAMES,
+    *_TELEMETRY_BOOL_FIELD_NAMES,
 ]
-
-_TELEMETRY_FIELD_NAMES = (
-    ["flight_status", "flight_status_raw", "has_filtered_state"]
-    + _SENSOR_FIELD_NAMES
-    + _FILTERED_FIELD_NAMES
-)
 
 
 def _flight_status_name(value: int) -> str:
@@ -103,6 +134,17 @@ def _event_type_name(value: int) -> str:
 
 def _iter_records(stream: BinaryIO) -> Iterator[Tuple[str, dict]]:
     offset = 0
+
+    preamble = stream.read(_LOG_PREAMBLE_STRUCT.size)
+    if len(preamble) == _LOG_PREAMBLE_STRUCT.size:
+        magic, _format_version, _schema_version, _firmware_hash, _reserved = _LOG_PREAMBLE_STRUCT.unpack(preamble)
+        if magic == _LOG_MAGIC:
+            offset += _LOG_PREAMBLE_STRUCT.size
+        else:
+            stream.seek(0)
+    else:
+        stream.seek(0)
+
     while True:
         record_offset = offset
         header_data = stream.read(_RECORD_HEADER_STRUCT.size)
@@ -117,24 +159,18 @@ def _iter_records(stream: BinaryIO) -> Iterator[Tuple[str, dict]]:
         offset += _RECORD_HEADER_STRUCT.size
 
         if record_type == 0:
-            payload_size = _SENSOR_STRUCT.size + _FILTERED_STRUCT.size
-            payload = stream.read(payload_size)
-            if len(payload) != payload_size:
+            payload = stream.read(_TELEMETRY_STRUCT.size)
+            if len(payload) != _TELEMETRY_STRUCT.size:
                 raise ValueError(
                     f"Encountered truncated telemetry record at byte offset {record_offset}."
                 )
-
-            sensor_values = _SENSOR_STRUCT.unpack(payload[: _SENSOR_STRUCT.size])
-            state_values = _FILTERED_STRUCT.unpack(payload[_SENSOR_STRUCT.size :])
-            offset += payload_size
-
+            offset += _TELEMETRY_STRUCT.size
             yield (
                 "telemetry",
                 {
                     "status": subtype,
                     "has_filtered_state": bool(flags & 0x01),
-                    "sensor": sensor_values,
-                    "state": state_values,
+                    "values": _TELEMETRY_STRUCT.unpack(payload),
                 },
             )
         elif record_type == 1:
@@ -144,7 +180,14 @@ def _iter_records(stream: BinaryIO) -> Iterator[Tuple[str, dict]]:
                     f"Encountered truncated event record at byte offset {record_offset}."
                 )
 
-            timestamp, altitude, velocity, apogee = _EVENT_PAYLOAD_STRUCT.unpack(payload)
+            (
+                timestamp,
+                altitude_agl_feet,
+                vertical_velocity_fps,
+                apogee_estimate_feet,
+                flap_command_deg,
+                flap_effective_deg,
+            ) = _EVENT_PAYLOAD_STRUCT.unpack(payload)
             offset += _EVENT_PAYLOAD_STRUCT.size
 
             yield (
@@ -153,9 +196,11 @@ def _iter_records(stream: BinaryIO) -> Iterator[Tuple[str, dict]]:
                     "event_type": subtype,
                     "flight_status": flags,
                     "timestamp": timestamp,
-                    "altitude_meters": altitude,
-                    "vertical_velocity": velocity,
-                    "apogee_estimate": apogee,
+                    "altitude_agl_feet": altitude_agl_feet,
+                    "vertical_velocity_fps": vertical_velocity_fps,
+                    "apogee_estimate_feet": apogee_estimate_feet,
+                    "flap_command_deg": flap_command_deg,
+                    "flap_effective_deg": flap_effective_deg,
                 },
             )
         else:
@@ -171,18 +216,21 @@ def _build_telemetry_row(data: dict) -> dict:
         "has_filtered_state": data["has_filtered_state"],
     }
 
-    for name, value in zip(_SENSOR_FIELD_NAMES, data["sensor"]):
-        if name in {"sensor_has_quaternion", "sensor_has_icm_quaternion", "sensor_has_icm_ypr"}:
-            row[name] = bool(value)
-        else:
-            row[name] = value
+    values = data["values"]
+    float_count = len(_TELEMETRY_FLOAT_FIELD_NAMES)
+    u8_count = len(_TELEMETRY_U8_FIELD_NAMES)
+    bool_count = len(_TELEMETRY_BOOL_FIELD_NAMES)
 
-    if data["has_filtered_state"]:
-        for name, value in zip(_FILTERED_FIELD_NAMES, data["state"]):
-            row[name] = value
-    else:
-        for name in _FILTERED_FIELD_NAMES:
-            row[name] = ""
+    float_values = values[:float_count]
+    u8_values = values[float_count : float_count + u8_count]
+    bool_values = values[float_count + u8_count : float_count + u8_count + bool_count]
+
+    for name, value in zip(_TELEMETRY_FLOAT_FIELD_NAMES, float_values):
+        row[name] = value
+    for name, value in zip(_TELEMETRY_U8_FIELD_NAMES, u8_values):
+        row[name] = value
+    for name, value in zip(_TELEMETRY_BOOL_FIELD_NAMES, bool_values):
+        row[name] = bool(value)
 
     return row
 
@@ -194,9 +242,11 @@ def _build_event_object(data: dict) -> dict:
         "flight_status": _flight_status_name(data["flight_status"]),
         "flight_status_raw": data["flight_status"],
         "timestamp": data["timestamp"],
-        "altitude_meters": data["altitude_meters"],
-        "vertical_velocity": data["vertical_velocity"],
-        "apogee_estimate": data["apogee_estimate"],
+        "altitude_agl_feet": data["altitude_agl_feet"],
+        "vertical_velocity_fps": data["vertical_velocity_fps"],
+        "apogee_estimate_feet": data["apogee_estimate_feet"],
+        "flap_command_deg": data["flap_command_deg"],
+        "flap_effective_deg": data["flap_effective_deg"],
     }
 
 

@@ -19,10 +19,11 @@ constexpr int8_t kBnoResetPin = settings::sensors::bno055::kResetPin;
 constexpr uint32_t kDataTimeoutUs = settings::sensors::bno055::kDataTimeoutUs;
 constexpr uint8_t kQuaternionInvalidDropThreshold = 2;
 
-Adafruit_BNO055 g_bno(55, kBnoI2cAddress, &Wire);
+Adafruit_BNO055 g_bno(55, kBnoI2cAddress, &Wire1);
 bool g_initialized = false;
 uint32_t g_lastSampleUs = 0;
 uint32_t g_lastHealthyEventUs = 0;
+bool g_lastAcquireFresh = false;
 
 float g_lastAccel[3] = {0.0f, 0.0f, 0.0f};
 float g_lastGyro[3] = {0.0f, 0.0f, 0.0f};
@@ -38,6 +39,7 @@ void ResetCachedState() {
     g_haveAccel = false;
     g_haveGyro = false;
     g_haveQuat = false;
+    g_lastAcquireFresh = false;
     g_invalidQuaternionStreak = 0;
 }
 
@@ -46,7 +48,7 @@ bool StartSensorTransport() {
         LOG_PRINTLN("BNO055 only supports I2C in this firmware build");
         return false;
     }
-    Wire.begin();
+    Wire1.begin();
     if (!g_bno.begin()) {
         return false;
     }
@@ -79,18 +81,17 @@ bool RecoverSensor(const char *reason) {
 
 void PopulateOutput(SensorData &out, uint32_t nowUs) {
     const bool quaternionValid = g_haveQuat && math_utils::ValidateQuaternionArray(g_lastQuat);
-    out.timestamp = static_cast<float>(nowUs) * 1.0e-6f;
     out.accelBNO[0] = g_haveAccel ? g_lastAccel[0] : 0.0f;
     out.accelBNO[1] = g_haveAccel ? g_lastAccel[1] : 0.0f;
     out.accelBNO[2] = g_haveAccel ? g_lastAccel[2] : 0.0f;
-    out.gyro[0] = g_haveGyro ? g_lastGyro[0] : 0.0f;
-    out.gyro[1] = g_haveGyro ? g_lastGyro[1] : 0.0f;
-    out.gyro[2] = g_haveGyro ? g_lastGyro[2] : 0.0f;
-    out.quaternion[0] = g_lastQuat[0];
-    out.quaternion[1] = g_lastQuat[1];
-    out.quaternion[2] = g_lastQuat[2];
-    out.quaternion[3] = g_lastQuat[3];
-    out.hasQuaternion = quaternionValid;
+    out.gyroBNO[0] = g_haveGyro ? g_lastGyro[0] : 0.0f;
+    out.gyroBNO[1] = g_haveGyro ? g_lastGyro[1] : 0.0f;
+    out.gyroBNO[2] = g_haveGyro ? g_lastGyro[2] : 0.0f;
+    out.quaternionBNO[0] = quaternionValid ? g_lastQuat[0] : 1.0f;
+    out.quaternionBNO[1] = quaternionValid ? g_lastQuat[1] : 0.0f;
+    out.quaternionBNO[2] = quaternionValid ? g_lastQuat[2] : 0.0f;
+    out.quaternionBNO[3] = quaternionValid ? g_lastQuat[3] : 0.0f;
+    out.hasBnoQuaternion = quaternionValid;
 }
 
 }  // namespace
@@ -108,6 +109,7 @@ bool Bno055SensorAcquire(SensorData &out) {
     }
 
     const uint32_t nowUs = micros();
+    g_lastAcquireFresh = false;
     if (g_lastHealthyEventUs != 0 && (nowUs - g_lastHealthyEventUs) > kDataTimeoutUs) {
         return RecoverSensor("data timeout");
     }
@@ -155,6 +157,7 @@ bool Bno055SensorAcquire(SensorData &out) {
     g_haveAccel = true;
     g_haveGyro = true;
     g_lastHealthyEventUs = nowUs;
+    g_lastAcquireFresh = true;
 
     PopulateOutput(out, nowUs);
     return true;
@@ -162,4 +165,58 @@ bool Bno055SensorAcquire(SensorData &out) {
 
 bool Bno055SensorIsInitialized() {
     return g_initialized;
+}
+
+BnoDiagnostics Bno055SensorGetDiagnostics() {
+    BnoDiagnostics diagnostics;
+    const uint32_t nowUs = micros();
+    diagnostics.transportReady = g_initialized;
+    diagnostics.hasAccel = g_haveAccel && g_lastHealthyEventUs != 0 && (nowUs - g_lastHealthyEventUs) <= kDataTimeoutUs;
+    diagnostics.hasGyro = diagnostics.hasAccel && g_haveGyro;
+    diagnostics.hasQuaternion = diagnostics.hasAccel && g_haveQuat && math_utils::ValidateQuaternionArray(g_lastQuat);
+    diagnostics.lastAcquireFresh = g_lastAcquireFresh;
+    diagnostics.accelBodyMps2[0] = g_lastAccel[0];
+    diagnostics.accelBodyMps2[1] = g_lastAccel[1];
+    diagnostics.accelBodyMps2[2] = g_lastAccel[2];
+    if (diagnostics.hasQuaternion) {
+        float yaw = 0.0f;
+        float pitch = 0.0f;
+        float roll = 0.0f;
+        const math_utils::Quaternion quat =
+            math_utils::MakeQuaternion(g_lastQuat[0], g_lastQuat[1], g_lastQuat[2], g_lastQuat[3]);
+        math_utils::QuaternionToEuler(quat, yaw, pitch, roll);
+        diagnostics.yprDeg[0] = yaw * 57.295779513082320876f;
+        diagnostics.yprDeg[1] = pitch * 57.295779513082320876f;
+        diagnostics.yprDeg[2] = roll * 57.295779513082320876f;
+    }
+    return diagnostics;
+}
+
+BnoSample Bno055SensorGetSample() {
+    BnoSample sample;
+    const uint32_t nowUs = micros();
+    const bool fresh = g_lastHealthyEventUs != 0 && (nowUs - g_lastHealthyEventUs) <= kDataTimeoutUs;
+    sample.hasAccel = fresh && g_haveAccel;
+    sample.hasGyro = fresh && g_haveGyro;
+    sample.hasQuaternion = fresh && g_haveQuat && math_utils::ValidateQuaternionArray(g_lastQuat);
+    sample.accelMicros = sample.hasAccel ? g_lastHealthyEventUs : 0;
+    sample.gyroMicros = sample.hasGyro ? g_lastHealthyEventUs : 0;
+    sample.quaternionMicros = sample.hasQuaternion ? g_lastHealthyEventUs : 0;
+    sample.sampleMicros = g_lastHealthyEventUs;
+    if (sample.hasAccel) {
+        for (int i = 0; i < 3; ++i) {
+            sample.accel[i] = g_lastAccel[i];
+        }
+    }
+    if (sample.hasGyro) {
+        for (int i = 0; i < 3; ++i) {
+            sample.gyro[i] = g_lastGyro[i];
+        }
+    }
+    if (sample.hasQuaternion) {
+        for (int i = 0; i < 4; ++i) {
+            sample.quaternion[i] = g_lastQuat[i];
+        }
+    }
+    return sample;
 }

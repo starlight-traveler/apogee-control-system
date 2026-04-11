@@ -6,8 +6,11 @@
 #include <string.h>
 #include <type_traits>
 
+#include "bno_sensor.h"
+#include "constants.h"
 #include "settings.h"
 #include "serial_logging.h"
+#include "wt901_sensor.h"
 
 namespace {
 
@@ -33,7 +36,7 @@ constexpr uint32_t kHardFlushIntervalMicros = kFlushIntervalMicros * 4u;
 constexpr const char *kLogPrefix = "SENS";
 constexpr const char *kLogExtension = "BIN";
 constexpr uint16_t kLogFileFormatVersion = 1;
-constexpr uint16_t kLogSchemaVersion = 7;
+constexpr uint16_t kLogSchemaVersion = 10;
 constexpr uint8_t kLogMagic[8] = {'A', 'C', 'S', 'N', 'D', 'R', 'T', '1'};
 
 #if defined(ACS_FIRMWARE_GIT_HASH)
@@ -45,18 +48,82 @@ constexpr const char *kFirmwareGitHash = "unknown";
 // These static asserts are the first line of defense for the binary schema.
 // If any of them changes, the decoder table in tools/decode/native must be
 // updated in lockstep before new logs are trusted.
-static_assert(sizeof(SensorData) == 304, "SensorData size mismatch.");
-static_assert(sizeof(FilteredState) == 60, "FilteredState size mismatch.");
-static_assert(sizeof(TelemetryLogRecord) == 368, "TelemetryLogRecord size mismatch.");
-static_assert(sizeof(EventLogRecord) == 20, "EventLogRecord size mismatch.");
+static_assert(sizeof(LoggedTelemetrySample) == 248, "LoggedTelemetrySample size mismatch.");
+static_assert(sizeof(TelemetryLogRecord) == 252, "TelemetryLogRecord size mismatch.");
+static_assert(sizeof(EventLogRecord) == 28, "EventLogRecord size mismatch.");
 static_assert(sizeof(LogFilePreamble) == 64, "LogFilePreamble size mismatch.");
 
-static_assert(std::is_trivially_copyable<SensorData>::value, "SensorData must be trivially copyable.");
-static_assert(std::is_trivially_copyable<FilteredState>::value, "FilteredState must be trivially copyable.");
+static_assert(std::is_trivially_copyable<LoggedTelemetrySample>::value,
+              "LoggedTelemetrySample must be trivially copyable.");
 static_assert(std::is_trivially_copyable<TelemetryLogRecord>::value,
               "TelemetryLogRecord must be trivially copyable.");
 static_assert(std::is_trivially_copyable<EventLogRecord>::value,
               "EventLogRecord must be trivially copyable.");
+
+constexpr float kRadToDeg = 57.295779513082320876f;
+
+void CopyVec3(const float src[3], float dst[3]) {
+    dst[0] = src[0];
+    dst[1] = src[1];
+    dst[2] = src[2];
+}
+
+void CopyQuat(const float src[4], float dst[4]) {
+    dst[0] = src[0];
+    dst[1] = src[1];
+    dst[2] = src[2];
+    dst[3] = src[3];
+}
+
+LoggedTelemetrySample BuildLoggedTelemetrySample(const SensorData &sensor,
+                                                 const FilteredState *state,
+                                                 float flapCommandDeg,
+                                                 float flapEffectiveDeg) {
+    const BnoDiagnostics bnoDiagnostics = BnoSensorGetDiagnostics();
+    const Wt901Diagnostics wt901Diagnostics = Wt901SensorGetDiagnostics();
+    LoggedTelemetrySample sample{};
+    sample.timestamp = sensor.timestamp;
+    sample.altitudeFeet = sensor.altitudeFeet;
+    CopyVec3(sensor.accelICM, sample.accelIcm);
+    CopyVec3(sensor.gyro, sample.gyroIcm);
+    CopyQuat(sensor.quaternion, sample.quaternionMain);
+    CopyQuat(sensor.icmQuaternion, sample.quaternionIcm);
+    CopyVec3(sensor.accelLSM, sample.accelLsm);
+    CopyVec3(sensor.gyroLSM, sample.gyroLsm);
+    CopyQuat(sensor.quaternionLSM, sample.quaternionLsm);
+    sample.flapCommandDeg = flapCommandDeg;
+    sample.flapEffectiveDeg = flapEffectiveDeg;
+    sample.mainQuaternionSource = sensor.mainQuaternionSource;
+    sample.hasQuaternion = sensor.hasQuaternion ? 1u : 0u;
+    sample.hasIcmQuaternion = sensor.hasIcmQuaternion ? 1u : 0u;
+    sample.hasLsmQuaternion = sensor.hasLsmQuaternion ? 1u : 0u;
+    sample.icmAccelSaturated = sensor.icmAccelSaturated ? 1u : 0u;
+    sample.icmGyroSaturated = sensor.icmGyroSaturated ? 1u : 0u;
+    sample.actuationIsSettling = (sensor.actuationIsSettling > 0.5f) ? 1u : 0u;
+    CopyVec3(sensor.accelBNO, sample.accelBno);
+    CopyVec3(sensor.gyroBNO, sample.gyroBno);
+    CopyQuat(sensor.quaternionBNO, sample.quaternionBno);
+    CopyVec3(bnoDiagnostics.yprDeg, sample.bnoYprDeg);
+    CopyVec3(wt901Diagnostics.accelBodyMps2, sample.accelWt901);
+    CopyVec3(wt901Diagnostics.yprDeg, sample.wt901YprDeg);
+    CopyVec3(wt901Diagnostics.gyroBodyRadPerSec, sample.gyroWt901);
+    CopyQuat(wt901Diagnostics.quaternion, sample.quaternionWt901);
+    sample.hasBnoQuaternion = sensor.hasBnoQuaternion ? 1u : 0u;
+    sample.hasBnoYpr = bnoDiagnostics.hasQuaternion ? 1u : 0u;
+    sample.hasWt901Accel = wt901Diagnostics.hasAccel ? 1u : 0u;
+    sample.hasWt901Ypr = wt901Diagnostics.hasYpr ? 1u : 0u;
+    sample.hasWt901Gyro = wt901Diagnostics.hasGyro ? 1u : 0u;
+    sample.hasWt901Quaternion = wt901Diagnostics.hasQuaternion ? 1u : 0u;
+
+    if (state != nullptr) {
+        sample.altitudeAglFeet = state->position[2] * constants::kMetersToFeet;
+        sample.verticalVelocityFps = state->velocity[2] * constants::kMetersToFeet;
+        sample.zenithDeg = state->zenith * kRadToDeg;
+        sample.apogeeEstimateFeet = state->apogeeEstimate * constants::kMetersToFeet;
+    }
+
+    return sample;
+}
 
 /// Tracks the maximum observed value for a timing diagnostic.
 void UpdateMax(uint32_t sample, uint32_t &maximum) {
@@ -242,7 +309,11 @@ bool DataLoggerBegin() {
 }
 
 /// Serializes and buffers one telemetry record.
-void DataLoggerLogTelemetry(const SensorData &sensor, FlightStatus status, const FilteredState *state) {
+void DataLoggerLogTelemetry(const SensorData &sensor,
+                            FlightStatus status,
+                            const FilteredState *state,
+                            float flapCommandDeg,
+                            float flapEffectiveDeg) {
     if (!g_loggerInitialized) {
         return;
     }
@@ -251,10 +322,7 @@ void DataLoggerLogTelemetry(const SensorData &sensor, FlightStatus status, const
     record.header.recordType = static_cast<uint8_t>(LogRecordType::Telemetry);
     record.header.subtype = static_cast<uint8_t>(status);
     record.header.flags = state != nullptr ? 1 : 0;
-    record.sensor = sensor;
-    if (state != nullptr) {
-        record.state = *state;
-    }
+    record.sample = BuildLoggedTelemetrySample(sensor, state, flapCommandDeg, flapEffectiveDeg);
 
     if (!AppendRecord(&record, sizeof(record), false)) {
         LOG_PRINTLN("Failed to append telemetry record to log.");
@@ -265,9 +333,11 @@ void DataLoggerLogTelemetry(const SensorData &sensor, FlightStatus status, const
 void DataLoggerLogEvent(FlightEventType type,
                         FlightStatus status,
                         float timestamp,
-                        float altitudeMeters,
-                        float verticalVelocity,
-                        float apogeeEstimate) {
+                        float altitudeAglFeet,
+                        float verticalVelocityFps,
+                        float apogeeEstimateFeet,
+                        float flapCommandDeg,
+                        float flapEffectiveDeg) {
     if (!g_loggerInitialized) {
         return;
     }
@@ -277,9 +347,11 @@ void DataLoggerLogEvent(FlightEventType type,
     record.header.subtype = static_cast<uint8_t>(type);
     record.header.flags = static_cast<uint8_t>(status);
     record.timestamp = timestamp;
-    record.altitudeMeters = altitudeMeters;
-    record.verticalVelocity = verticalVelocity;
-    record.apogeeEstimate = apogeeEstimate;
+    record.altitudeAglFeet = altitudeAglFeet;
+    record.verticalVelocityFps = verticalVelocityFps;
+    record.apogeeEstimateFeet = apogeeEstimateFeet;
+    record.flapCommandDeg = flapCommandDeg;
+    record.flapEffectiveDeg = flapEffectiveDeg;
 
     if (!AppendRecord(&record, sizeof(record), true)) {
         LOG_PRINTLN("Failed to append event record to log.");

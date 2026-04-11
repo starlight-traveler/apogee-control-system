@@ -97,11 +97,15 @@ void FlightComputer::ReconfigurePredictor(const EnvironmentModel::Config &enviro
 
 /// Processes one sensor sample and updates the filtered flight state.
 bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
-    const bool hasBnoAccel =
-        !(data.accelBNO[0] == 0.0f && data.accelBNO[1] == 0.0f && data.accelBNO[2] == 0.0f);
     const bool hasIcmAccel =
         !(data.accelICM[0] == 0.0f && data.accelICM[1] == 0.0f && data.accelICM[2] == 0.0f);
-    if (!hasBnoAccel && !hasIcmAccel) {
+    const bool hasLsmAccel =
+        !(data.accelLSM[0] == 0.0f && data.accelLSM[1] == 0.0f && data.accelLSM[2] == 0.0f);
+    const bool hasIcmGyro =
+        !(data.gyro[0] == 0.0f && data.gyro[1] == 0.0f && data.gyro[2] == 0.0f);
+    const bool hasLsmGyro =
+        !(data.gyroLSM[0] == 0.0f && data.gyroLSM[1] == 0.0f && data.gyroLSM[2] == 0.0f);
+    if (!hasIcmAccel && !hasLsmAccel) {
         return false;  // No usable acceleration source means the filters cannot advance safely.
     }
     
@@ -126,17 +130,75 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
         altitudeReferenceInitialized_ ? (altitudeMeters - altitudeReferenceMeters_) : 0.0;
 
     float accelBody[3];
-    // Prefer the ICM path during the higher-dynamic ground/burn phases when it
-    // is available; otherwise fall back to the BNO source.
-    const bool preferIcm = (status_ == FlightStatus::Ground || status_ == FlightStatus::Burn) && hasIcmAccel;
-    if (preferIcm || !hasBnoAccel) {
+    float gyroBody[3] = {0.0f, 0.0f, 0.0f};
+    const MainQuaternionSource selectedQuaternionSource =
+        static_cast<MainQuaternionSource>(data.mainQuaternionSource);
+    (void)selectedQuaternionSource;
+    const bool hasFreshIcmAccel = hasIcmAccel && data.icmSampleFresh;
+    const bool hasFreshLsmAccel = hasLsmAccel && data.lsmSampleFresh;
+    const bool hasFreshIcmGyro = hasIcmGyro && data.icmSampleFresh;
+    const bool hasFreshLsmGyro = hasLsmGyro && data.lsmSampleFresh;
+
+    auto loadIcmGyro = [&]() {
+        if (hasFreshIcmGyro) {
+            gyroBody[0] = data.gyro[0];
+            gyroBody[1] = data.gyro[1];
+            gyroBody[2] = data.gyro[2];
+        } else if (hasFreshLsmGyro) {
+            gyroBody[0] = data.gyroLSM[0];
+            gyroBody[1] = data.gyroLSM[1];
+            gyroBody[2] = data.gyroLSM[2];
+        } else if (hasIcmGyro) {
+            gyroBody[0] = data.gyro[0];
+            gyroBody[1] = data.gyro[1];
+            gyroBody[2] = data.gyro[2];
+        } else if (hasLsmGyro) {
+            gyroBody[0] = data.gyroLSM[0];
+            gyroBody[1] = data.gyroLSM[1];
+            gyroBody[2] = data.gyroLSM[2];
+        }
+    };
+    auto loadLsmGyro = [&]() {
+        if (hasFreshLsmGyro) {
+            gyroBody[0] = data.gyroLSM[0];
+            gyroBody[1] = data.gyroLSM[1];
+            gyroBody[2] = data.gyroLSM[2];
+        } else if (hasFreshIcmGyro) {
+            gyroBody[0] = data.gyro[0];
+            gyroBody[1] = data.gyro[1];
+            gyroBody[2] = data.gyro[2];
+        } else if (hasLsmGyro) {
+            gyroBody[0] = data.gyroLSM[0];
+            gyroBody[1] = data.gyroLSM[1];
+            gyroBody[2] = data.gyroLSM[2];
+        } else if (hasIcmGyro) {
+            gyroBody[0] = data.gyro[0];
+            gyroBody[1] = data.gyro[1];
+            gyroBody[2] = data.gyro[2];
+        }
+    };
+
+    // Raw estimator feed is intentionally LSM-first for this flight build.
+    if (hasFreshLsmAccel) {
+        accelBody[0] = data.accelLSM[0];
+        accelBody[1] = data.accelLSM[1];
+        accelBody[2] = data.accelLSM[2];
+        loadLsmGyro();
+    } else if (hasFreshIcmAccel) {
         accelBody[0] = data.accelICM[0];
         accelBody[1] = data.accelICM[1];
         accelBody[2] = data.accelICM[2];
+        loadIcmGyro();
+    } else if (hasLsmAccel) {
+        accelBody[0] = data.accelLSM[0];
+        accelBody[1] = data.accelLSM[1];
+        accelBody[2] = data.accelLSM[2];
+        loadLsmGyro();
     } else {
-        accelBody[0] = data.accelBNO[0];
-        accelBody[1] = data.accelBNO[1];
-        accelBody[2] = data.accelBNO[2];
+        accelBody[0] = data.accelICM[0];
+        accelBody[1] = data.accelICM[1];
+        accelBody[2] = data.accelICM[2];
+        loadIcmGyro();
     }
 
     math_utils::Quaternion orientation = previousQuaternion_;
@@ -151,28 +213,23 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
         // Propagate attitude through ascent with gyro-only integration so brief
         // quaternion dropouts do not immediately collapse the predictor seed.
         bool propagatedQuaternionValid = true;
-        orientation = TeasleyFilter(previousQuaternion_, data.gyro, static_cast<float>(dt), &propagatedQuaternionValid);
+        orientation = TeasleyFilter(previousQuaternion_, gyroBody, static_cast<float>(dt), &propagatedQuaternionValid);
         quaternionValid_ = propagatedQuaternionValid;
 
-        // When the runtime source selector marks the main quaternion as BNO-led
-        // or blended, treat it as a slow external reference and trim the
-        // propagated attitude back toward it instead of hard-switching.
-        // During coast, use more aggressive correction to quickly fix any
-        // gyro drift accumulated during burn.
-        const MainQuaternionSource correctionSource =
-            static_cast<MainQuaternionSource>(data.mainQuaternionSource);
+        // Keep ascent attitude anchored to the current fast-rail solution so
+        // brief gyro drift does not move zenith away from the ICM/LSM rails.
         if (settings::ahrs::kEnableBnoReferenceCorrection &&
             (status_ == FlightStatus::Burn || status_ == FlightStatus::Coast) &&
             data.hasQuaternion &&
-            (correctionSource == MainQuaternionSource::Bno ||
-             correctionSource == MainQuaternionSource::Blended)) {
+            (selectedQuaternionSource == MainQuaternionSource::Icm ||
+             selectedQuaternionSource == MainQuaternionSource::Lsm ||
+             selectedQuaternionSource == MainQuaternionSource::Blended)) {
             math_utils::Quaternion referenceQuat = math_utils::MakeQuaternion(1.0f, 0.0f, 0.0f, 0.0f);
             if (ArrayToQuaternion(data.quaternion, referenceQuat)) {
-                // Use higher blend factor during coast to aggressively correct drift
                 const float baseBlendFactor = (status_ == FlightStatus::Coast)
                     ? settings::ahrs::kBnoCoastCorrectionBlendFactor
                     : settings::ahrs::kBnoReferenceCorrectionBlendFactor;
-                const float blendFactor = baseBlendFactor * std::max(0.0f, data.icmAccelTrust);
+                const float blendFactor = baseBlendFactor;
                 if (blendFactor > 0.0f) {
                     orientation = math_utils::Slerp(orientation, referenceQuat, blendFactor);
                     quaternionValid_ = math_utils::ValidateQuaternion(orientation);
