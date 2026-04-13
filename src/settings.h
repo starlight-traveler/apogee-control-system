@@ -29,6 +29,26 @@
 #define APOGEE_PREDICTOR_MAX_STEPS 256
 #endif
 
+
+
+  // - settings::sensors::bmp585::kSeaLevelPressureHpa
+  //   in src/settings.h:477
+  // - settings::sensors::ms5611::kSeaLevelPressureHpa
+  //   in src/settings.h:490
+  // - settings::predictor::kSeaLevelPressurePa
+  //   in src/settings.h:863
+
+  // Use the same day-of sea-level pressure, just in the correct units:
+
+  // - barometers use hPa
+  // - predictor uses Pa
+
+  // So for example, if the day-of value is 1017.6 hPa, then:
+
+  // - BMP585: 1017.6f
+  // - MS5611: 1017.6f
+  // - predictor: 101760.0f
+
 namespace settings {
 // ---------------------------------------------------------------------------
 // Build/Profile Settings
@@ -221,13 +241,13 @@ constexpr size_t kCsvLineBufferSize = 2048;
 // ---------------------------------------------------------------------------
 namespace environment {
 // Ground temperature used as altitude=0 reference in Fahrenheit.
-constexpr float kGroundTemperatureF = 42.0f;
+constexpr float kGroundTemperatureF = 53.0f;
 // Measured surface wind speed in miles per hour.
-constexpr float kWindSpeedMph = 13.0f;
+constexpr float kWindSpeedMph = 8.0f;
 // Meteorological wind direction in degrees.
-constexpr float kWindDirectionDeg = 317.0f;
+constexpr float kWindDirectionDeg = 111.0f;
 // Launch rail azimuth direction in degrees.
-constexpr float kLaunchDirectionDeg = 317.0f;
+constexpr float kLaunchDirectionDeg = 111.0f;
 // Terrain roughness length (meters) for log wind profile.
 constexpr float kRoughnessLengthMeters = 0.075f;
 // Height where gradient wind is modeled (meters).
@@ -243,11 +263,12 @@ constexpr float kMeasurementHeightMeters = 10.0f;
 namespace vehicle {
 // Aerodynamic moment arm CP-CG during coast/burnout [m].
 // CP from tip: 1.7537 m, CG from tip: 1.31 m.
-constexpr double kCenterOfPressureOffsetMeters = 0.4389;
+
+constexpr double kCenterOfPressureOffsetMeters = 0.22;
 // Longitudinal moment of inertia during coast [kg*m^2].
-constexpr double kMomentOfInertiaKgM2 = 8.28;
+constexpr double kMomentOfInertiaKgM2 = 0.529;
 // Rocket dry mass / burnout mass [kg].
-constexpr double kDryMassKg = 18.09975;
+constexpr double kDryMassKg = 3.33;
 }
 
 // ---------------------------------------------------------------------------
@@ -283,7 +304,7 @@ constexpr double kSigmaAccelZ = 0.7;
 constexpr double kSigmaAltimeter = 1.0;
 constexpr double kProcessNoiseXY = 0.6;
 constexpr double kProcessNoiseZ = 1.2;
-constexpr double kApogeeTargetMeters = 1540;
+constexpr double kApogeeTargetMeters = 822.96;
 // Predictor-only horizontal speed seed tuning. These values intentionally keep
 // XY speed conservative because the estimator does not have a horizontal
 // position/velocity measurement update.
@@ -474,7 +495,7 @@ constexpr float kMagAinv[3][3] = {
 
 namespace bmp585 {
 // Pressure reference used by barometric altitude conversion.
-constexpr float kSeaLevelPressureHpa = 1022.689f;
+constexpr float kSeaLevelPressureHpa = 1030.9f;
 // Reject altitude jumps that imply faster vertical motion than this rate.
 constexpr float kMaxAltitudeRateFeetPerSecond = 2500.0f;
 // Minimum single-sample jump (feet) required before classifying as a spike.
@@ -487,7 +508,7 @@ namespace ms5611 {
 // SPI chip-select pin for the MS5611 breakout.
 constexpr uint8_t kChipSelectPin = 36;
 // Pressure reference used by barometric altitude conversion.
-constexpr float kSeaLevelPressureHpa = 1018.8f;
+constexpr float kSeaLevelPressureHpa = 1030.9f;
 // Minimum spacing between blocking reads.
 constexpr uint32_t kMinReadSpacingUs = 1000;
 // Absolute altitude magnitude limit for invalid sample rejection.
@@ -859,9 +880,12 @@ constexpr float kMachDragAdaptTauTransitionEnd = 1.5f;   // Fully conservative b
 constexpr float kUncertaintyDragPerturbFraction = 0.12f;  // +/- 12% drag variation
 constexpr float kUncertaintyWindPerturbMps = 3.0f;        // +/- 3 m/s wind variation
 
+// - MS5611: 1017.6f
+// - predictor: 101760.0fs
 // Atmospheric density model: ISA reference values.
-constexpr float kSeaLevelPressurePa = 101325.0f;
-constexpr float kSeaLevelTemperatureK = 288.15f;
+constexpr float kSeaLevelPressurePa = 103090.0f;
+// 101760
+constexpr float kSeaLevelTemperatureK = 284.26f;
 constexpr float kTemperatureLapseRateKPerM = 0.0065f;
 constexpr float kReferenceDensityKgPerM3 = 1.225f;
 

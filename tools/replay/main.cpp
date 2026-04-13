@@ -46,11 +46,28 @@ enum class FieldId {
     GyroX,
     GyroY,
     GyroZ,
+    AccelLsmX,
+    AccelLsmY,
+    AccelLsmZ,
+    GyroLsmX,
+    GyroLsmY,
+    GyroLsmZ,
     QuatW,
     QuatX,
     QuatY,
     QuatZ,
+    IcmQuatW,
+    IcmQuatX,
+    IcmQuatY,
+    IcmQuatZ,
+    LsmQuatW,
+    LsmQuatX,
+    LsmQuatY,
+    LsmQuatZ,
     HasQuaternion,
+    HasIcmQuaternion,
+    HasLsmQuaternion,
+    MainQuaternionSource,
 };
 
 struct FieldInfo {
@@ -89,13 +106,42 @@ const std::vector<FieldInfo> &AllFields() {
         {FieldId::GyroX, "gyro_x", {"gyro_x", "gx", "sensor_gyro_x"}},
         {FieldId::GyroY, "gyro_y", {"gyro_y", "gy", "sensor_gyro_y"}},
         {FieldId::GyroZ, "gyro_z", {"gyro_z", "gz", "sensor_gyro_z"}},
+        {FieldId::AccelLsmX,
+         "accel_lsm_x",
+         {"accel_lsm_x", "lsm_ax", "sensor_accel_lsm_x"}},
+        {FieldId::AccelLsmY,
+         "accel_lsm_y",
+         {"accel_lsm_y", "lsm_ay", "sensor_accel_lsm_y"}},
+        {FieldId::AccelLsmZ,
+         "accel_lsm_z",
+         {"accel_lsm_z", "lsm_az", "sensor_accel_lsm_z"}},
+        {FieldId::GyroLsmX, "gyro_lsm_x", {"gyro_lsm_x", "lsm_gx", "sensor_gyro_lsm_x"}},
+        {FieldId::GyroLsmY, "gyro_lsm_y", {"gyro_lsm_y", "lsm_gy", "sensor_gyro_lsm_y"}},
+        {FieldId::GyroLsmZ, "gyro_lsm_z", {"gyro_lsm_z", "lsm_gz", "sensor_gyro_lsm_z"}},
         {FieldId::QuatW, "quat_w", {"quat_w", "qw", "sensor_quat_w"}},
         {FieldId::QuatX, "quat_x", {"quat_x", "qx", "sensor_quat_x"}},
         {FieldId::QuatY, "quat_y", {"quat_y", "qy", "sensor_quat_y"}},
         {FieldId::QuatZ, "quat_z", {"quat_z", "qz", "sensor_quat_z"}},
+        {FieldId::IcmQuatW, "icm_quat_w", {"icm_quat_w", "sensor_icm_quat_w"}},
+        {FieldId::IcmQuatX, "icm_quat_x", {"icm_quat_x", "sensor_icm_quat_x"}},
+        {FieldId::IcmQuatY, "icm_quat_y", {"icm_quat_y", "sensor_icm_quat_y"}},
+        {FieldId::IcmQuatZ, "icm_quat_z", {"icm_quat_z", "sensor_icm_quat_z"}},
+        {FieldId::LsmQuatW, "lsm_quat_w", {"lsm_quat_w", "sensor_lsm_quat_w"}},
+        {FieldId::LsmQuatX, "lsm_quat_x", {"lsm_quat_x", "sensor_lsm_quat_x"}},
+        {FieldId::LsmQuatY, "lsm_quat_y", {"lsm_quat_y", "sensor_lsm_quat_y"}},
+        {FieldId::LsmQuatZ, "lsm_quat_z", {"lsm_quat_z", "sensor_lsm_quat_z"}},
         {FieldId::HasQuaternion,
          "has_quaternion",
          {"has_quaternion", "quat_valid", "sensor_has_quaternion"}},
+        {FieldId::HasIcmQuaternion,
+         "has_icm_quaternion",
+         {"has_icm_quaternion", "sensor_has_icm_quaternion"}},
+        {FieldId::HasLsmQuaternion,
+         "has_lsm_quaternion",
+         {"has_lsm_quaternion", "sensor_has_lsm_quaternion"}},
+        {FieldId::MainQuaternionSource,
+         "main_quaternion_source",
+         {"main_quaternion_source", "sensor_main_quaternion_source"}},
     };
     return kFields;
 }
@@ -129,6 +175,7 @@ struct ProgramOptions {
     std::string cfdPath = "lib/cfd.csv";
     bool showHelp = false;
     bool quiet = false;
+    bool ignoreLoggedState = false;
     float sigmaAccelXY = 0.5f;
     float sigmaAccelZ = 0.5f;
     float sigmaAltimeter = 0.5f;
@@ -148,9 +195,16 @@ struct FieldIndices {
     std::optional<std::size_t> altitudeMeters;
     std::array<std::optional<std::size_t>, 3> accelBno{};
     std::array<std::optional<std::size_t>, 3> accelIcm{};
+    std::array<std::optional<std::size_t>, 3> accelLsm{};
     std::array<std::optional<std::size_t>, 3> gyro{};
+    std::array<std::optional<std::size_t>, 3> gyroLsm{};
     std::array<std::optional<std::size_t>, 4> quaternion{};
+    std::array<std::optional<std::size_t>, 4> icmQuaternion{};
+    std::array<std::optional<std::size_t>, 4> lsmQuaternion{};
     std::optional<std::size_t> hasQuaternionFlag;
+    std::optional<std::size_t> hasIcmQuaternionFlag;
+    std::optional<std::size_t> hasLsmQuaternionFlag;
+    std::optional<std::size_t> mainQuaternionSource;
 };
 
 struct ReplaySeedIndices {
@@ -747,14 +801,31 @@ FieldIndices BuildFieldIndices(const std::vector<std::string> &headers, const Fi
     resolve(FieldId::AccelIcmX, indices.accelIcm[0]);
     resolve(FieldId::AccelIcmY, indices.accelIcm[1]);
     resolve(FieldId::AccelIcmZ, indices.accelIcm[2]);
+    resolve(FieldId::AccelLsmX, indices.accelLsm[0]);
+    resolve(FieldId::AccelLsmY, indices.accelLsm[1]);
+    resolve(FieldId::AccelLsmZ, indices.accelLsm[2]);
     resolve(FieldId::GyroX, indices.gyro[0]);
     resolve(FieldId::GyroY, indices.gyro[1]);
     resolve(FieldId::GyroZ, indices.gyro[2]);
+    resolve(FieldId::GyroLsmX, indices.gyroLsm[0]);
+    resolve(FieldId::GyroLsmY, indices.gyroLsm[1]);
+    resolve(FieldId::GyroLsmZ, indices.gyroLsm[2]);
     resolve(FieldId::QuatW, indices.quaternion[0]);
     resolve(FieldId::QuatX, indices.quaternion[1]);
     resolve(FieldId::QuatY, indices.quaternion[2]);
     resolve(FieldId::QuatZ, indices.quaternion[3]);
+    resolve(FieldId::IcmQuatW, indices.icmQuaternion[0]);
+    resolve(FieldId::IcmQuatX, indices.icmQuaternion[1]);
+    resolve(FieldId::IcmQuatY, indices.icmQuaternion[2]);
+    resolve(FieldId::IcmQuatZ, indices.icmQuaternion[3]);
+    resolve(FieldId::LsmQuatW, indices.lsmQuaternion[0]);
+    resolve(FieldId::LsmQuatX, indices.lsmQuaternion[1]);
+    resolve(FieldId::LsmQuatY, indices.lsmQuaternion[2]);
+    resolve(FieldId::LsmQuatZ, indices.lsmQuaternion[3]);
     resolve(FieldId::HasQuaternion, indices.hasQuaternionFlag);
+    resolve(FieldId::HasIcmQuaternion, indices.hasIcmQuaternionFlag);
+    resolve(FieldId::HasLsmQuaternion, indices.hasLsmQuaternionFlag);
+    resolve(FieldId::MainQuaternionSource, indices.mainQuaternionSource);
     return indices;
 }
 
@@ -826,6 +897,7 @@ bool PopulateSensorData(const std::vector<std::string> &row,
                         SensorData &out,
                         float &altimeterMeasurementMeters,
                         std::string &error) {
+    out = SensorData{};
     auto timestamp = ExtractFloat(row, indices.timestamp);
     if (!timestamp.has_value()) {
         error = "missing timestamp";
@@ -853,6 +925,10 @@ bool PopulateSensorData(const std::vector<std::string> &row,
     for (int i = 0; i < 3; ++i) {
         hasIcmAccel |= AssignFloat(row, indices.accelIcm[i], out.accelICM[i]);
     }
+    bool hasLsmAccel = false;
+    for (int i = 0; i < 3; ++i) {
+        hasLsmAccel |= AssignFloat(row, indices.accelLsm[i], out.accelLSM[i]);
+    }
     bool hasBnoAccel = false;
     for (int i = 0; i < 3; ++i) {
         hasBnoAccel |= AssignFloat(row, indices.accelBno[i], out.accelBNO[i]);
@@ -872,6 +948,7 @@ bool PopulateSensorData(const std::vector<std::string> &row,
 
     for (int i = 0; i < 3; ++i) {
         AssignFloat(row, indices.gyro[i], out.gyro[i]);
+        AssignFloat(row, indices.gyroLsm[i], out.gyroLSM[i]);
     }
 
     bool hasQuaternionValues = true;
@@ -886,6 +963,53 @@ bool PopulateSensorData(const std::vector<std::string> &row,
     } else {
         out.hasQuaternion = hasQuaternionValues;
     }
+
+    bool hasIcmQuaternionValues = true;
+    for (int i = 0; i < 4; ++i) {
+        if (!AssignFloat(row, indices.icmQuaternion[i], out.icmQuaternion[i])) {
+            hasIcmQuaternionValues = false;
+        }
+    }
+    if (auto flag = ExtractBool(row, indices.hasIcmQuaternionFlag); flag.has_value()) {
+        out.hasIcmQuaternion = *flag;
+    } else {
+        out.hasIcmQuaternion = hasIcmQuaternionValues;
+    }
+
+    bool hasLsmQuaternionValues = true;
+    for (int i = 0; i < 4; ++i) {
+        if (!AssignFloat(row, indices.lsmQuaternion[i], out.quaternionLSM[i])) {
+            hasLsmQuaternionValues = false;
+        }
+    }
+    if (auto flag = ExtractBool(row, indices.hasLsmQuaternionFlag); flag.has_value()) {
+        out.hasLsmQuaternion = *flag;
+    } else {
+        out.hasLsmQuaternion = hasLsmQuaternionValues;
+    }
+
+    if (const auto source = ExtractFloat(row, indices.mainQuaternionSource); source.has_value()) {
+        const int sourceCode = static_cast<int>(std::lround(*source));
+        if (sourceCode >= 0 && sourceCode <= 255) {
+            out.mainQuaternionSource = static_cast<uint8_t>(sourceCode);
+        }
+    }
+
+    if (!out.hasQuaternion) {
+        const MainQuaternionSource source =
+            static_cast<MainQuaternionSource>(out.mainQuaternionSource);
+        if (source == MainQuaternionSource::Icm && out.hasIcmQuaternion) {
+            std::copy(std::begin(out.icmQuaternion), std::end(out.icmQuaternion), std::begin(out.quaternion));
+            out.hasQuaternion = true;
+        } else if (source == MainQuaternionSource::Lsm && out.hasLsmQuaternion) {
+            std::copy(std::begin(out.quaternionLSM), std::end(out.quaternionLSM), std::begin(out.quaternion));
+            out.hasQuaternion = true;
+        }
+    }
+
+    out.icmSampleFresh = hasIcmAccel || out.hasIcmQuaternion;
+    out.lsmSampleFresh = hasLsmAccel || out.hasLsmQuaternion;
+    out.baroSampleFresh = hasAltitude;
 
     return true;
 }
@@ -1323,6 +1447,7 @@ void PrintUsage(const char *program) {
               << "  --cfd-path <path>          CFD CSV path for sign check (default lib/cfd.csv).\n"
               << "  --sign-check-time <sec>    Evaluate apogee at ACS 0/10/20 deg near this time.\n"
               << "  --sign-check-window <sec>  Match window for sign-check sample (default 0.05).\n"
+              << "  --ignore-logged-state      Recompute filtered state instead of smart-seeding from logged state columns.\n"
               << "  --include-raw-altimeter    Append raw altimeter measurements to output CSV.\n"
               << "  --include-raw <fields>    Append raw sensor fields (comma-separated).\n"
              << "  --graph <fields>          Render ASCII graphs and Matplot++ images for the requested fields.\n"
@@ -1380,6 +1505,10 @@ bool ParseArgs(int argc, char **argv, ProgramOptions &options) {
         }
         if (arg == "--quiet") {
             options.quiet = true;
+            continue;
+        }
+        if (arg == "--ignore-logged-state") {
+            options.ignoreLoggedState = true;
             continue;
         }
         if (arg == "--include-raw-altimeter") {
@@ -1570,13 +1699,33 @@ void PrintFieldMappingSummary(const FieldIndices &indices, const std::vector<std
         printEntry(label.c_str(), indices.accelBno[i]);
     }
     for (int i = 0; i < 3; ++i) {
+        std::string label = std::string("accel_lsm") + accLabels[i];
+        printEntry(label.c_str(), indices.accelLsm[i]);
+    }
+    for (int i = 0; i < 3; ++i) {
         std::string label = std::string("gyro") + accLabels[i];
         printEntry(label.c_str(), indices.gyro[i]);
+    }
+    for (int i = 0; i < 3; ++i) {
+        std::string label = std::string("gyro_lsm") + accLabels[i];
+        printEntry(label.c_str(), indices.gyroLsm[i]);
     }
     printEntry("quat_w", indices.quaternion[0]);
     printEntry("quat_x", indices.quaternion[1]);
     printEntry("quat_y", indices.quaternion[2]);
     printEntry("quat_z", indices.quaternion[3]);
+    printEntry("icm_quat_w", indices.icmQuaternion[0]);
+    printEntry("icm_quat_x", indices.icmQuaternion[1]);
+    printEntry("icm_quat_y", indices.icmQuaternion[2]);
+    printEntry("icm_quat_z", indices.icmQuaternion[3]);
+    printEntry("lsm_quat_w", indices.lsmQuaternion[0]);
+    printEntry("lsm_quat_x", indices.lsmQuaternion[1]);
+    printEntry("lsm_quat_y", indices.lsmQuaternion[2]);
+    printEntry("lsm_quat_z", indices.lsmQuaternion[3]);
+    printEntry("has_quaternion", indices.hasQuaternionFlag);
+    printEntry("has_icm_quaternion", indices.hasIcmQuaternionFlag);
+    printEntry("has_lsm_quaternion", indices.hasLsmQuaternionFlag);
+    printEntry("main_quaternion_source", indices.mainQuaternionSource);
 }
 
 }  // namespace
@@ -1621,9 +1770,12 @@ int main(int argc, char **argv) {
 
     if (!options.quiet) {
         PrintFieldMappingSummary(indices, headers);
-        if (replaySeedIndices.HasAnySeedColumns()) {
+        if (replaySeedIndices.HasAnySeedColumns() && !options.ignoreLoggedState) {
             std::cout << "Smart seed: logged filtered-state columns detected; using them when available and"
                          " recomputing apogee look-ahead from the seeded state."
+                      << std::endl;
+        } else if (replaySeedIndices.HasAnySeedColumns() && options.ignoreLoggedState) {
+            std::cout << "Ignoring logged filtered-state columns; replaying the hosted flight computer from sensor rails."
                       << std::endl;
         }
     }
@@ -1634,6 +1786,10 @@ int main(int argc, char **argv) {
     vehicleParameters.momentOfInertia = settings::vehicle::kMomentOfInertiaKgM2;
     vehicleParameters.dryMass = settings::vehicle::kDryMassKg;
     EnvironmentModel environment(environmentConfig);
+    StandaloneCfdTableStorage seededReplayCfdStorage;
+    const bool loadedSeededReplayCfd = LoadStandaloneCfdTable(options.cfdPath, seededReplayCfdStorage) ||
+                                       (options.cfdPath == "lib/cfd.csv" &&
+                                        LoadStandaloneCfdTable("../lib/cfd.csv", seededReplayCfdStorage));
     FlightComputer flightComputer;
     flightComputer.Begin(options.sigmaAccelXY,
                          options.sigmaAccelZ,
@@ -1643,13 +1799,8 @@ int main(int argc, char **argv) {
                          options.apogeeTargetMeters,
                          environmentConfig,
                          vehicleParameters,
-                         nullptr);
+                         loadedSeededReplayCfd ? &seededReplayCfdStorage.table : nullptr);
     flightComputer.SetSerialReportingEnabled(false);
-
-    StandaloneCfdTableStorage seededReplayCfdStorage;
-    const bool loadedSeededReplayCfd = LoadStandaloneCfdTable(options.cfdPath, seededReplayCfdStorage) ||
-                                       (options.cfdPath == "lib/cfd.csv" &&
-                                        LoadStandaloneCfdTable("../lib/cfd.csv", seededReplayCfdStorage));
     ApogeePredictor seededReplayPredictor;
     seededReplayPredictor.SetEnvironment(environment);
     seededReplayPredictor.SetVehicleParameters(vehicleParameters);
@@ -1720,7 +1871,8 @@ int main(int argc, char **argv) {
         ++processedRows;
         FilteredState state;
         FlightStatus emittedStatus = flightComputer.Status();
-        bool hasState = TryPopulateSeededState(row, replaySeedIndices, state, emittedStatus);
+        bool hasState = !options.ignoreLoggedState &&
+                        TryPopulateSeededState(row, replaySeedIndices, state, emittedStatus);
         if (hasState) {
             usedSeededStateOutput = true;
             const double seededAngularRate =

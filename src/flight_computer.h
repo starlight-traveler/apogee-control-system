@@ -150,7 +150,6 @@ class FlightComputer {
                                  double measuredVerticalAcceleration,
                                  double dtSeconds,
                                  double timeToApogeeSeconds);
-
     KalmanFilterAccel kalmanX_;
     KalmanFilterAccel kalmanY_;
     KalmanFilterAccelAlt kalmanZ_;

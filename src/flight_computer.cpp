@@ -270,11 +270,11 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
                     static_cast<double>(data.altimeterSigmaScale),
                     static_cast<double>(data.altimeterGateSigma));
 
-    const double rawPosZ = kalmanZ_.Position();
-    const double rawVelZ = kalmanZ_.Velocity();
+    double rawPosZ = kalmanZ_.Position();
+    double rawVelZ = kalmanZ_.Velocity();
     const double accX = kalmanX_.Acceleration();
     const double accY = kalmanY_.Acceleration();
-    const double accZ = kalmanZ_.Acceleration();
+    double accZ = kalmanZ_.Acceleration();
     double publishedPosZ = rawPosZ;
     double publishedVelZ = rawVelZ;
 
@@ -362,8 +362,13 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
         }
     }
 
+    // Keep predicting through overshoot while the vehicle is still ascending.
+    // Overshoot only means "above target apogee", not "at apogee".
     const bool shouldPredictApogee =
-        (status_ == FlightStatus::Burn || status_ == FlightStatus::Coast) && rawVelZ > 0.0;
+        (status_ == FlightStatus::Burn ||
+         status_ == FlightStatus::Coast ||
+         status_ == FlightStatus::Overshoot) &&
+        rawVelZ > 0.0;
     if (shouldPredictApogee) {
         // Deliberately degrade to a simpler predictor seed whenever attitude
         // freshness is questionable rather than integrating unstable XY terms.

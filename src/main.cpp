@@ -3266,13 +3266,10 @@ void loop() {
     const bool hasBaroAgl = g_hasPadAltitude;
     const float altitudeAglMeters = altitudeAglFeet * 0.3048f;
 
-    // Barometer innovations are temporarily widened around flap motion so the
-    // estimator does not overreact to local pressure disturbances.
-    const bool flapTransientActive = g_flapActuator.IsSettling() || (nowMs < g_altimeterTransientUntilMs);
-    data.altimeterGateSigma = flapTransientActive ? settings::actuation::kBaroInnovationGateSigmaTransient
-                                                  : settings::actuation::kBaroInnovationGateSigmaNominal;
-    data.altimeterSigmaScale =
-        flapTransientActive ? settings::actuation::kBaroDeweightSigmaScale : 1.0f;
+    // Keep baro fusion at the nominal flight weighting. Subscale flights with
+    // no active flaps should not carry a transient deweight penalty.
+    data.altimeterGateSigma = settings::actuation::kBaroInnovationGateSigmaNominal;
+    data.altimeterSigmaScale = 1.0f;
 
     FilteredState state;
     const uint32_t estimatorStartUs = micros();

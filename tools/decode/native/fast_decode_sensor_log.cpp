@@ -785,7 +785,9 @@ double ComputeSeededAngularRate(float currentTimeSeconds,
 #if defined(ACS_ENABLE_IMGUI_DECODER)
 
 constexpr float kFeetToMeters = 0.3048f;
+constexpr float kMetersToFeet = 3.280839895013123f;
 constexpr float kDegToRad = 0.01745329251994329577f;
+constexpr float kRadToDeg = 57.29577951308232f;
 
 struct NumericSeries {
     std::string name;
@@ -808,6 +810,22 @@ const NumericSeries *FindSeriesNamed(const TelemetryTable &table, const char *na
         }
     }
     return nullptr;
+}
+
+struct SeriesLookup {
+    const NumericSeries *series = nullptr;
+    float scale = 1.0f;
+};
+
+SeriesLookup FindSeriesByNamesWithScale(
+    const TelemetryTable &table,
+    std::initializer_list<std::pair<const char *, float>> candidates) {
+    for (const auto &[name, scale] : candidates) {
+        if (const NumericSeries *series = FindSeriesNamed(table, name); series != nullptr) {
+            return {series, scale};
+        }
+    }
+    return {};
 }
 
 void AppendScaledAliasSeries(TelemetryTable &table, const char *sourceName, const char *aliasName, float scale = 1.0f) {
@@ -1569,7 +1587,9 @@ bool ApplySmartParserToDataset(LoadedDataset &dataset, const SmartParserSettings
 
     const NumericSeries *status = FindSeriesConst(dataset.table, "flight_status_raw");
     const NumericSeries *alt = FindSeriesConst(dataset.table, "sensor_altitude_feet");
-    const NumericSeries *vel = FindSeriesConst(dataset.table, "state_velocity_z");
+    const SeriesLookup vel = FindSeriesByNamesWithScale(
+        dataset.table,
+        {{"state_vertical_velocity_fps", 1.0f}, {"state_velocity_z", kMetersToFeet}});
     const NumericSeries *cmd = FindSeriesConst(dataset.table, "sensor_auto_cmd_deg");
     const NumericSeries *settling = FindSeriesConst(dataset.table, "sensor_actuation_is_settling");
     if (alt == nullptr) {
@@ -1613,7 +1633,9 @@ bool ApplySmartParserToDataset(LoadedDataset &dataset, const SmartParserSettings
     for (std::size_t i = 0; i < dataset.table.RowCount(); ++i) {
         const float altitude = alt->values[i];
         const float statusVal = (status != nullptr && i < status->values.size()) ? status->values[i] : 0.0f;
-        const float velVal = (vel != nullptr && i < vel->values.size()) ? vel->values[i] : 0.0f;
+        const float velVal = (vel.series != nullptr && i < vel.series->values.size())
+                                 ? (vel.series->values[i] * vel.scale)
+                                 : 0.0f;
         const float cmdVal = (cmd != nullptr && i < cmd->values.size()) ? cmd->values[i] : 0.0f;
         const float settlingVal = (settling != nullptr && i < settling->values.size()) ? settling->values[i] : 0.0f;
 
@@ -2407,11 +2429,17 @@ bool ComputeReplayAnalysis(const LoadedDataset &dataset, const ReplaySettings &s
 
     const NumericSeries *hasFiltered = FindSeriesByName(source, "has_filtered_state");
     const NumericSeries *statusSeries = FindSeriesByName(source, "flight_status_raw");
-    const NumericSeries *altitudeSeries = FindSeriesByName(source, "state_position_z");
-    const NumericSeries *velocitySeries = FindSeriesByName(source, "state_velocity_z");
-    const NumericSeries *zenithSeries = FindSeriesByName(source, "state_zenith");
-    if (altitudeSeries == nullptr || velocitySeries == nullptr || zenithSeries == nullptr) {
-        error = "Replay requires state_position_z, state_velocity_z, and state_zenith.";
+    const SeriesLookup altitudeSeries = FindSeriesByNamesWithScale(
+        source,
+        {{"state_altitude_agl_feet", kFeetToMeters}, {"state_position_z", 1.0f}});
+    const SeriesLookup velocitySeries = FindSeriesByNamesWithScale(
+        source,
+        {{"state_vertical_velocity_fps", kFeetToMeters}, {"state_velocity_z", 1.0f}});
+    const SeriesLookup zenithSeries = FindSeriesByNamesWithScale(
+        source,
+        {{"state_zenith_deg", kDegToRad}, {"state_zenith", 1.0f}});
+    if (altitudeSeries.series == nullptr || velocitySeries.series == nullptr || zenithSeries.series == nullptr) {
+        error = "Replay requires altitude, vertical velocity, and zenith state columns.";
         return false;
     }
 
@@ -2419,8 +2447,12 @@ bool ComputeReplayAnalysis(const LoadedDataset &dataset, const ReplaySettings &s
     const NumericSeries *velYSeries = FindSeriesByName(source, "state_velocity_y");
     const NumericSeries *inertialXSeries = FindSeriesByName(source, "state_inertial_acceleration_x");
     const NumericSeries *inertialYSeries = FindSeriesByName(source, "state_inertial_acceleration_y");
-    const NumericSeries *loggedStateApogee = FindSeriesByName(source, "state_apogee_estimate");
-    const NumericSeries *loggedOptimizerApogee = FindSeriesByName(source, "sensor_optimizer_best_predicted_apogee_m");
+    const SeriesLookup loggedStateApogee = FindSeriesByNamesWithScale(
+        source,
+        {{"state_apogee_estimate_feet", kFeetToMeters}, {"state_apogee_estimate", 1.0f}});
+    const SeriesLookup loggedOptimizerApogee = FindSeriesByNamesWithScale(
+        source,
+        {{"sensor_optimizer_best_predicted_apogee_m", 1.0f}, {"state_apogee_estimate_feet", kFeetToMeters}});
 
     analysis.table.timeSeconds = source.timeSeconds;
     analysis.table.timeSorted = source.timeSorted;
@@ -2471,9 +2503,15 @@ bool ComputeReplayAnalysis(const LoadedDataset &dataset, const ReplaySettings &s
 
     for (std::size_t row = 0; row < rows; ++row) {
         const float timeValue = source.timeSeconds[row];
-        const auto altitude = SeriesValueAt(altitudeSeries, row);
-        const auto verticalVelocity = SeriesValueAt(velocitySeries, row);
-        const auto zenith = SeriesValueAt(zenithSeries, row);
+        const auto altitudeRaw = SeriesValueAt(altitudeSeries.series, row);
+        const auto verticalVelocityRaw = SeriesValueAt(velocitySeries.series, row);
+        const auto zenithRaw = SeriesValueAt(zenithSeries.series, row);
+        const std::optional<float> altitude =
+            altitudeRaw.has_value() ? std::optional<float>(*altitudeRaw * altitudeSeries.scale) : std::nullopt;
+        const std::optional<float> verticalVelocity =
+            verticalVelocityRaw.has_value() ? std::optional<float>(*verticalVelocityRaw * velocitySeries.scale) : std::nullopt;
+        const std::optional<float> zenith =
+            zenithRaw.has_value() ? std::optional<float>(*zenithRaw * zenithSeries.scale) : std::nullopt;
         if (!std::isfinite(timeValue) || !altitude.has_value() || !verticalVelocity.has_value() || !zenith.has_value()) {
             continue;
         }
@@ -2537,8 +2575,12 @@ bool ComputeReplayAnalysis(const LoadedDataset &dataset, const ReplaySettings &s
         }
 
         analysis.table.series[0].values[row] = *altitude;
-        analysis.table.series[1].values[row] = SeriesValueAt(loggedStateApogee, row).value_or(std::numeric_limits<float>::quiet_NaN());
-        analysis.table.series[2].values[row] = SeriesValueAt(loggedOptimizerApogee, row).value_or(std::numeric_limits<float>::quiet_NaN());
+        if (const auto stateApogee = SeriesValueAt(loggedStateApogee.series, row); stateApogee.has_value()) {
+            analysis.table.series[1].values[row] = *stateApogee * loggedStateApogee.scale;
+        }
+        if (const auto optimizerApogee = SeriesValueAt(loggedOptimizerApogee.series, row); optimizerApogee.has_value()) {
+            analysis.table.series[2].values[row] = *optimizerApogee * loggedOptimizerApogee.scale;
+        }
         analysis.table.series[3].values[row] = static_cast<float>(replayApogee);
         analysis.table.series[4].values[row] = static_cast<float>(ballisticApogee);
         analysis.table.series[8].values[row] = static_cast<float>(horizontalVelocity);
@@ -2576,11 +2618,11 @@ bool ComputeReplayAnalysis(const LoadedDataset &dataset, const ReplaySettings &s
                 continue;
             }
             errorActual.values[row] = replayApogee - analysis.actualApogeeMeters;
-            if (const auto stateApogee = SeriesValueAt(loggedStateApogee, row); stateApogee.has_value()) {
-                errorState.values[row] = replayApogee - *stateApogee;
+            if (const auto stateApogee = SeriesValueAt(loggedStateApogee.series, row); stateApogee.has_value()) {
+                errorState.values[row] = replayApogee - (*stateApogee * loggedStateApogee.scale);
             }
-            if (const auto optimizerApogee = SeriesValueAt(loggedOptimizerApogee, row); optimizerApogee.has_value()) {
-                errorOptimizer.values[row] = replayApogee - *optimizerApogee;
+            if (const auto optimizerApogee = SeriesValueAt(loggedOptimizerApogee.series, row); optimizerApogee.has_value()) {
+                errorOptimizer.values[row] = replayApogee - (*optimizerApogee * loggedOptimizerApogee.scale);
             }
         }
     }
@@ -2742,8 +2784,12 @@ void AnalyzeDataset(const LoadedDataset &dataset, SummaryMetrics &summary, std::
     }
 
     const NumericSeries *altitudeFeet = FindSeriesByName(table, "sensor_altitude_feet");
-    const NumericSeries *predictedApogeeM = FindSeriesByName(table, "sensor_optimizer_best_predicted_apogee_m");
-    const NumericSeries *velocityZ = FindSeriesByName(table, "state_velocity_z");
+    const SeriesLookup predictedApogeeM = FindSeriesByNamesWithScale(
+        table,
+        {{"sensor_optimizer_best_predicted_apogee_m", 1.0f}, {"state_apogee_estimate_feet", kFeetToMeters}});
+    const SeriesLookup velocityZ = FindSeriesByNamesWithScale(
+        table,
+        {{"state_vertical_velocity_fps", 1.0f}, {"state_velocity_z", kMetersToFeet}});
     const NumericSeries *accelX = FindSeriesByName(table, "state_acceleration_x");
     const NumericSeries *accelY = FindSeriesByName(table, "state_acceleration_y");
     const NumericSeries *accelZ = FindSeriesByName(table, "state_acceleration_z");
@@ -2808,11 +2854,12 @@ void AnalyzeDataset(const LoadedDataset &dataset, SummaryMetrics &summary, std::
         }
     }
 
-    if (predictedApogeeM != nullptr) {
-        for (float value : predictedApogeeM->values) {
+    if (predictedApogeeM.series != nullptr) {
+        for (float value : predictedApogeeM.series->values) {
             if (!std::isfinite(value)) {
                 continue;
             }
+            value *= predictedApogeeM.scale;
             if (!summary.hasPredictedApogee || value > summary.predictedApogeeMeters) {
                 summary.hasPredictedApogee = true;
                 summary.predictedApogeeMeters = value;
@@ -2820,11 +2867,11 @@ void AnalyzeDataset(const LoadedDataset &dataset, SummaryMetrics &summary, std::
         }
     }
 
-    if (velocityZ != nullptr) {
+    if (velocityZ.series != nullptr) {
         float prev = std::numeric_limits<float>::quiet_NaN();
         float prevT = 0.0f;
-        for (std::size_t i = 0; i < velocityZ->values.size(); ++i) {
-            const float v = velocityZ->values[i];
+        for (std::size_t i = 0; i < velocityZ.series->values.size(); ++i) {
+            const float v = velocityZ.series->values[i] * velocityZ.scale;
             const float t = table.timeSeconds[i];
             if (!std::isfinite(v)) {
                 continue;
@@ -2840,7 +2887,7 @@ void AnalyzeDataset(const LoadedDataset &dataset, SummaryMetrics &summary, std::
                 PushDetectedEvent(detected,
                                   crossingTime,
                                   "Vertical velocity zero-cross",
-                                  "state_velocity_z crossed from + to -",
+                                  "vertical velocity crossed from + to -",
                                   maxDetectedEvents);
             }
             prev = v;
@@ -3896,7 +3943,12 @@ int RunGuiMain(int argc, char **argv) {
                     const NumericSeries *seedHorizontal = FindSeriesByName(replayAnalysis.table, "derived_replay_seed_horizontal_speed_mps");
                     const NumericSeries *seedZenith = FindSeriesByName(replayAnalysis.table, "derived_replay_seed_zenith_deg");
                     const NumericSeries *seedRate = FindSeriesByName(replayAnalysis.table, "derived_replay_seed_angular_rate_deg_s");
-                    const NumericSeries *sourceVz = FindSeriesByName(dataset.table, "state_velocity_z");
+                    const SeriesLookup sourceVz = FindSeriesByNamesWithScale(
+                        dataset.table,
+                        {{"state_vertical_velocity_fps", kFeetToMeters}, {"state_velocity_z", 1.0f}});
+                    const SeriesLookup sourceZenith = FindSeriesByNamesWithScale(
+                        dataset.table,
+                        {{"state_zenith_deg", kDegToRad}, {"state_zenith", 1.0f}});
                     const NumericSeries *sourceStatus = FindSeriesByName(dataset.table, "flight_status_raw");
                     const NumericSeries *sourceFlags = FindSeriesByName(dataset.table, "sensor_predictor_seed_confidence_flags");
 
@@ -3919,13 +3971,21 @@ int RunGuiMain(int argc, char **argv) {
                     ImGui::TextUnformatted("Source");
                     ImGui::Separator();
                     ImGui::Text("Flight Status: %s", FormatOptionalFloat(SeriesValueAt(sourceStatus, replayHoveredRow)).c_str());
-                    ImGui::Text("Vertical Velocity: %s", FormatOptionalFloat(SeriesValueAt(sourceVz, replayHoveredRow), "m/s").c_str());
+                    const std::optional<float> sourceVzValue =
+                        SeriesValueAt(sourceVz.series, replayHoveredRow).has_value()
+                            ? std::optional<float>(*SeriesValueAt(sourceVz.series, replayHoveredRow) * sourceVz.scale)
+                            : std::nullopt;
+                    const std::optional<float> sourceZenithValue =
+                        SeriesValueAt(sourceZenith.series, replayHoveredRow).has_value()
+                            ? std::optional<float>(*SeriesValueAt(sourceZenith.series, replayHoveredRow) * sourceZenith.scale)
+                            : std::nullopt;
+                    ImGui::Text("Vertical Velocity: %s", FormatOptionalFloat(sourceVzValue, "m/s").c_str());
                     ImGui::Text("Predictor Flags: %s", FormatOptionalFloat(SeriesValueAt(sourceFlags, replayHoveredRow)).c_str());
                     ImGui::Text("State X Vel: %s", FormatOptionalFloat(SeriesValueAt(FindSeriesByName(dataset.table, "state_velocity_x"), replayHoveredRow), "m/s").c_str());
                     ImGui::Text("State Y Vel: %s", FormatOptionalFloat(SeriesValueAt(FindSeriesByName(dataset.table, "state_velocity_y"), replayHoveredRow), "m/s").c_str());
                     ImGui::Text("Inertial Ax: %s", FormatOptionalFloat(SeriesValueAt(FindSeriesByName(dataset.table, "state_inertial_acceleration_x"), replayHoveredRow), "m/s^2").c_str());
                     ImGui::Text("Inertial Ay: %s", FormatOptionalFloat(SeriesValueAt(FindSeriesByName(dataset.table, "state_inertial_acceleration_y"), replayHoveredRow), "m/s^2").c_str());
-                    ImGui::Text("Zenith Raw: %s", FormatOptionalFloat(SeriesValueAt(FindSeriesByName(dataset.table, "state_zenith"), replayHoveredRow), "rad").c_str());
+                    ImGui::Text("Zenith Raw: %s", FormatOptionalFloat(sourceZenithValue, "rad").c_str());
                     ImGui::Text("Auto Cmd: %s", FormatOptionalFloat(SeriesValueAt(FindSeriesByName(dataset.table, "sensor_auto_cmd_deg"), replayHoveredRow), "deg").c_str());
                     ImGui::Text("Altimeter: %s", FormatOptionalFloat(SeriesValueAt(FindSeriesByName(dataset.table, "sensor_altitude_feet"), replayHoveredRow), "ft").c_str());
                     ImGui::Columns(1);
