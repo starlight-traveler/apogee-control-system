@@ -1816,6 +1816,7 @@ int main(int argc, char **argv) {
 
                     ImGui::Text("Environment");
                     settingsDraftDirty |= ImGui::InputDouble("Ground temperature (F)", &settingsDraft.groundTemperatureF, 0.0, 0.0, "%.6f");
+                    settingsDraftDirty |= ImGui::InputDouble("Sea-level pressure (hPa)", &settingsDraft.seaLevelPressureHpa, 0.0, 0.0, "%.6f");
                     settingsDraftDirty |= ImGui::InputDouble("Wind speed (mph)", &settingsDraft.windSpeedMph, 0.0, 0.0, "%.6f");
                     settingsDraftDirty |= ImGui::InputDouble("Wind direction (deg)", &settingsDraft.windDirectionDeg, 0.0, 0.0, "%.6f");
                     settingsDraftDirty |= ImGui::InputDouble("Launch direction (deg)", &settingsDraft.launchDirectionDeg, 0.0, 0.0, "%.6f");

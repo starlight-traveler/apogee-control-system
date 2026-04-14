@@ -69,6 +69,8 @@ bool ParseLine(const char *line, void *context) {
     parse->sawAnySetting = true;
     if (strcmp(key, "environment.ground_temperature_f") == 0) {
         parse->settings.environment.groundTemperatureF = static_cast<float>(value);
+    } else if (strcmp(key, "environment.sea_level_pressure_hpa") == 0) {
+        parse->settings.environment.seaLevelPressureHpa = static_cast<float>(value);
     } else if (strcmp(key, "environment.wind_speed_mph") == 0) {
         parse->settings.environment.windSpeedMph = static_cast<float>(value);
     } else if (strcmp(key, "environment.wind_direction_deg") == 0) {
@@ -113,6 +115,7 @@ bool BuildFileContents(const RuntimeSettings &settings, char *buffer, size_t buf
         bufferSize,
         "# ACS runtime settings\n"
         "environment.ground_temperature_f=%.6f\n"
+        "environment.sea_level_pressure_hpa=%.6f\n"
         "environment.wind_speed_mph=%.6f\n"
         "environment.wind_direction_deg=%.6f\n"
         "environment.launch_direction_deg=%.6f\n"
@@ -123,6 +126,7 @@ bool BuildFileContents(const RuntimeSettings &settings, char *buffer, size_t buf
         "vehicle.moment_of_inertia_kg_m2=%.10f\n"
         "vehicle.dry_mass_kg=%.10f\n",
         static_cast<double>(settings.environment.groundTemperatureF),
+        static_cast<double>(settings.environment.seaLevelPressureHpa),
         static_cast<double>(settings.environment.windSpeedMph),
         static_cast<double>(settings.environment.windDirectionDeg),
         static_cast<double>(settings.environment.launchDirectionDeg),
@@ -150,6 +154,7 @@ bool RuntimeSettingsValidate(const RuntimeSettings &settings) {
     const EnvironmentModel::Config &environment = settings.environment;
     const ApogeeVehicleParameters &vehicle = settings.vehicle;
     return InClosedRange(environment.groundTemperatureF, -100.0, 150.0) &&
+           InClosedRange(environment.seaLevelPressureHpa, 800.0, 1100.0) &&
            InClosedRange(environment.windSpeedMph, 0.0, 200.0) &&
            InClosedRange(environment.windDirectionDeg, 0.0, 360.0) &&
            InClosedRange(environment.launchDirectionDeg, 0.0, 360.0) &&

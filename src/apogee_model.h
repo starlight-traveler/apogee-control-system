@@ -163,6 +163,15 @@ struct ApogeeState {
     double acsAngleDeg = 0.0;
 };
 
+struct AirRelativeState {
+    double relX = 0.0;
+    double relY = 0.0;
+    double relZ = 0.0;
+    double temperatureK = 288.15;
+    double densityRatio = 1.0;
+    double mach = 0.0;
+};
+
 class ApogeePredictor {
   public:
     /// Numerical integration modes exposed by the runtime predictor.
@@ -215,6 +224,11 @@ class ApogeePredictor {
     /// Returns reference to the Mach-dependent drag scale for adaptation.
     MachDependentDragScale &MachDragScale() { return machDragScale_; }
     const MachDependentDragScale &MachDragScale() const { return machDragScale_; }
+
+    /// Computes air-relative Mach using the same wind/temperature path as force evaluation.
+    double ComputeAirRelativeMach(const ApogeeState &state) const {
+        return BuildAirRelativeState(state).mach;
+    }
 
     /// Computes adaptive drag learning time constant based on time-to-apogee.
     /// Fast learning early in coast for quick convergence, slow near apogee for stability.
@@ -702,23 +716,12 @@ class ApogeePredictor {
 
     /// Computes linear and angular acceleration from gravity and aerodynamic loads.
     AccelResult ComputeAcceleration(const ApogeeState &state, InterpHintSet &hints) {
-        const double velX = state.verticalVelocity;
-        const double velY = state.horizontalVelocity;
-        double relX = velX;
-        double relY = velY;
-        double relZ = 0.0;
-        double temperature = 288.15;
-        double densityRatio = 1.0;
-        if (environment_ != nullptr) {
-            // Use effective wind (includes runtime estimation offset)
-            const math_utils::Vec3 wind = environment_->EffectiveWind();
-            relX -= static_cast<double>(wind.x);
-            relY -= static_cast<double>(wind.y);
-            relZ -= static_cast<double>(wind.z);
-            temperature = environment_->TemperatureKelvin(state.altitudeMeters);
-            // Get density ratio for force scaling
-            densityRatio = environment_->DensityRatio(state.altitudeMeters);
-        }
+        const AirRelativeState air = BuildAirRelativeState(state);
+        const double relX = air.relX;
+        const double relY = air.relY;
+        const double relZ = air.relZ;
+        const double temperature = air.temperatureK;
+        const double densityRatio = air.densityRatio;
         float speedOfSound = 0.0f;
         if (temperature > 0.0) {
             const float tempF = static_cast<float>(temperature);
@@ -727,11 +730,7 @@ class ApogeePredictor {
             speedOfSound = math_utils::FastSqrt(gamma * gasConstant * tempF);
         }
         const double relSpeedSquared = relX * relX + relY * relY + relZ * relZ;
-        double mach = 0.0;
-        if (speedOfSound > 0.0f && relSpeedSquared > 0.0) {
-            const float velMag = math_utils::FastSqrt(static_cast<float>(relSpeedSquared));
-            mach = static_cast<double>(velMag / speedOfSound);
-        }
+        const double mach = air.mach;
 
         const double gravityX = -static_cast<double>(constants::kGravity);
         const double gravityY = 0.0;
@@ -800,6 +799,36 @@ class ApogeePredictor {
         }
 
         return AccelResult{linearAccelX, linearAccelY, linearAccelZ, angularAccel, 0.0};
+    }
+
+    AirRelativeState BuildAirRelativeState(const ApogeeState &state) const {
+        AirRelativeState air;
+        air.relX = state.verticalVelocity;
+        air.relY = state.horizontalVelocity;
+        air.relZ = 0.0;
+        if (environment_ != nullptr) {
+            const math_utils::Vec3 wind = environment_->EffectiveWind();
+            air.relX -= static_cast<double>(wind.x);
+            air.relY -= static_cast<double>(wind.y);
+            air.relZ -= static_cast<double>(wind.z);
+            air.temperatureK = environment_->TemperatureKelvin(state.altitudeMeters);
+            air.densityRatio = environment_->DensityRatio(state.altitudeMeters);
+        }
+
+        if (air.temperatureK > 0.0) {
+            const float tempK = static_cast<float>(air.temperatureK);
+            const float gamma = static_cast<float>(constants::kGamma);
+            const float gasConstant = static_cast<float>(constants::kGasConstant);
+            const float speedOfSound = math_utils::FastSqrt(gamma * gasConstant * tempK);
+            const double relSpeedSquared =
+                air.relX * air.relX + air.relY * air.relY + air.relZ * air.relZ;
+            if (speedOfSound > 0.0f && relSpeedSquared > 0.0) {
+                const float relSpeed = math_utils::FastSqrt(static_cast<float>(relSpeedSquared));
+                air.mach = static_cast<double>(relSpeed / speedOfSound);
+            }
+        }
+
+        return air;
     }
 
     const EnvironmentModel *environment_ = nullptr;

@@ -2550,6 +2550,7 @@ static void LogTimingDiagnostics(uint32_t nowMs) {
 static RuntimeSettings RuntimeSettingsFromPayload(const telemetry::RuntimeSettingsPayloadV1 &payload) {
     RuntimeSettings settings;
     settings.environment.groundTemperatureF = static_cast<float>(payload.groundTemperatureF);
+    settings.environment.seaLevelPressureHpa = static_cast<float>(payload.seaLevelPressureHpa);
     settings.environment.windSpeedMph = static_cast<float>(payload.windSpeedMph);
     settings.environment.windDirectionDeg = static_cast<float>(payload.windDirectionDeg);
     settings.environment.launchDirectionDeg = static_cast<float>(payload.launchDirectionDeg);
@@ -2562,8 +2563,14 @@ static RuntimeSettings RuntimeSettingsFromPayload(const telemetry::RuntimeSettin
     return settings;
 }
 
+static void ApplyRuntimeSettingsToBarometers() {
+    Bmp585SensorSetSeaLevelPressureHpa(g_runtimeSettings.environment.seaLevelPressureHpa);
+    Ms5611SensorSetSeaLevelPressureHpa(g_runtimeSettings.environment.seaLevelPressureHpa);
+}
+
 /// Rebinds the live predictor stack to the currently active runtime settings.
 static void ApplyRuntimeSettingsToPredictors() {
+    ApplyRuntimeSettingsToBarometers();
     g_actuationEnvironment.Configure(g_runtimeSettings.environment);
     g_actuationPredictor.SetEnvironment(g_actuationEnvironment);
     g_actuationPredictor.SetVehicleParameters(g_runtimeSettings.vehicle);
@@ -2579,6 +2586,11 @@ static void ApplyRuntimeSettingsToPredictors() {
     flightComputer.ReconfigurePredictor(g_runtimeSettings.environment,
                                         g_runtimeSettings.vehicle,
                                         g_cfdTable.loaded ? &g_cfdTable.table : nullptr);
+    if (flightComputer.Status() == FlightStatus::Ground && !g_csvReplay.enabled) {
+        flightComputer.ResetGroundReference();
+        g_hasPadAltitude = false;
+        g_padAltitudeFeet = 0.0f;
+    }
 }
 
 /// Publishes the latest runtime settings/status snapshot to telemetry subscribers.
@@ -2603,6 +2615,7 @@ static void InitializeRuntimeSettings() {
         }
         g_runtimeSettingsStorageStatus = loadedStatus;
     }
+    ApplyRuntimeSettingsToBarometers();
     g_runtimeSettingsRevision = 1;
     g_runtimeSettingsLastRequestId = 0;
     g_runtimeSettingsLastCommandResult = telemetry::kSettingsResultNone;
@@ -3266,10 +3279,17 @@ void loop() {
     const bool hasBaroAgl = g_hasPadAltitude;
     const float altitudeAglMeters = altitudeAglFeet * 0.3048f;
 
-    // Keep baro fusion at the nominal flight weighting. Subscale flights with
-    // no active flaps should not carry a transient deweight penalty.
-    data.altimeterGateSigma = settings::actuation::kBaroInnovationGateSigmaNominal;
-    data.altimeterSigmaScale = 1.0f;
+    const bool baroTransientActive =
+        g_flapActuator.IsSettling() || (nowMs < g_altimeterTransientUntilMs);
+    data.altimeterGateSigma = baroTransientActive
+        ? settings::actuation::kBaroInnovationGateSigmaTransient
+        : settings::actuation::kBaroInnovationGateSigmaNominal;
+    data.altimeterSigmaScale = baroTransientActive
+        ? settings::actuation::kBaroDeweightSigmaScale
+        : 1.0f;
+    data.flapCommandDeg = g_servoCommandDeg;
+    data.flapEffectiveDeg = g_servoEffectiveDeg;
+    data.actuationIsSettling = g_flapActuator.IsSettling() ? 1.0f : 0.0f;
 
     FilteredState state;
     const uint32_t estimatorStartUs = micros();
@@ -3332,6 +3352,8 @@ void loop() {
     data.optimizerBestPredictedApogeeM = autoTelemetry.bestPredictedApogeeM;
     data.optimizerBestCost = autoTelemetry.bestCost;
     data.optimizerTimeToApogeeS = autoTelemetry.timeToApogeeS;
+    data.flapCommandDeg = g_servoCommandDeg;
+    data.flapEffectiveDeg = g_servoEffectiveDeg;
     data.actuationIsSettling = g_flapActuator.IsSettling() ? 1.0f : 0.0f;
     data.predictorSeedHorizontalSpeedMps = autoTelemetry.predictorSeedHorizontalSpeedMps;
     data.predictorSeedClampedZenithRad = autoTelemetry.predictorSeedClampedZenithRad;
@@ -3411,6 +3433,12 @@ void loop() {
         LOG_PRINT(g_servoEffectiveDeg, 1);
         LOG_PRINT(" mode=");
         LOG_PRINT(manualOverrideActive ? "manual" : "auto");
+        if (flightComputer.Status() == FlightStatus::Ground) {
+            LOG_PRINT(" pad=");
+            LOG_PRINT(state.padReferenceSettled > 0.5f ? "ready" : "settling");
+            LOG_PRINT(" driftfpm=");
+            LOG_PRINT(state.padReferenceDriftMps * constants::kMetersToFeet * 60.0f, 2);
+        }
         LOG_PRINT(" status=");
         LOG_PRINTLN(FlightStatusToString(flightComputer.Status()));
     }

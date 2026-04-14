@@ -14,6 +14,7 @@ over telemetry, but only while the flight computer is still in `Ground`.
 These feed the atmosphere and wind model used by the predictor:
 
 - `environment.ground_temperature_f`
+- `environment.sea_level_pressure_hpa`
 - `environment.wind_speed_mph`
 - `environment.wind_direction_deg`
 - `environment.launch_direction_deg`
@@ -62,7 +63,7 @@ editing in the field:
 1. Make sure the computer is still in `Ground`.
 2. Make sure pad altitude has been captured.
 3. Update:
-   `ground_temperature_f`, `wind_speed_mph`, `wind_direction_deg`,
+   `ground_temperature_f`, `sea_level_pressure_hpa`, `wind_speed_mph`, `wind_direction_deg`,
    `launch_direction_deg`, `measurement_height_m`, and `dry_mass_kg`.
 4. Leave `roughness_length_m`, `gradient_height_m`, `center_of_pressure_offset_m`,
    and `moment_of_inertia_kg_m2` alone unless there is a real reason to change them.
@@ -72,36 +73,33 @@ editing in the field:
 
 From `settings.h`:
 
-- `ground_temperature_f = 42.0`
-- `wind_speed_mph = 13.0`
-- `wind_direction_deg = 317.0`
-- `launch_direction_deg = 317.0`
+- `ground_temperature_f = 53.0`
+- `sea_level_pressure_hpa = 1030.9`
+- `wind_speed_mph = 8.0`
+- `wind_direction_deg = 111.0`
+- `launch_direction_deg = 111.0`
 - `roughness_length_m = 0.075`
 - `gradient_height_m = 300.0`
 - `measurement_height_m = 10.0`
-- `center_of_pressure_offset_m = 0.4389`
-- `moment_of_inertia_kg_m2 = 8.28`
-- `dry_mass_kg = 18.09975`
+- `center_of_pressure_offset_m = 0.22`
+- `moment_of_inertia_kg_m2 = 0.529`
+- `dry_mass_kg = 3.33`
 
 ## Sea-Level Pressure
 
-Sea-level pressure still is not a runtime setting. It is compile-time data in
-`settings.h`.
+Sea-level pressure is now a runtime setting:
 
-There are three separate pressure references in the code:
+- `environment.sea_level_pressure_hpa`
 
-- `settings::sensors::bmp585::kSeaLevelPressureHpa = 1022.689`
-- `settings::sensors::ms5611::kSeaLevelPressureHpa = 1018.8`
-- `settings::predictor::kSeaLevelPressurePa = 101325.0`
+That single value drives:
 
-What that means:
+- `BMP585` altitude conversion
+- `MS5611` altitude conversion
+- predictor atmosphere pressure reference
 
-- if you care about absolute pad altitude, the barometer pressure reference should match the day
-- flight logic mostly works off captured AGL, so it is less sensitive to this than the absolute displayed altitude
-- the predictor uses its own fixed sea-level pressure, separate from the barometer conversion
-
-If you change pressure in code before a flight, update every place that matters
-for the active sensors and predictor, not just one constant.
+If you change it on the pad while still in `Ground`, the firmware also clears
+the captured pad altitude and re-baselines the ground-reference altitude on the
+next valid barometer sample.
 
 ## Misc
 

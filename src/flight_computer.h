@@ -49,6 +49,8 @@ struct SensorData {
     float optimizerBestPredictedApogeeM = 0.0f;
     float optimizerBestCost = 0.0f;
     float optimizerTimeToApogeeS = 0.0f;
+    float flapCommandDeg = 0.0f;
+    float flapEffectiveDeg = 0.0f;
     float actuationIsSettling = 0.0f;
     float predictorSeedHorizontalSpeedMps = 0.0f;
     float predictorSeedClampedZenithRad = 0.0f;
@@ -80,6 +82,8 @@ struct FilteredState {
     float inertialAcceleration[3] = {0.0f, 0.0f, 0.0f};
     float zenith = 0.0f;
     float apogeeEstimate = 0.0f;
+    float padReferenceDriftMps = 0.0f;
+    float padReferenceSettled = 0.0f;
 };
 
 /// High-level flight phases used for event detection and control gating.
@@ -106,6 +110,9 @@ class FlightComputer {
     void ReconfigurePredictor(const EnvironmentModel::Config &environmentConfig,
                               const ApogeeVehicleParameters &vehicleParameters,
                               const ApogeeForceTable *forceTable = nullptr);
+
+    /// Resets pad-referenced altitude/velocity latches while staying in Ground.
+    void ResetGroundReference();
 
     /// Ingests one sensor sample and publishes the latest filtered state.
     ///
@@ -149,7 +156,10 @@ class FlightComputer {
     void UpdateAdaptiveDragScale(const ApogeeState &predictorState,
                                  double measuredVerticalAcceleration,
                                  double dtSeconds,
-                                 double timeToApogeeSeconds);
+                                 double timeToApogeeSeconds,
+                                 double flapCommandDeg,
+                                 double flapEffectiveDeg,
+                                 bool actuationIsSettling);
     KalmanFilterAccel kalmanX_;
     KalmanFilterAccel kalmanY_;
     KalmanFilterAccelAlt kalmanZ_;
@@ -174,6 +184,7 @@ class FlightComputer {
     double apogeeAltitude_ = 0.0;
     bool apogeeRecorded_ = false;
     double burnTimestamp_ = 0.0;
+    double burnDetectTimestamp_ = 0.0;
     double burnoutTimestamp_ = 0.0;
     double apogeeTimestamp_ = 0.0;
     uint8_t liftoffCandidateCount_ = 0;
@@ -181,6 +192,9 @@ class FlightComputer {
 
     double processNoiseXY_ = 0.5;
     double processNoiseZ_ = 1.0;
+    double accelSigmaXY_ = 0.8;
+    double accelSigmaZ_ = 0.7;
+    double altitudeSigma_ = 1.0;
 
     // Output-only smoothing state (does not affect estimator internals/status decisions).
     bool outputFilterInitialized_ = false;
@@ -192,6 +206,9 @@ class FlightComputer {
     double windEstimateHorizontalMps_ = 0.0;
     double coastStartTime_ = 0.0;
     bool windEstimationActive_ = false;
+    double groundReferenceDriftRateMps_ = 0.0;
+    double groundReferenceStableSince_ = 0.0;
+    bool groundReferenceSettled_ = false;
 
 };
 

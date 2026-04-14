@@ -11,3 +11,5 @@ bool Bmp585SensorAcquire(SensorData &out);
 bool Bmp585SensorIsInitialized();
 /// Returns cached timing and latest-sample diagnostics for the BMP585.
 BarometerDiagnostics Bmp585SensorGetDiagnostics();
+/// Updates the sea-level pressure reference used by altitude conversion.
+void Bmp585SensorSetSeaLevelPressureHpa(float pressureHpa);

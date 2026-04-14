@@ -28,27 +28,6 @@
 #ifndef APOGEE_PREDICTOR_MAX_STEPS
 #define APOGEE_PREDICTOR_MAX_STEPS 256
 #endif
-
-
-
-  // - settings::sensors::bmp585::kSeaLevelPressureHpa
-  //   in src/settings.h:477
-  // - settings::sensors::ms5611::kSeaLevelPressureHpa
-  //   in src/settings.h:490
-  // - settings::predictor::kSeaLevelPressurePa
-  //   in src/settings.h:863
-
-  // Use the same day-of sea-level pressure, just in the correct units:
-
-  // - barometers use hPa
-  // - predictor uses Pa
-
-  // So for example, if the day-of value is 1017.6 hPa, then:
-
-  // - BMP585: 1017.6f
-  // - MS5611: 1017.6f
-  // - predictor: 101760.0f
-
 namespace settings {
 // ---------------------------------------------------------------------------
 // Build/Profile Settings
@@ -304,6 +283,41 @@ constexpr double kSigmaAccelZ = 0.7;
 constexpr double kSigmaAltimeter = 1.0;
 constexpr double kProcessNoiseXY = 0.6;
 constexpr double kProcessNoiseZ = 1.2;
+// Grounded filter tuning: prioritize a stable pad state and low noise.
+constexpr double kGroundAccelSigmaScale = 0.85;
+constexpr double kGroundAltSigmaScale = 0.75;
+constexpr double kGroundProcessNoiseXYScale = 0.5;
+constexpr double kGroundProcessNoiseZScale = 0.4;
+// Burn tuning: IMU vibration and baro lag are both materially worse here.
+constexpr double kBurnAccelSigmaScale = 2.2;
+constexpr double kBurnAltSigmaScale = 3.0;
+constexpr double kBurnProcessNoiseXYScale = 1.8;
+constexpr double kBurnProcessNoiseZScale = 2.5;
+// Coast / overshoot are the nominal predictor-driven phases.
+constexpr double kCoastAccelSigmaScale = 1.0;
+constexpr double kCoastAltSigmaScale = 1.0;
+constexpr double kCoastProcessNoiseXYScale = 1.0;
+constexpr double kCoastProcessNoiseZScale = 1.0;
+// Descent is lower dynamic pressure but still less benign than the pad.
+constexpr double kDescentAccelSigmaScale = 1.2;
+constexpr double kDescentAltSigmaScale = 1.0;
+constexpr double kDescentProcessNoiseXYScale = 1.1;
+constexpr double kDescentProcessNoiseZScale = 1.2;
+// Slow random walk for the vertical accel-bias state.
+constexpr double kProcessNoiseZBias = 0.05;
+// Reject accel samples whose normalized innovation exceeds this gate.
+constexpr double kAccelInnovationGateSigma = 4.0;
+// Strong grounded pseudo-measurements keep z/vz converged at the pad without
+// hard-resetting the vertical filter every cycle.
+constexpr double kGroundConstraintAltitudeSigma = 0.25;
+constexpr double kGroundConstraintVelocitySigma = 0.15;
+// While grounded, slowly track pad baro drift from thermal settling and
+// ambient changes, then freeze the reference once launch is being detected.
+constexpr double kGroundAltitudeReferenceTauSeconds = 30.0;
+// Smoothed pad-reference drift rate used for baro readiness reporting.
+constexpr double kPadReferenceDriftTauSeconds = 8.0;
+constexpr double kPadReadyMaxDriftMps = 0.0035;
+constexpr double kPadReadyHoldSeconds = 15.0;
 constexpr double kApogeeTargetMeters = 822.96;
 // Predictor-only horizontal speed seed tuning. These values intentionally keep
 // XY speed conservative because the estimator does not have a horizontal
@@ -860,7 +874,7 @@ namespace predictor {
 constexpr bool kEnableMachDependentDrag = true;
 constexpr bool kEnableUncertaintyBounds = true;
 constexpr bool kEnableDensityScaling = true;
-constexpr bool kEnableWindEstimation = true;
+constexpr bool kEnableWindEstimation = false;
 
 // Mach-dependent drag adaptation: bin edges for piecewise-linear interpolation.
 // Scales are learned independently in each bin during coast phase.
@@ -880,13 +894,9 @@ constexpr float kMachDragAdaptTauTransitionEnd = 1.5f;   // Fully conservative b
 constexpr float kUncertaintyDragPerturbFraction = 0.12f;  // +/- 12% drag variation
 constexpr float kUncertaintyWindPerturbMps = 3.0f;        // +/- 3 m/s wind variation
 
-// - MS5611: 1017.6f
-// - predictor: 101760.0fs
-// Atmospheric density model: ISA reference values.
-constexpr float kSeaLevelPressurePa = 103090.0f;
-// 101760
-constexpr float kSeaLevelTemperatureK = 284.26f;
-constexpr float kTemperatureLapseRateKPerM = 0.0065f;
+// CFD table reference density. The force table stores absolute forces, so the
+// runtime atmosphere scales those forces relative to the density used when the
+// CFD table was generated.
 constexpr float kReferenceDensityKgPerM3 = 1.225f;
 
 // Wind estimation: low-pass filter for horizontal acceleration residual.

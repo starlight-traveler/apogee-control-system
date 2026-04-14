@@ -12,14 +12,14 @@ namespace {
 
 MS5611_SPI g_pressureSensor(settings::sensors::ms5611::kChipSelectPin, &SPI);
 
-constexpr float kSeaLevelPressureHpa = settings::sensors::ms5611::kSeaLevelPressureHpa;
-constexpr float kSeaLevelPressureInv = 1.0f / kSeaLevelPressureHpa;
 constexpr float kMaxValidAltitudeFeet = settings::sensors::ms5611::kMaxValidAltitudeFeet;
 constexpr uint32_t kMinReadSpacingUs = settings::sensors::ms5611::kMinReadSpacingUs;
 constexpr osr_t kOversampling = OSR_ULTRA_LOW;
 
 bool g_initialized = false;
 bool g_hasSample = false;
+float g_seaLevelPressureHpa = settings::sensors::ms5611::kSeaLevelPressureHpa;
+float g_seaLevelPressureInv = 1.0f / settings::sensors::ms5611::kSeaLevelPressureHpa;
 
 float g_lastAltitudeFeet = 0.0f;
 float g_lastPressureHpa = 0.0f;
@@ -44,7 +44,7 @@ void UpdateAverage(uint32_t sample, uint32_t &average) {
 
 /// Converts pressure to altitude in feet using the MS5611 sea-level reference.
 float ComputeAltitudeFeet(float pressureHpa) {
-    const float ratio = pressureHpa * kSeaLevelPressureInv;
+    const float ratio = pressureHpa * g_seaLevelPressureInv;
     if (!(ratio > 0.0f)) {
         return 0.0f;
     }
@@ -141,4 +141,15 @@ BarometerDiagnostics Ms5611SensorGetDiagnostics() {
     diagnostics.averageUpdatePeriodUs = g_averageUpdatePeriodUs;
     diagnostics.lastUpdateMicros = g_lastUpdateMicros;
     return diagnostics;
+}
+
+void Ms5611SensorSetSeaLevelPressureHpa(float pressureHpa) {
+    if (!(pressureHpa > 0.0f) || !isfinite(pressureHpa)) {
+        return;
+    }
+    g_seaLevelPressureHpa = pressureHpa;
+    g_seaLevelPressureInv = 1.0f / pressureHpa;
+    if (g_lastPressureHpa > 0.0f) {
+        g_lastAltitudeFeet = ComputeAltitudeFeet(g_lastPressureHpa);
+    }
 }

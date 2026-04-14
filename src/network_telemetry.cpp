@@ -165,6 +165,7 @@ void FillPacket(const TelemetrySnapshot &snapshot, telemetry::PacketV1 &packet) 
 
 void FillSettingsPayload(const RuntimeSettings &settings, telemetry::RuntimeSettingsPayloadV1 &payload) {
     payload.groundTemperatureF = static_cast<double>(settings.environment.groundTemperatureF);
+    payload.seaLevelPressureHpa = static_cast<double>(settings.environment.seaLevelPressureHpa);
     payload.windSpeedMph = static_cast<double>(settings.environment.windSpeedMph);
     payload.windDirectionDeg = static_cast<double>(settings.environment.windDirectionDeg);
     payload.launchDirectionDeg = static_cast<double>(settings.environment.launchDirectionDeg);

@@ -11,6 +11,7 @@ class EnvironmentModel {
   public:
     struct Config {
         float groundTemperatureF = settings::environment::kGroundTemperatureF;
+        float seaLevelPressureHpa = settings::sensors::bmp585::kSeaLevelPressureHpa;
         float windSpeedMph = settings::environment::kWindSpeedMph;
         float windDirectionDeg = settings::environment::kWindDirectionDeg;
         float launchDirectionDeg = settings::environment::kLaunchDirectionDeg;
@@ -28,6 +29,14 @@ class EnvironmentModel {
         initialiseWind();
     }
 
+    double SeaLevelPressurePa() const {
+        return static_cast<double>(config_.seaLevelPressureHpa) * 100.0;
+    }
+
+    double SeaLevelTemperatureKelvin() const {
+        return TemperatureKelvin(0.0);
+    }
+
     // Temperature as a function of altitude (meters).
     double TemperatureKelvin(double altitudeMeters) const {
         const double altitudeFeet = altitudeMeters * constants::kMetersToFeet;
@@ -38,11 +47,11 @@ class EnvironmentModel {
     // Atmospheric pressure at altitude using barometric formula (Pa).
     double PressurePa(double altitudeMeters) const {
         if (!settings::predictor::kEnableDensityScaling) {
-            return static_cast<double>(settings::predictor::kSeaLevelPressurePa);
+            return SeaLevelPressurePa();
         }
         const double T = TemperatureKelvin(altitudeMeters);
-        const double T0 = static_cast<double>(settings::predictor::kSeaLevelTemperatureK);
-        const double P0 = static_cast<double>(settings::predictor::kSeaLevelPressurePa);
+        const double T0 = SeaLevelTemperatureKelvin();
+        const double P0 = SeaLevelPressurePa();
         // Barometric formula: P = P0 * (T / T0)^(g / (L * R))
         // With g = 9.80665, R = 287.05, L = 0.0065, exponent ≈ 5.2561 for ISA
         constexpr double kBarometricExponent = 5.2561;
@@ -66,7 +75,7 @@ class EnvironmentModel {
         return P / (kGasConstant * T);
     }
 
-    // Density ratio relative to sea-level reference (dimensionless).
+    // Density ratio relative to the CFD table's reference density (dimensionless).
     // Applies pre-flight calibration correction if CalibrateFromMeasurements() was called.
     double DensityRatio(double altitudeMeters) const {
         const double density = DensityKgPerM3(altitudeMeters);

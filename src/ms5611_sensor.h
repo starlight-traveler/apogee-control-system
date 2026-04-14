@@ -8,3 +8,5 @@ bool Ms5611SensorBegin();
 bool Ms5611SensorAcquire();
 /// Returns cached timing/latest-sample diagnostics for the MS5611.
 BarometerDiagnostics Ms5611SensorGetDiagnostics();
+/// Updates the sea-level pressure reference used by altitude conversion.
+void Ms5611SensorSetSeaLevelPressureHpa(float pressureHpa);

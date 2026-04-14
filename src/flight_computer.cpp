@@ -9,18 +9,37 @@
 
 namespace {
 
-/// Rotates body-frame acceleration into the simplified inertial frame used by the filters.
-math_utils::Vec3 RotateBodyToInertial(const math_utils::Vec3 &bodyAccel, float zenith) {
-    constexpr float kHalfPi = 1.5707963267948966f;
-    const float angle = zenith - kHalfPi;
-    float sinA = 0.0f;
-    float cosA = 1.0f;
-    math_utils::FastSinCos(angle, sinA, cosA);
+/// Rotates body-frame acceleration into the filter frame using the main quaternion.
+///
+/// The filter publishes vertical acceleration in `.z`, but the underlying
+/// Earth-frame vertical axis for this vehicle convention is the predictor's
+/// Earth `x` axis. Yaw error does not affect `result.z` because the vertical
+/// component depends only on the quaternion-derived up vector.
+math_utils::Vec3 RotateBodyToInertial(const math_utils::Vec3 &bodyAccel,
+                                      const math_utils::Quaternion &orientation) {
+    const float w = orientation.w;
+    const float x = orientation.x;
+    const float y = orientation.y;
+    const float z = orientation.z;
+
+    const float r00 = 1.0f - 2.0f * (y * y + z * z);
+    const float r01 = 2.0f * (x * y - w * z);
+    const float r02 = 2.0f * (x * z + w * y);
+    const float r10 = 2.0f * (x * y + w * z);
+    const float r11 = 1.0f - 2.0f * (x * x + z * z);
+    const float r12 = 2.0f * (y * z - w * x);
+    const float r20 = 2.0f * (x * z - w * y);
+    const float r21 = 2.0f * (y * z + w * x);
+    const float r22 = 1.0f - 2.0f * (x * x + y * y);
+
+    const float earthX = r00 * bodyAccel.x + r10 * bodyAccel.y + r20 * bodyAccel.z;
+    const float earthY = r01 * bodyAccel.x + r11 * bodyAccel.y + r21 * bodyAccel.z;
+    const float earthZ = r02 * bodyAccel.x + r12 * bodyAccel.y + r22 * bodyAccel.z;
 
     math_utils::Vec3 result;
-    result.x = bodyAccel.x * cosA + bodyAccel.z * sinA;
-    result.y = bodyAccel.y;
-    result.z = -bodyAccel.x * sinA + bodyAccel.z * cosA - constants::kGravity;
+    result.x = -earthZ;
+    result.y = earthY;
+    result.z = earthX - constants::kGravity;
     return result;
 }
 
@@ -54,6 +73,40 @@ double ApplySlewLimit(double previous, double target, double maxDeltaPerStep) {
     return target;
 }
 
+struct FilterPhaseTuning {
+    double accelSigmaScale = 1.0;
+    double altitudeSigmaScale = 1.0;
+    double processNoiseXYScale = 1.0;
+    double processNoiseZScale = 1.0;
+};
+
+FilterPhaseTuning ComputeFilterPhaseTuning(FlightStatus status) {
+    switch (status) {
+        case FlightStatus::Ground:
+            return {settings::flight::kGroundAccelSigmaScale,
+                    settings::flight::kGroundAltSigmaScale,
+                    settings::flight::kGroundProcessNoiseXYScale,
+                    settings::flight::kGroundProcessNoiseZScale};
+        case FlightStatus::Burn:
+            return {settings::flight::kBurnAccelSigmaScale,
+                    settings::flight::kBurnAltSigmaScale,
+                    settings::flight::kBurnProcessNoiseXYScale,
+                    settings::flight::kBurnProcessNoiseZScale};
+        case FlightStatus::Descent:
+            return {settings::flight::kDescentAccelSigmaScale,
+                    settings::flight::kDescentAltSigmaScale,
+                    settings::flight::kDescentProcessNoiseXYScale,
+                    settings::flight::kDescentProcessNoiseZScale};
+        case FlightStatus::Coast:
+        case FlightStatus::Overshoot:
+        default:
+            return {settings::flight::kCoastAccelSigmaScale,
+                    settings::flight::kCoastAltSigmaScale,
+                    settings::flight::kCoastProcessNoiseXYScale,
+                    settings::flight::kCoastProcessNoiseZScale};
+    }
+}
+
 }  // namespace
 
 FlightComputer::FlightComputer() = default;
@@ -76,7 +129,11 @@ void FlightComputer::Begin(double sigmaAccelXY,
     kalmanX_.Configure(sigmaAccelXY);
     kalmanY_.Configure(sigmaAccelXY);
     kalmanZ_.Configure(sigmaAccelZ, sigmaAltimeter);
+    kalmanZ_.SetBiasProcessSigma(settings::flight::kProcessNoiseZBias);
 
+    accelSigmaXY_ = sigmaAccelXY;
+    accelSigmaZ_ = sigmaAccelZ;
+    altitudeSigma_ = sigmaAltimeter;
     processNoiseXY_ = processXY;
     processNoiseZ_ = processZ;
     apogeeTargetMeters_ = apogeeTargetMeters;
@@ -95,6 +152,21 @@ void FlightComputer::ReconfigurePredictor(const EnvironmentModel::Config &enviro
     apogeePredictor_.ResetAxialDragScale();
 }
 
+void FlightComputer::ResetGroundReference() {
+    altitudeReferenceInitialized_ = false;
+    altitudeReferenceMeters_ = 0.0;
+    lastGroundRelativeAltitudeMeters_ = 0.0;
+    groundRelativeVelocityMps_ = 0.0;
+    groundReferenceDriftRateMps_ = 0.0;
+    groundReferenceStableSince_ = 0.0;
+    groundReferenceSettled_ = false;
+    liftoffCandidateCount_ = 0;
+    burnDetectTimestamp_ = 0.0;
+    burnoutCandidateCount_ = 0;
+    kalmanZ_.Reset();
+    smoothedVelocity_[2] = 0.0;
+}
+
 /// Processes one sensor sample and updates the filtered flight state.
 bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
     const bool hasIcmAccel =
@@ -105,8 +177,9 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
         !(data.gyro[0] == 0.0f && data.gyro[1] == 0.0f && data.gyro[2] == 0.0f);
     const bool hasLsmGyro =
         !(data.gyroLSM[0] == 0.0f && data.gyroLSM[1] == 0.0f && data.gyroLSM[2] == 0.0f);
-    if (!hasIcmAccel && !hasLsmAccel) {
-        return false;  // No usable acceleration source means the filters cannot advance safely.
+    const bool hasAnyAccel = hasIcmAccel || hasLsmAccel;
+    if (!hasAnyAccel && !data.baroSampleFresh) {
+        return false;  // No fresh altitude and no accel data means the filter cannot advance safely.
     }
     
     double dt = static_cast<double>(settings::flight::kDefaultDtSeconds);
@@ -120,14 +193,51 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
     }
     lastTimestamp_ = static_cast<double>(data.timestamp);
     const double altitudeMeters = static_cast<double>(data.altitudeFeet) * constants::kFeetToMeters;
-    if (!altitudeReferenceInitialized_ && std::isfinite(altitudeMeters)) {
-        altitudeReferenceMeters_ = altitudeMeters;
-        altitudeReferenceInitialized_ = true;
-        lastGroundRelativeAltitudeMeters_ = 0.0;
-        groundRelativeVelocityMps_ = 0.0;
+    if (data.baroSampleFresh && std::isfinite(altitudeMeters)) {
+        if (!altitudeReferenceInitialized_) {
+            altitudeReferenceMeters_ = altitudeMeters;
+            altitudeReferenceInitialized_ = true;
+            lastGroundRelativeAltitudeMeters_ = 0.0;
+            groundRelativeVelocityMps_ = 0.0;
+            groundReferenceDriftRateMps_ = 0.0;
+            groundReferenceStableSince_ = static_cast<double>(data.timestamp);
+            groundReferenceSettled_ = false;
+        } else if (status_ == FlightStatus::Ground && burnDetectTimestamp_ <= 0.0) {
+            const double previousReferenceMeters = altitudeReferenceMeters_;
+            const double referenceAlpha = ComputeSmoothingAlpha(
+                dt,
+                settings::flight::kGroundAltitudeReferenceTauSeconds);
+            altitudeReferenceMeters_ += referenceAlpha * (altitudeMeters - altitudeReferenceMeters_);
+            if (dt > 1.0e-4) {
+                const double rawDriftRateMps = (altitudeReferenceMeters_ - previousReferenceMeters) / dt;
+                const double driftAlpha = ComputeSmoothingAlpha(
+                    dt,
+                    settings::flight::kPadReferenceDriftTauSeconds);
+                groundReferenceDriftRateMps_ +=
+                    driftAlpha * (rawDriftRateMps - groundReferenceDriftRateMps_);
+            }
+            const bool driftIsStable =
+                std::fabs(groundReferenceDriftRateMps_) <= settings::flight::kPadReadyMaxDriftMps;
+            if (driftIsStable) {
+                if (groundReferenceStableSince_ <= 0.0) {
+                    groundReferenceStableSince_ = static_cast<double>(data.timestamp);
+                }
+                groundReferenceSettled_ =
+                    (static_cast<double>(data.timestamp) - groundReferenceStableSince_) >=
+                    settings::flight::kPadReadyHoldSeconds;
+            } else {
+                groundReferenceStableSince_ = 0.0;
+                groundReferenceSettled_ = false;
+            }
+        }
     }
     const double relativeAltitudeMeters =
         altitudeReferenceInitialized_ ? (altitudeMeters - altitudeReferenceMeters_) : 0.0;
+    const FilterPhaseTuning phaseTuning = ComputeFilterPhaseTuning(status_);
+    kalmanX_.SetMeasurementSigma(accelSigmaXY_ * phaseTuning.accelSigmaScale);
+    kalmanY_.SetMeasurementSigma(accelSigmaXY_ * phaseTuning.accelSigmaScale);
+    kalmanZ_.SetMeasurementSigmas(accelSigmaZ_ * phaseTuning.accelSigmaScale,
+                                  altitudeSigma_ * phaseTuning.altitudeSigmaScale);
 
     float accelBody[3];
     float gyroBody[3] = {0.0f, 0.0f, 0.0f};
@@ -136,8 +246,11 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
     (void)selectedQuaternionSource;
     const bool hasFreshIcmAccel = hasIcmAccel && data.icmSampleFresh;
     const bool hasFreshLsmAccel = hasLsmAccel && data.lsmSampleFresh;
+    const bool hasFreshAccelMeasurement = hasFreshIcmAccel || hasFreshLsmAccel;
     const bool hasFreshIcmGyro = hasIcmGyro && data.icmSampleFresh;
     const bool hasFreshLsmGyro = hasLsmGyro && data.lsmSampleFresh;
+    const bool hasFreshAltitudeMeasurement =
+        data.baroSampleFresh && altitudeReferenceInitialized_ && std::isfinite(relativeAltitudeMeters);
 
     auto loadIcmGyro = [&]() {
         if (hasFreshIcmGyro) {
@@ -194,11 +307,16 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
         accelBody[1] = data.accelLSM[1];
         accelBody[2] = data.accelLSM[2];
         loadLsmGyro();
-    } else {
+    } else if (hasIcmAccel) {
         accelBody[0] = data.accelICM[0];
         accelBody[1] = data.accelICM[1];
         accelBody[2] = data.accelICM[2];
         loadIcmGyro();
+    } else {
+        accelBody[0] = 0.0f;
+        accelBody[1] = 0.0f;
+        accelBody[2] = 0.0f;
+        loadLsmGyro();
     }
 
     math_utils::Quaternion orientation = previousQuaternion_;
@@ -257,18 +375,34 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
         accelBody[0],
         accelBody[1],
         accelBody[2]);
-    const math_utils::Vec3 inertialAcceleration = RotateBodyToInertial(bodyAccel, static_cast<float>(zenithRadians_));
+    const math_utils::Vec3 inertialAcceleration = hasAnyAccel
+        ? (quaternionValid_
+               ? RotateBodyToInertial(bodyAccel, orientation)
+               : RotateBodyToInertial(bodyAccel, previousQuaternion_))
+        : math_utils::MakeVec3(0.0f, 0.0f, 0.0f);
 
-    kalmanX_.Predict(dt, processNoiseXY_);
-    kalmanY_.Predict(dt, processNoiseXY_);
-    kalmanZ_.Predict(dt, processNoiseZ_);
+    kalmanX_.Predict(dt, processNoiseXY_ * phaseTuning.processNoiseXYScale);
+    kalmanY_.Predict(dt, processNoiseXY_ * phaseTuning.processNoiseXYScale);
+    kalmanZ_.Predict(dt, processNoiseZ_ * phaseTuning.processNoiseZScale);
 
-    kalmanX_.Update(inertialAcceleration.x);
-    kalmanY_.Update(inertialAcceleration.y);
-    kalmanZ_.Update(static_cast<float>(inertialAcceleration.z),
-                    static_cast<float>(relativeAltitudeMeters),
-                    static_cast<double>(data.altimeterSigmaScale),
-                    static_cast<double>(data.altimeterGateSigma));
+    if (hasFreshAccelMeasurement) {
+        kalmanX_.Update(inertialAcceleration.x);
+        kalmanY_.Update(inertialAcceleration.y);
+    }
+    if (hasFreshAccelMeasurement && hasFreshAltitudeMeasurement) {
+        kalmanZ_.UpdateAccelAndAltitude(static_cast<double>(inertialAcceleration.z),
+                                        relativeAltitudeMeters,
+                                        static_cast<double>(data.altimeterSigmaScale),
+                                        static_cast<double>(data.altimeterGateSigma),
+                                        static_cast<double>(settings::flight::kAccelInnovationGateSigma));
+    } else if (hasFreshAccelMeasurement) {
+        kalmanZ_.UpdateAccelOnly(static_cast<double>(inertialAcceleration.z),
+                                 static_cast<double>(settings::flight::kAccelInnovationGateSigma));
+    } else if (hasFreshAltitudeMeasurement) {
+        kalmanZ_.UpdateAltitudeOnly(relativeAltitudeMeters,
+                                    static_cast<double>(data.altimeterSigmaScale),
+                                    static_cast<double>(data.altimeterGateSigma));
+    }
 
     double rawPosZ = kalmanZ_.Position();
     double rawVelZ = kalmanZ_.Velocity();
@@ -293,25 +427,38 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
         const bool velocitySuggestsLiftoff =
             groundRelativeVelocityMps_ > settings::flight::kLiftoffVelocityThresholdMps;
 
-        if (accelerationSuggestsLiftoff && altitudeSuggestsLiftoff && velocitySuggestsLiftoff) {
+        if (accelerationSuggestsLiftoff) {
             if (liftoffCandidateCount_ < 255) {
                 ++liftoffCandidateCount_;
             }
         } else {
             liftoffCandidateCount_ = 0;
+            burnDetectTimestamp_ = 0.0;
         }
 
-        if (liftoffCandidateCount_ >= settings::flight::kLiftoffConfirmSamples) {
+        if (burnDetectTimestamp_ <= 0.0 &&
+            liftoffCandidateCount_ >= settings::flight::kLiftoffConfirmSamples) {
+            burnDetectTimestamp_ = static_cast<double>(data.timestamp);
+        }
+
+        if (burnDetectTimestamp_ > 0.0 &&
+            (velocitySuggestsLiftoff || altitudeSuggestsLiftoff)) {
             status_ = FlightStatus::Burn;
-            burnTimestamp_ = static_cast<double>(data.timestamp);
+            burnTimestamp_ = burnDetectTimestamp_;
             liftoffCandidateCount_ = 0;
             burnoutCandidateCount_ = 0;
-            ReportEvent(false, data.timestamp, "Engine burn");
+            ReportEvent(false, static_cast<float>(burnTimestamp_), "Engine burn");
             groundRelativeVelocityMps_ = 0.0;
         } else {
-            // Hold the vertical filter at the pad while grounded so z/vz
-            // cannot drift away from zero before liftoff is confirmed.
-            kalmanZ_.Reset();
+            // Keep the vertical filter alive on the pad so covariance and bias
+            // can settle before launch, while strongly constraining z and vz to
+            // the grounded condition.
+            kalmanZ_.ApplyGroundConstraints(
+                settings::flight::kGroundConstraintAltitudeSigma,
+                settings::flight::kGroundConstraintVelocitySigma);
+            rawPosZ = kalmanZ_.Position();
+            rawVelZ = kalmanZ_.Velocity();
+            accZ = kalmanZ_.Acceleration();
             publishedPosZ = 0.0;
             publishedVelZ = 0.0;
             smoothedVelocity_[2] = 0.0;
@@ -404,9 +551,19 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
         predictorState.horizontalVelocity = predictorHorizontalVelocity;
         predictorState.zenith = seedZenith;
         predictorState.angularVelocity = predictorAngularRate;
+        predictorState.acsAngleDeg =
+            std::clamp(static_cast<double>(data.flapEffectiveDeg),
+                       0.0,
+                       static_cast<double>(settings::actuation::kServoMaxActuationDeg));
         // Single integration pass returns both altitude and time-to-apogee
         const PredictResult prediction = apogeePredictor_.PredictApogeeWithTime(predictorState);
-        UpdateAdaptiveDragScale(predictorState, accZ, dt, prediction.timeToApogee);
+        UpdateAdaptiveDragScale(predictorState,
+                                accZ,
+                                dt,
+                                prediction.timeToApogee,
+                                static_cast<double>(data.flapCommandDeg),
+                                static_cast<double>(data.flapEffectiveDeg),
+                                data.actuationIsSettling > 0.5f);
         lastApogeePrediction_ = prediction.altitude;
     } else {
         ResetPredictorHorizontalVelocityTracker(predictorHorizontalVelocity_);
@@ -462,6 +619,8 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
     output.inertialAcceleration[2] = static_cast<float>(inertialAcceleration.z);
     output.zenith = static_cast<float>(zenithRadians_);
     output.apogeeEstimate = static_cast<float>(lastApogeePrediction_);
+    output.padReferenceDriftMps = static_cast<float>(groundReferenceDriftRateMps_);
+    output.padReferenceSettled = groundReferenceSettled_ ? 1.0f : 0.0f;
 
     lastZenith_ = zenithRadians_;
 
@@ -473,13 +632,23 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
 void FlightComputer::UpdateAdaptiveDragScale(const ApogeeState &predictorState,
                                              double measuredVerticalAcceleration,
                                              double dtSeconds,
-                                             double timeToApogeeSeconds) {
+                                             double timeToApogeeSeconds,
+                                             double flapCommandDeg,
+                                             double flapEffectiveDeg,
+                                             bool actuationIsSettling) {
     if (status_ != FlightStatus::Coast ||
         predictorState.verticalVelocity <= 0.0 ||
         !quaternionValid_ ||
         !PredictorSeedHasFreshSample(dtSeconds) ||
         !std::isfinite(measuredVerticalAcceleration) ||
         !std::isfinite(predictorState.zenith)) {
+        return;
+    }
+
+    const double flapTrackingErrorDeg = std::fabs(flapCommandDeg - flapEffectiveDeg);
+    if (actuationIsSettling ||
+        !std::isfinite(flapTrackingErrorDeg) ||
+        flapTrackingErrorDeg > static_cast<double>(settings::actuation::kServoSettlingAngleEpsilonDeg)) {
         return;
     }
 
@@ -504,16 +673,7 @@ void FlightComputer::UpdateAdaptiveDragScale(const ApogeeState &predictorState,
                    residualClamp);
 
     // Compute Mach number for Mach-dependent adaptation.
-    double mach = 0.0;
-    const double temperature = environment_.TemperatureKelvin(predictorState.altitudeMeters);
-    if (temperature > 0.0) {
-        const double speedOfSound = std::sqrt(constants::kGamma * constants::kGasConstant * temperature);
-        const double totalSpeed = std::sqrt(predictorState.verticalVelocity * predictorState.verticalVelocity +
-                                            predictorState.horizontalVelocity * predictorState.horizontalVelocity);
-        if (speedOfSound > 0.0) {
-            mach = totalSpeed / speedOfSound;
-        }
-    }
+    const double mach = apogeePredictor_.ComputeAirRelativeMach(predictorState);
 
     // Update Mach-dependent drag scale if enabled.
     if (settings::predictor::kEnableMachDependentDrag) {
@@ -582,12 +742,16 @@ void FlightComputer::ResetInternalState() {
     altitudeReferenceMeters_ = 0.0;
     lastGroundRelativeAltitudeMeters_ = 0.0;
     groundRelativeVelocityMps_ = 0.0;
+    groundReferenceDriftRateMps_ = 0.0;
+    groundReferenceStableSince_ = 0.0;
+    groundReferenceSettled_ = false;
     quaternionValid_ = false;
     previousQuaternion_ = math_utils::MakeQuaternion(1.0f, 0.0f, 0.0f, 0.0f);
     lastApogeePrediction_ = 0.0;
     apogeeAltitude_ = 0.0;
     apogeeRecorded_ = false;
     burnTimestamp_ = 0.0;
+    burnDetectTimestamp_ = 0.0;
     burnoutTimestamp_ = 0.0;
     apogeeTimestamp_ = 0.0;
     liftoffCandidateCount_ = 0;

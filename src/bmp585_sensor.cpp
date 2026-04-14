@@ -20,14 +20,13 @@ Adafruit_BMP5xx g_pressureSensor;
 
 constexpr uint8_t kChipSelectPin = 35;
 constexpr uint32_t kSampleIntervalUs = 10000UL;
-
-constexpr float kSeaLevelPressureHpa = settings::sensors::bmp585::kSeaLevelPressureHpa;
-constexpr float kSeaLevelPressureInv = 1.0f / kSeaLevelPressureHpa;
 constexpr float kMaxAltitudeRateFeetPerSecond = settings::sensors::bmp585::kMaxAltitudeRateFeetPerSecond;
 constexpr float kMinSpikeJumpFeet = settings::sensors::bmp585::kMinSpikeJumpFeet;
 constexpr float kMaxValidAltitudeFeet = settings::sensors::bmp585::kMaxValidAltitudeFeet;
 bool g_initialized = false;
 bool g_hasSample = false;
+float g_seaLevelPressureHpa = settings::sensors::bmp585::kSeaLevelPressureHpa;
+float g_seaLevelPressureInv = 1.0f / settings::sensors::bmp585::kSeaLevelPressureHpa;
 
 float g_lastAltitudeFeet = 0.0f;
 float g_lastPressureHpa = 0.0f;
@@ -62,7 +61,7 @@ bool ConfigureSensor() {
 
 /// Converts pressure to altitude in feet using the configured sea-level reference.
 float ComputeAltitudeFeet(float pressureHpa) {
-    const float32_t ratio = std::max(pressureHpa * kSeaLevelPressureInv, 1.0e-6f);
+    const float32_t ratio = std::max(pressureHpa * g_seaLevelPressureInv, 1.0e-6f);
     const float32_t powTerm = static_cast<float32_t>(std::pow(static_cast<double>(ratio), 0.190294957));
 
     float32_t buffer[1] = {powTerm};
@@ -183,7 +182,7 @@ bool Bmp585SensorAcquire(SensorData &out) {
         if (out.timestamp == 0.0f && g_lastTimestamp > 0.0f) {
             out.timestamp = g_lastTimestamp;
         }
-        return true;
+        return false;
     }
 
     UpdateCachedSample(pressureHpa, g_pressureSensor.temperature);
@@ -214,4 +213,15 @@ BarometerDiagnostics Bmp585SensorGetDiagnostics() {
     diagnostics.averageUpdatePeriodUs = g_averageUpdatePeriodUs;
     diagnostics.lastUpdateMicros = g_lastUpdateMicros;
     return diagnostics;
+}
+
+void Bmp585SensorSetSeaLevelPressureHpa(float pressureHpa) {
+    if (!(pressureHpa > 0.0f) || !isfinite(pressureHpa)) {
+        return;
+    }
+    g_seaLevelPressureHpa = pressureHpa;
+    g_seaLevelPressureInv = 1.0f / pressureHpa;
+    if (g_lastPressureHpa > 0.0f) {
+        g_lastAltitudeFeet = ComputeAltitudeFeet(g_lastPressureHpa);
+    }
 }

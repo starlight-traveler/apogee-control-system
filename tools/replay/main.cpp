@@ -176,12 +176,18 @@ struct ProgramOptions {
     bool showHelp = false;
     bool quiet = false;
     bool ignoreLoggedState = false;
+    bool rebuildMainQuaternion = false;
     float sigmaAccelXY = 0.5f;
     float sigmaAccelZ = 0.5f;
     float sigmaAltimeter = 0.5f;
     float processXY = 0.5f;
     float processZ = 1.0f;
     float apogeeTargetMeters = 1550.0f;
+    std::optional<float> cpOffsetMetersOverride;
+    std::optional<float> momentOfInertiaOverride;
+    std::optional<float> dryMassKgOverride;
+    float seededZenithScale = 1.0f;
+    float seededHorizontalVelocityScale = 1.0f;
     std::optional<float> signCheckTimeSeconds;
     float signCheckWindowSeconds = 0.05f;
     FieldOverrideMap fieldOverrides;
@@ -622,6 +628,100 @@ std::optional<bool> ParseBool(const std::string &value) {
     return std::nullopt;
 }
 
+bool LoadValidatedQuaternionArray(const float values[4], math_utils::Quaternion &quat) {
+    quat = math_utils::MakeQuaternion(values[0], values[1], values[2], values[3]);
+    return math_utils::ValidateQuaternion(quat);
+}
+
+bool QuaternionFromPitchRollDeg(float pitchDeg, float rollDeg, float quaternion[4]) {
+    if (!std::isfinite(pitchDeg) || !std::isfinite(rollDeg)) {
+        return false;
+    }
+    const float halfPitch = 0.5f * pitchDeg * kDegreesToRadians;
+    const float halfRoll = 0.5f * rollDeg * kDegreesToRadians;
+    float sinPitch = 0.0f;
+    float cosPitch = 1.0f;
+    float sinRoll = 0.0f;
+    float cosRoll = 1.0f;
+    math_utils::FastSinCos(halfPitch, sinPitch, cosPitch);
+    math_utils::FastSinCos(halfRoll, sinRoll, cosRoll);
+    const math_utils::Quaternion q = math_utils::Normalize(math_utils::MakeQuaternion(
+        cosPitch * cosRoll,
+        -cosPitch * sinRoll,
+        -sinPitch * cosRoll,
+        -sinPitch * sinRoll));
+    quaternion[0] = q.w;
+    quaternion[1] = q.x;
+    quaternion[2] = q.y;
+    quaternion[3] = q.z;
+    return true;
+}
+
+bool TiltQuaternionFromQuaternionArray(const float input[4], float quaternion[4]) {
+    math_utils::Quaternion q = math_utils::MakeQuaternion(1.0f, 0.0f, 0.0f, 0.0f);
+    if (!LoadValidatedQuaternionArray(input, q)) {
+        return false;
+    }
+    float yaw = 0.0f;
+    float pitch = 0.0f;
+    float roll = 0.0f;
+    math_utils::QuaternionToEuler(q, yaw, pitch, roll);
+    return QuaternionFromPitchRollDeg(pitch * (180.0f / 3.14159265358979323846f),
+                                      roll * (180.0f / 3.14159265358979323846f),
+                                      quaternion);
+}
+
+void CopyQuaternion(const float src[4], float dst[4]) {
+    for (int i = 0; i < 4; ++i) {
+        dst[i] = src[i];
+    }
+}
+
+bool RebuildMainQuaternionFromRails(SensorData &sample) {
+    float icmTilt[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+    float lsmTilt[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+    const bool hasIcmTilt = sample.hasIcmQuaternion && TiltQuaternionFromQuaternionArray(sample.icmQuaternion, icmTilt);
+    const bool hasLsmTilt = sample.hasLsmQuaternion && TiltQuaternionFromQuaternionArray(sample.quaternionLSM, lsmTilt);
+
+    float selected[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+    bool hasSelected = false;
+    const MainQuaternionSource source = static_cast<MainQuaternionSource>(sample.mainQuaternionSource);
+    if (source == MainQuaternionSource::Blended) {
+        if (hasIcmTilt && hasLsmTilt) {
+            const math_utils::Quaternion icmQuat = math_utils::Normalize(
+                math_utils::MakeQuaternion(icmTilt[0], icmTilt[1], icmTilt[2], icmTilt[3]));
+            const math_utils::Quaternion lsmQuat = math_utils::Normalize(
+                math_utils::MakeQuaternion(lsmTilt[0], lsmTilt[1], lsmTilt[2], lsmTilt[3]));
+            const math_utils::Quaternion blendedQuat = math_utils::Slerp(icmQuat, lsmQuat, 0.5f);
+            const float blended[4] = {blendedQuat.w, blendedQuat.x, blendedQuat.y, blendedQuat.z};
+            hasSelected = TiltQuaternionFromQuaternionArray(blended, selected);
+        } else if (hasIcmTilt) {
+            CopyQuaternion(icmTilt, selected);
+            hasSelected = true;
+        } else if (hasLsmTilt) {
+            CopyQuaternion(lsmTilt, selected);
+            hasSelected = true;
+        }
+    } else if (source == MainQuaternionSource::Icm) {
+        if (hasIcmTilt) {
+            CopyQuaternion(icmTilt, selected);
+            hasSelected = true;
+        }
+    } else if (source == MainQuaternionSource::Lsm) {
+        if (hasLsmTilt) {
+            CopyQuaternion(lsmTilt, selected);
+            hasSelected = true;
+        }
+    }
+
+    if (!hasSelected) {
+        return false;
+    }
+    CopyQuaternion(selected, sample.quaternion);
+    sample.hasQuaternion = true;
+    return true;
+}
+
 struct StandaloneCfdTableStorage {
     std::vector<double> acs;
     std::vector<double> atk;
@@ -892,8 +992,40 @@ bool AssignFloat(const std::vector<std::string> &row,
     return true;
 }
 
+bool NearlyEqual(float lhs, float rhs, float epsilon) {
+    return std::fabs(lhs - rhs) <= epsilon;
+}
+
+bool Vec3Differs(const float lhs[3], const float rhs[3], float epsilon) {
+    return !NearlyEqual(lhs[0], rhs[0], epsilon) ||
+           !NearlyEqual(lhs[1], rhs[1], epsilon) ||
+           !NearlyEqual(lhs[2], rhs[2], epsilon);
+}
+
+bool QuatDiffers(const float lhs[4], const float rhs[4], float epsilon) {
+    return !NearlyEqual(lhs[0], rhs[0], epsilon) ||
+           !NearlyEqual(lhs[1], rhs[1], epsilon) ||
+           !NearlyEqual(lhs[2], rhs[2], epsilon) ||
+           !NearlyEqual(lhs[3], rhs[3], epsilon);
+}
+
+struct ReplayFreshnessTracker {
+    bool hasPrevious = false;
+    float altitudeFeet = 0.0f;
+    float accelIcm[3] = {0.0f, 0.0f, 0.0f};
+    float gyroIcm[3] = {0.0f, 0.0f, 0.0f};
+    float icmQuaternion[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+    bool hasIcmQuaternion = false;
+    float accelLsm[3] = {0.0f, 0.0f, 0.0f};
+    float gyroLsm[3] = {0.0f, 0.0f, 0.0f};
+    float lsmQuaternion[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+    bool hasLsmQuaternion = false;
+};
+
 bool PopulateSensorData(const std::vector<std::string> &row,
                         const FieldIndices &indices,
+                        const ProgramOptions &options,
+                        ReplayFreshnessTracker &freshnessTracker,
                         SensorData &out,
                         float &altimeterMeasurementMeters,
                         std::string &error) {
@@ -1007,9 +1139,67 @@ bool PopulateSensorData(const std::vector<std::string> &row,
         }
     }
 
-    out.icmSampleFresh = hasIcmAccel || out.hasIcmQuaternion;
-    out.lsmSampleFresh = hasLsmAccel || out.hasLsmQuaternion;
-    out.baroSampleFresh = hasAltitude;
+    if (options.rebuildMainQuaternion) {
+        RebuildMainQuaternionFromRails(out);
+    }
+
+    constexpr float kAltitudeFreshEpsilonFeet = 1.0e-4f;
+    constexpr float kImuFreshEpsilon = 1.0e-6f;
+    // Logged telemetry is written every main-loop pass, but the CSV does not
+    // carry explicit per-rail fresh/stale flags. Reconstruct freshness by
+    // detecting when raw sensor channels actually change between rows.
+    if (!freshnessTracker.hasPrevious) {
+        out.icmSampleFresh = hasIcmAccel || out.hasIcmQuaternion;
+        out.lsmSampleFresh = hasLsmAccel || out.hasLsmQuaternion;
+        out.baroSampleFresh = hasAltitude;
+    } else {
+        const bool icmQuaternionChanged =
+            out.hasIcmQuaternion != freshnessTracker.hasIcmQuaternion ||
+            (out.hasIcmQuaternion &&
+             QuatDiffers(out.icmQuaternion, freshnessTracker.icmQuaternion, kImuFreshEpsilon));
+        const bool lsmQuaternionChanged =
+            out.hasLsmQuaternion != freshnessTracker.hasLsmQuaternion ||
+            (out.hasLsmQuaternion &&
+             QuatDiffers(out.quaternionLSM, freshnessTracker.lsmQuaternion, kImuFreshEpsilon));
+        out.icmSampleFresh =
+            (hasIcmAccel &&
+             (Vec3Differs(out.accelICM, freshnessTracker.accelIcm, kImuFreshEpsilon) ||
+              Vec3Differs(out.gyro, freshnessTracker.gyroIcm, kImuFreshEpsilon))) ||
+            icmQuaternionChanged;
+        out.lsmSampleFresh =
+            (hasLsmAccel &&
+             (Vec3Differs(out.accelLSM, freshnessTracker.accelLsm, kImuFreshEpsilon) ||
+              Vec3Differs(out.gyroLSM, freshnessTracker.gyroLsm, kImuFreshEpsilon))) ||
+            lsmQuaternionChanged;
+        out.baroSampleFresh =
+            hasAltitude &&
+            !NearlyEqual(out.altitudeFeet, freshnessTracker.altitudeFeet, kAltitudeFreshEpsilonFeet);
+    }
+
+    freshnessTracker.altitudeFeet = out.altitudeFeet;
+    freshnessTracker.accelIcm[0] = out.accelICM[0];
+    freshnessTracker.accelIcm[1] = out.accelICM[1];
+    freshnessTracker.accelIcm[2] = out.accelICM[2];
+    freshnessTracker.gyroIcm[0] = out.gyro[0];
+    freshnessTracker.gyroIcm[1] = out.gyro[1];
+    freshnessTracker.gyroIcm[2] = out.gyro[2];
+    freshnessTracker.icmQuaternion[0] = out.icmQuaternion[0];
+    freshnessTracker.icmQuaternion[1] = out.icmQuaternion[1];
+    freshnessTracker.icmQuaternion[2] = out.icmQuaternion[2];
+    freshnessTracker.icmQuaternion[3] = out.icmQuaternion[3];
+    freshnessTracker.hasIcmQuaternion = out.hasIcmQuaternion;
+    freshnessTracker.accelLsm[0] = out.accelLSM[0];
+    freshnessTracker.accelLsm[1] = out.accelLSM[1];
+    freshnessTracker.accelLsm[2] = out.accelLSM[2];
+    freshnessTracker.gyroLsm[0] = out.gyroLSM[0];
+    freshnessTracker.gyroLsm[1] = out.gyroLSM[1];
+    freshnessTracker.gyroLsm[2] = out.gyroLSM[2];
+    freshnessTracker.lsmQuaternion[0] = out.quaternionLSM[0];
+    freshnessTracker.lsmQuaternion[1] = out.quaternionLSM[1];
+    freshnessTracker.lsmQuaternion[2] = out.quaternionLSM[2];
+    freshnessTracker.lsmQuaternion[3] = out.quaternionLSM[3];
+    freshnessTracker.hasLsmQuaternion = out.hasLsmQuaternion;
+    freshnessTracker.hasPrevious = true;
 
     return true;
 }
@@ -1036,6 +1226,8 @@ std::optional<FlightStatus> ParseFlightStatusValue(const std::string &value) {
 
 bool TryPopulateSeededState(const std::vector<std::string> &row,
                             const ReplaySeedIndices &indices,
+                            const std::optional<float> &zenithOverrideRadians,
+                            float zenithScale,
                             FilteredState &state,
                             FlightStatus &status) {
     if (!indices.HasRequiredStateColumns()) {
@@ -1072,7 +1264,11 @@ bool TryPopulateSeededState(const std::vector<std::string> &row,
     state.time = *stateTime;
     state.position[2] = indices.positionZIsFeet ? (*posZ * constants::kFeetToMeters) : *posZ;
     state.velocity[2] = indices.velocityZIsFeetPerSecond ? (*velZ * constants::kFeetToMeters) : *velZ;
-    state.zenith = indices.zenithIsDegrees ? (*zenith * kDegreesToRadians) : *zenith;
+    const float seededZenithRadians =
+        zenithOverrideRadians.has_value()
+            ? *zenithOverrideRadians
+            : (indices.zenithIsDegrees ? (*zenith * kDegreesToRadians) : *zenith);
+    state.zenith = seededZenithRadians * zenithScale;
     state.apogeeEstimate = apogeeEstimate.has_value()
                                ? (indices.apogeeEstimateIsFeet
                                       ? (*apogeeEstimate * constants::kFeetToMeters)
@@ -1100,7 +1296,7 @@ bool TryPopulateSeededState(const std::vector<std::string> &row,
     return true;
 }
 
-double ComputeSeededHorizontalVelocityOption1(const FilteredState &state) {
+double ComputeSeededHorizontalVelocityOption1(const FilteredState &state, float horizontalVelocityScale) {
     const double cosZenith = std::cos(static_cast<double>(state.zenith));
     const double clampedCos = std::clamp(cosZenith, 0.1, 1.0);
     const double speedAlongAxis = static_cast<double>(state.velocity[2]) / clampedCos;
@@ -1108,7 +1304,8 @@ double ComputeSeededHorizontalVelocityOption1(const FilteredState &state) {
         static_cast<double>(state.velocity[2]) * static_cast<double>(state.velocity[2]);
     const double speedSquared = speedAlongAxis * speedAlongAxis;
     const double horizontalSquared = speedSquared - verticalSquared;
-    return (horizontalSquared > 0.0) ? std::sqrt(horizontalSquared) : 0.0;
+    const double horizontalVelocity = (horizontalSquared > 0.0) ? std::sqrt(horizontalSquared) : 0.0;
+    return horizontalVelocity * static_cast<double>(horizontalVelocityScale);
 }
 
 double ComputeSeededAngularRate(float currentTimeSeconds,
@@ -1129,6 +1326,7 @@ double ComputeSeededAngularRate(float currentTimeSeconds,
 double RecomputeSeededApogeeEstimate(const FilteredState &state,
                                      FlightStatus status,
                                      double angularRate,
+                                     float horizontalVelocityScale,
                                      ApogeePredictor &predictor,
                                      double &lastPredictionMeters,
                                      float &lastPredictionTimeSeconds,
@@ -1144,7 +1342,8 @@ double RecomputeSeededApogeeEstimate(const FilteredState &state,
             predictorState.altitudeMeters = static_cast<double>(state.position[2]);
             predictorState.horizontalDistanceMeters = 0.0;
             predictorState.verticalVelocity = static_cast<double>(state.velocity[2]);
-            predictorState.horizontalVelocity = ComputeSeededHorizontalVelocityOption1(state);
+            predictorState.horizontalVelocity =
+                ComputeSeededHorizontalVelocityOption1(state, horizontalVelocityScale);
             predictorState.zenith = static_cast<double>(state.zenith);
             predictorState.angularVelocity = angularRate;
             predictorState.acsAngleDeg = 0.0;
@@ -1445,9 +1644,15 @@ void PrintUsage(const char *program) {
               << "  --process-z <value>        Process noise for Z axis (default 1.0).\n"
               << "  --apogee-target <value>    Target apogee altitude in meters (default 1550).\n"
               << "  --cfd-path <path>          CFD CSV path for sign check (default lib/cfd.csv).\n"
+              << "  --cp-offset-m <value>      Override replay CP-CG offset in meters.\n"
+              << "  --moment-of-inertia-kgm2 <value> Override replay longitudinal inertia.\n"
+              << "  --dry-mass-kg <value>      Override replay vehicle dry mass in kilograms.\n"
+              << "  --seed-zenith-scale <f>    Scale seeded zenith before replay recomputes apogee (default 1.0).\n"
+              << "  --seed-horizontal-scale <f> Scale replay-only seeded horizontal speed (default 1.0).\n"
               << "  --sign-check-time <sec>    Evaluate apogee at ACS 0/10/20 deg near this time.\n"
               << "  --sign-check-window <sec>  Match window for sign-check sample (default 0.05).\n"
               << "  --ignore-logged-state      Recompute filtered state instead of smart-seeding from logged state columns.\n"
+              << "  --rebuild-main-quaternion  Rebuild main quaternion from logged ICM/LSM rails and override seeded zenith from it.\n"
               << "  --include-raw-altimeter    Append raw altimeter measurements to output CSV.\n"
               << "  --include-raw <fields>    Append raw sensor fields (comma-separated).\n"
              << "  --graph <fields>          Render ASCII graphs and Matplot++ images for the requested fields.\n"
@@ -1511,6 +1716,76 @@ bool ParseArgs(int argc, char **argv, ProgramOptions &options) {
             options.ignoreLoggedState = true;
             continue;
         }
+        if (arg == "--rebuild-main-quaternion") {
+            options.rebuildMainQuaternion = true;
+            continue;
+        }
+        if (arg == "--cp-offset-m") {
+            if (i + 1 >= argc) {
+                std::cerr << "Missing value for --cp-offset-m" << std::endl;
+                return false;
+            }
+            std::optional<float> value = ParseFloat(argv[++i]);
+            if (!value.has_value()) {
+                std::cerr << "Invalid numeric value for --cp-offset-m: " << argv[i] << std::endl;
+                return false;
+            }
+            options.cpOffsetMetersOverride = *value;
+            continue;
+        }
+        if (arg == "--moment-of-inertia-kgm2") {
+            if (i + 1 >= argc) {
+                std::cerr << "Missing value for --moment-of-inertia-kgm2" << std::endl;
+                return false;
+            }
+            std::optional<float> value = ParseFloat(argv[++i]);
+            if (!value.has_value()) {
+                std::cerr << "Invalid numeric value for --moment-of-inertia-kgm2: " << argv[i]
+                          << std::endl;
+                return false;
+            }
+            options.momentOfInertiaOverride = *value;
+            continue;
+        }
+        if (arg == "--dry-mass-kg") {
+            if (i + 1 >= argc) {
+                std::cerr << "Missing value for --dry-mass-kg" << std::endl;
+                return false;
+            }
+            std::optional<float> value = ParseFloat(argv[++i]);
+            if (!value.has_value()) {
+                std::cerr << "Invalid numeric value for --dry-mass-kg: " << argv[i] << std::endl;
+                return false;
+            }
+            options.dryMassKgOverride = *value;
+            continue;
+        }
+        if (arg == "--seed-zenith-scale") {
+            if (i + 1 >= argc) {
+                std::cerr << "Missing value for --seed-zenith-scale" << std::endl;
+                return false;
+            }
+            std::optional<float> value = ParseFloat(argv[++i]);
+            if (!value.has_value()) {
+                std::cerr << "Invalid numeric value for --seed-zenith-scale: " << argv[i] << std::endl;
+                return false;
+            }
+            options.seededZenithScale = *value;
+            continue;
+        }
+        if (arg == "--seed-horizontal-scale") {
+            if (i + 1 >= argc) {
+                std::cerr << "Missing value for --seed-horizontal-scale" << std::endl;
+                return false;
+            }
+            std::optional<float> value = ParseFloat(argv[++i]);
+            if (!value.has_value()) {
+                std::cerr << "Invalid numeric value for --seed-horizontal-scale: " << argv[i] << std::endl;
+                return false;
+            }
+            options.seededHorizontalVelocityScale = *value;
+            continue;
+        }
         if (arg == "--include-raw-altimeter") {
             if (!AppendSampleValueId(SampleValueId::AltimeterRawMeters, false, options.extraOutputFields)) {
                 return false;
@@ -1531,6 +1806,56 @@ bool ParseArgs(int argc, char **argv, ProgramOptions &options) {
             if (!ParseSampleValueList(arg.substr(14), false, options.extraOutputFields)) {
                 return false;
             }
+            continue;
+        }
+        if (arg.rfind("--cp-offset-m=", 0) == 0) {
+            std::optional<float> value = ParseFloat(arg.substr(14));
+            if (!value.has_value()) {
+                std::cerr << "Invalid numeric value for --cp-offset-m: " << arg.substr(14)
+                          << std::endl;
+                return false;
+            }
+            options.cpOffsetMetersOverride = *value;
+            continue;
+        }
+        if (arg.rfind("--moment-of-inertia-kgm2=", 0) == 0) {
+            std::optional<float> value = ParseFloat(arg.substr(26));
+            if (!value.has_value()) {
+                std::cerr << "Invalid numeric value for --moment-of-inertia-kgm2: " << arg.substr(26)
+                          << std::endl;
+                return false;
+            }
+            options.momentOfInertiaOverride = *value;
+            continue;
+        }
+        if (arg.rfind("--dry-mass-kg=", 0) == 0) {
+            std::optional<float> value = ParseFloat(arg.substr(14));
+            if (!value.has_value()) {
+                std::cerr << "Invalid numeric value for --dry-mass-kg: " << arg.substr(14)
+                          << std::endl;
+                return false;
+            }
+            options.dryMassKgOverride = *value;
+            continue;
+        }
+        if (arg.rfind("--seed-zenith-scale=", 0) == 0) {
+            std::optional<float> value = ParseFloat(arg.substr(20));
+            if (!value.has_value()) {
+                std::cerr << "Invalid numeric value for --seed-zenith-scale: " << arg.substr(20)
+                          << std::endl;
+                return false;
+            }
+            options.seededZenithScale = *value;
+            continue;
+        }
+        if (arg.rfind("--seed-horizontal-scale=", 0) == 0) {
+            std::optional<float> value = ParseFloat(arg.substr(24));
+            if (!value.has_value()) {
+                std::cerr << "Invalid numeric value for --seed-horizontal-scale: " << arg.substr(24)
+                          << std::endl;
+                return false;
+            }
+            options.seededHorizontalVelocityScale = *value;
             continue;
         }
         if (arg == "--graph") {
@@ -1785,6 +2110,15 @@ int main(int argc, char **argv) {
     vehicleParameters.centerOfPressureOffsetMeters = settings::vehicle::kCenterOfPressureOffsetMeters;
     vehicleParameters.momentOfInertia = settings::vehicle::kMomentOfInertiaKgM2;
     vehicleParameters.dryMass = settings::vehicle::kDryMassKg;
+    if (options.cpOffsetMetersOverride.has_value()) {
+        vehicleParameters.centerOfPressureOffsetMeters = *options.cpOffsetMetersOverride;
+    }
+    if (options.momentOfInertiaOverride.has_value()) {
+        vehicleParameters.momentOfInertia = *options.momentOfInertiaOverride;
+    }
+    if (options.dryMassKgOverride.has_value()) {
+        vehicleParameters.dryMass = *options.dryMassKgOverride;
+    }
     EnvironmentModel environment(environmentConfig);
     StandaloneCfdTableStorage seededReplayCfdStorage;
     const bool loadedSeededReplayCfd = LoadStandaloneCfdTable(options.cfdPath, seededReplayCfdStorage) ||
@@ -1836,12 +2170,16 @@ int main(int argc, char **argv) {
     bool hasPreviousZenith = false;
     float previousZenithRadians = 0.0f;
     float previousTimeSeconds = 0.0f;
+    ReplayFreshnessTracker freshnessTracker{};
     bool hasSignCheckState = false;
     float signCheckAngularRate = 0.0f;
     float signCheckMatchedTime = 0.0f;
     float signCheckBestDelta = std::numeric_limits<float>::infinity();
     FilteredState signCheckState{};
     bool usedSeededStateOutput = false;
+    bool hasReplayStateCache = false;
+    FilteredState replayStateCache{};
+    FlightStatus replayStatusCache = FlightStatus::Ground;
     double lastEmittedApogeeMeters = 0.0;
     FlightStatus lastEmittedStatus = FlightStatus::Ground;
     bool hasSeededReplayPrediction = false;
@@ -1856,7 +2194,7 @@ int main(int argc, char **argv) {
         SensorData sample;
         float altimeterMeasurementMeters = 0.0f;
         std::string error;
-        if (!PopulateSensorData(row, indices, sample, altimeterMeasurementMeters, error)) {
+        if (!PopulateSensorData(row, indices, options, freshnessTracker, sample, altimeterMeasurementMeters, error)) {
             ++skippedRows;
             std::cerr << "Skipping line " << lineNumber << ": " << error << std::endl;
             continue;
@@ -1871,8 +2209,22 @@ int main(int argc, char **argv) {
         ++processedRows;
         FilteredState state;
         FlightStatus emittedStatus = flightComputer.Status();
+        const bool hasFreshEstimatorSample =
+            sample.icmSampleFresh || sample.lsmSampleFresh || sample.baroSampleFresh;
+        std::optional<float> rebuiltZenithRadians;
+        if (options.rebuildMainQuaternion && sample.hasQuaternion) {
+            math_utils::Quaternion rebuiltQuaternion = math_utils::MakeQuaternion(1.0f, 0.0f, 0.0f, 0.0f);
+            if (LoadValidatedQuaternionArray(sample.quaternion, rebuiltQuaternion)) {
+                rebuiltZenithRadians = math_utils::QuaternionToZenith(rebuiltQuaternion);
+            }
+        }
         bool hasState = !options.ignoreLoggedState &&
-                        TryPopulateSeededState(row, replaySeedIndices, state, emittedStatus);
+                        TryPopulateSeededState(row,
+                                               replaySeedIndices,
+                                               rebuiltZenithRadians,
+                                               options.seededZenithScale,
+                                               state,
+                                               emittedStatus);
         if (hasState) {
             usedSeededStateOutput = true;
             const double seededAngularRate =
@@ -1885,13 +2237,25 @@ int main(int argc, char **argv) {
                 static_cast<float>(RecomputeSeededApogeeEstimate(state,
                                                                  emittedStatus,
                                                                  seededAngularRate,
+                                                                 options.seededHorizontalVelocityScale,
                                                                  seededReplayPredictor,
                                                                  lastSeededReplayPredictionMeters,
                                                                  lastSeededReplayPredictionTimeSeconds,
                                                                  hasSeededReplayPrediction));
         } else {
-            hasState = flightComputer.Update(sample, state);
-            emittedStatus = flightComputer.Status();
+            if (hasFreshEstimatorSample || !hasReplayStateCache) {
+                hasState = flightComputer.Update(sample, state);
+                emittedStatus = flightComputer.Status();
+                if (hasState) {
+                    replayStateCache = state;
+                    replayStatusCache = emittedStatus;
+                    hasReplayStateCache = true;
+                }
+            } else if (hasReplayStateCache) {
+                state = replayStateCache;
+                emittedStatus = replayStatusCache;
+                hasState = true;
+            }
         }
         if (hasState) {
             ++emittedStates;

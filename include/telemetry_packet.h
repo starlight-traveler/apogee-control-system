@@ -134,6 +134,7 @@ static_assert(sizeof(TelemetryControlV1) == 12,
 #pragma pack(push, 1)
 struct RuntimeSettingsPayloadV1 {
     double groundTemperatureF = 0.0;
+    double seaLevelPressureHpa = 0.0;
     double windSpeedMph = 0.0;
     double windDirectionDeg = 0.0;
     double launchDirectionDeg = 0.0;
@@ -146,7 +147,7 @@ struct RuntimeSettingsPayloadV1 {
 };
 #pragma pack(pop)
 
-static_assert(sizeof(RuntimeSettingsPayloadV1) == 80,
+static_assert(sizeof(RuntimeSettingsPayloadV1) == 88,
               "RuntimeSettingsPayloadV1 size changed; update sender/receiver together.");
 
 #pragma pack(push, 1)
@@ -161,7 +162,7 @@ struct SettingsCommandV1 {
 };
 #pragma pack(pop)
 
-static_assert(sizeof(SettingsCommandV1) == 96,
+static_assert(sizeof(SettingsCommandV1) == 104,
               "SettingsCommandV1 size changed; update sender/receiver together.");
 
 #pragma pack(push, 1)
@@ -178,7 +179,7 @@ struct SettingsSnapshotV1 {
 };
 #pragma pack(pop)
 
-static_assert(sizeof(SettingsSnapshotV1) == 100,
+static_assert(sizeof(SettingsSnapshotV1) == 108,
               "SettingsSnapshotV1 size changed; update sender/receiver together.");
 
 }  // namespace telemetry
