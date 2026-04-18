@@ -140,6 +140,10 @@ constexpr float kCoastHardDisableVelocityMps = 25.0f;
 // Keep automatic flaps disabled briefly after burnout so the coast-state
 // estimate can settle before the first deployment decision.
 constexpr float kPostBurnoutHoldoffSeconds = 1.0f;
+// Clamp the very first permitted automatic flap command to a conservative
+// angle, then ramp available authority up from there over a short window.
+constexpr float kFirstMotionRampStartMaxAngleDeg = 8.0f;
+constexpr float kFirstMotionRampDurationSeconds = 1.0f;
 // Require baro AGL and estimator altitude to agree this closely before the
 // first automatic flap motion is allowed.
 constexpr float kFirstFlapBaroStateAgreementMeters = 25.0f;
@@ -833,6 +837,9 @@ constexpr float kBnoReferenceCorrectionBlendFactor = 0.20f;
 // Aggressive BNO correction during coast - weight BNO much more heavily to
 // quickly correct any gyro drift accumulated during burn.
 constexpr float kBnoCoastCorrectionBlendFactor = 0.66f;
+// Ramp into the stronger coast correction instead of stepping it in one
+// sample at burnout, which can create a visible zenith/apogee jump.
+constexpr float kBnoCoastCorrectionRampSeconds = 0.5f;
 
 // Burnout correction burst: aggressive accel correction window after burnout
 // to quickly correct gyro drift accumulated during burn phase.

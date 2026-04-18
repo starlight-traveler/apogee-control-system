@@ -344,10 +344,23 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
              selectedQuaternionSource == MainQuaternionSource::Blended)) {
             math_utils::Quaternion referenceQuat = math_utils::MakeQuaternion(1.0f, 0.0f, 0.0f, 0.0f);
             if (ArrayToQuaternion(data.quaternion, referenceQuat)) {
-                const float baseBlendFactor = (status_ == FlightStatus::Coast)
-                    ? settings::ahrs::kBnoCoastCorrectionBlendFactor
-                    : settings::ahrs::kBnoReferenceCorrectionBlendFactor;
-                const float blendFactor = baseBlendFactor;
+                const float burnBlendFactor = settings::ahrs::kBnoReferenceCorrectionBlendFactor;
+                float blendFactor = burnBlendFactor;
+                if (status_ == FlightStatus::Coast) {
+                    blendFactor = settings::ahrs::kBnoCoastCorrectionBlendFactor;
+                    const double rampDurationSeconds =
+                        static_cast<double>(settings::ahrs::kBnoCoastCorrectionRampSeconds);
+                    if (rampDurationSeconds > 0.0 && burnoutTimestamp_ > 0.0) {
+                        const double timeSinceBurnout =
+                            std::max(0.0, static_cast<double>(data.timestamp) - burnoutTimestamp_);
+                        const double rampFraction =
+                            std::clamp(timeSinceBurnout / rampDurationSeconds, 0.0, 1.0);
+                        blendFactor = static_cast<float>(
+                            static_cast<double>(burnBlendFactor) +
+                            rampFraction * static_cast<double>(
+                                settings::ahrs::kBnoCoastCorrectionBlendFactor - burnBlendFactor));
+                    }
+                }
                 if (blendFactor > 0.0f) {
                     orientation = math_utils::Slerp(orientation, referenceQuat, blendFactor);
                     quaternionValid_ = math_utils::ValidateQuaternion(orientation);
@@ -420,20 +433,26 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
             kGroundVelocityBlend * (rawGroundVelocityMps - groundRelativeVelocityMps_);
         lastGroundRelativeAltitudeMeters_ = relativeAltitudeMeters;
 
+        const bool hasFreshLiftoffAcceleration = hasFreshAccelMeasurement;
+        const double liftoffAccelerationMps2 =
+            hasFreshLiftoffAcceleration ? static_cast<double>(inertialAcceleration.z) : accZ;
         const bool accelerationSuggestsLiftoff =
-            accZ > settings::flight::kLiftoffAccelerationThresholdMps2;
+            hasFreshLiftoffAcceleration &&
+            liftoffAccelerationMps2 > settings::flight::kLiftoffAccelerationThresholdMps2;
         const bool altitudeSuggestsLiftoff =
             std::fabs(relativeAltitudeMeters) > settings::flight::kLiftoffAltitudeThresholdM;
         const bool velocitySuggestsLiftoff =
             groundRelativeVelocityMps_ > settings::flight::kLiftoffVelocityThresholdMps;
 
-        if (accelerationSuggestsLiftoff) {
-            if (liftoffCandidateCount_ < 255) {
-                ++liftoffCandidateCount_;
+        if (hasFreshLiftoffAcceleration) {
+            if (accelerationSuggestsLiftoff) {
+                if (liftoffCandidateCount_ < 255) {
+                    ++liftoffCandidateCount_;
+                }
+            } else {
+                liftoffCandidateCount_ = 0;
+                burnDetectTimestamp_ = 0.0;
             }
-        } else {
-            liftoffCandidateCount_ = 0;
-            burnDetectTimestamp_ = 0.0;
         }
 
         if (burnDetectTimestamp_ <= 0.0 &&

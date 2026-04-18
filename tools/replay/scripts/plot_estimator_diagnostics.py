@@ -151,6 +151,8 @@ def compute_smoothed_slope(times: list[float], values: list[float], window_secon
 
 def load_rows(path: Path) -> list[DiagnosticRow]:
     base_altitude_feet: float | None = None
+    base_state_z_m: float | None = None
+    state_z_is_agl: bool | None = None
     samples: list[dict[str, float | str]] = []
 
     for raw in iter_csv_rows(path):
@@ -163,10 +165,23 @@ def load_rows(path: Path) -> list[DiagnosticRow]:
             base_altitude_feet = altitude_feet
 
         baro_agl_m = (altitude_feet - base_altitude_feet) * FEET_TO_METERS
-        state_z_m = pick_float(raw, "state_position_z", "altitude_m", "altitude_meters")
+        state_agl_feet = pick_float(raw, "state_altitude_agl_feet")
+        if state_agl_feet is not None:
+            state_z_m = state_agl_feet * FEET_TO_METERS
+        else:
+            state_z_m = pick_float(raw, "state_position_z", "altitude_m", "altitude_meters")
         state_vz_mps = pick_float(raw, "state_velocity_z", "velocity_mps", "vertical_velocity")
         altimeter_sigma_scale = pick_float(raw, "sensor_altimeter_sigma_scale")
         altimeter_gate_sigma = pick_float(raw, "sensor_altimeter_gate_sigma")
+
+        if state_z_m is not None and state_z_is_agl is None:
+            if state_agl_feet is not None:
+                state_z_is_agl = True
+                base_state_z_m = 0.0
+            else:
+                first_baro_abs_m = altitude_feet * FEET_TO_METERS
+                state_z_is_agl = abs(state_z_m - first_baro_abs_m) > 30.0
+                base_state_z_m = 0.0 if state_z_is_agl else state_z_m
 
         bno_pitch_deg = math.nan
         bno_roll_deg = math.nan
@@ -205,6 +220,10 @@ def load_rows(path: Path) -> list[DiagnosticRow]:
 
     if not samples:
         raise SystemExit(f"No usable rows found in {path}")
+
+    if state_z_is_agl is False and base_state_z_m is not None:
+        for sample in samples:
+            sample["state_z_m"] = float(sample["state_z_m"]) - base_state_z_m
 
     times = [float(sample["time_s"]) for sample in samples]
     baro_agl = [float(sample["baro_agl_m"]) for sample in samples]

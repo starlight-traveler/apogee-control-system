@@ -2151,6 +2151,7 @@ static bool g_actuationHasLastControlUpdate = false;
 static uint32_t g_actuationLastControlUpdateMs = 0;
 static float g_actuationLastCommandDeg = 0.0f;
 static bool g_autoActuationFirstMotionReleased = false;
+static uint32_t g_autoActuationFirstMotionReleaseMs = 0;
 static bool g_autoActuationSafetyLatched = false;
 static PredictorHorizontalVelocityTracker g_actuationPredictorHorizontalVelocity;
 static RuntimeSettings g_runtimeSettings = RuntimeSettingsDefaults();
@@ -2581,6 +2582,7 @@ static void ApplyRuntimeSettingsToPredictors() {
     g_actuationHasLastZenithSample = false;
     g_actuationHasLastControlUpdate = false;
     g_autoActuationFirstMotionReleased = false;
+    g_autoActuationFirstMotionReleaseMs = 0;
     g_autoActuationSafetyLatched = false;
     ResetPredictorHorizontalVelocityTracker(g_actuationPredictorHorizontalVelocity);
     flightComputer.ReconfigurePredictor(g_runtimeSettings.environment,
@@ -2709,11 +2711,12 @@ static float ComputeAutoActuationCommandDeg(uint32_t nowMs,
     g_actuationLastZenithRad = state.zenith;
     g_actuationLastStateTime = state.time;
 
-    const bool canControl =
+    const bool predictorSeedActive =
         g_actuationPredictorReady && (status == FlightStatus::Burn || status == FlightStatus::Coast) &&
         state.velocity[2] > 0.0f;
+    const bool canControl = predictorSeedActive;
     uint32_t predictorSeedFlags = 0;
-    if (status == FlightStatus::Burn || status == FlightStatus::Coast) {
+    if (predictorSeedActive) {
         predictorSeedFlags |= kPredictorSeedFlagControlActive;
     }
     if (state.velocity[2] > 0.0f) {
@@ -2722,7 +2725,7 @@ static float ComputeAutoActuationCommandDeg(uint32_t nowMs,
     const double clampedZenith = SanitizePredictorZenithRadians(static_cast<double>(state.zenith));
     // A stale or inactive control window is forced back to a simpler
     // vertical-only predictor seed.
-    const bool useHorizontalModel = canControl && freshSeedSample;
+    const bool useHorizontalModel = predictorSeedActive && freshSeedSample;
     if (!useHorizontalModel) {
         ResetPredictorHorizontalVelocityTracker(g_actuationPredictorHorizontalVelocity);
     }
@@ -2732,7 +2735,7 @@ static float ComputeAutoActuationCommandDeg(uint32_t nowMs,
                                              static_cast<double>(state.inertialAcceleration[0]),
                                              static_cast<double>(state.inertialAcceleration[1]),
                                              dtSeconds,
-                                             status == FlightStatus::Burn || status == FlightStatus::Coast,
+                                             predictorSeedActive,
                                              static_cast<double>(state.velocity[2]),
                                              clampedZenith)
             : 0.0;
@@ -2820,6 +2823,26 @@ static float ComputeAutoActuationCommandDeg(uint32_t nowMs,
             const double taper =
                 std::clamp((timeToApogee - hardDisableTime) / (softDisableStart - hardDisableTime), 0.0, 1.0);
             maxAllowedAngle = maxAngle * taper;
+        }
+    }
+
+    if (status == FlightStatus::Coast) {
+        const double rampStartMaxAngle =
+            std::min(maxAllowedAngle,
+                     static_cast<double>(settings::actuation::kFirstMotionRampStartMaxAngleDeg));
+        if (!g_autoActuationFirstMotionReleased) {
+            maxAllowedAngle = rampStartMaxAngle;
+        } else {
+            const double rampDurationSeconds =
+                static_cast<double>(settings::actuation::kFirstMotionRampDurationSeconds);
+            if (rampDurationSeconds > 0.0 && g_autoActuationFirstMotionReleaseMs > 0) {
+                const double elapsedSeconds =
+                    static_cast<double>(nowMs - g_autoActuationFirstMotionReleaseMs) * 0.001;
+                const double rampFraction =
+                    std::clamp(elapsedSeconds / rampDurationSeconds, 0.0, 1.0);
+                maxAllowedAngle =
+                    rampStartMaxAngle + rampFraction * (maxAllowedAngle - rampStartMaxAngle);
+            }
         }
     }
 
@@ -3157,6 +3180,7 @@ void setup() {
     g_actuationLastControlUpdateMs = 0;
     g_actuationLastCommandDeg = 0.0f;
     g_autoActuationFirstMotionReleased = false;
+    g_autoActuationFirstMotionReleaseMs = 0;
     g_autoActuationSafetyLatched = false;
     ResetPredictorHorizontalVelocityTracker(g_actuationPredictorHorizontalVelocity);
     g_lastTimingLogMs = 0;
@@ -3310,6 +3334,7 @@ void loop() {
         const FlightStatus flightStatus = flightComputer.Status();
         if (flightStatus == FlightStatus::Ground) {
             g_autoActuationFirstMotionReleased = false;
+            g_autoActuationFirstMotionReleaseMs = 0;
             g_autoActuationSafetyLatched = false;
         }
         if (ShouldLatchAutoActuationSafety(state, flightStatus, hasBaroAgl, altitudeAglMeters)) {
@@ -3327,13 +3352,18 @@ void loop() {
             autoCommandDeg = 0.0f;
             g_actuationLastCommandDeg = 0.0f;
             g_actuationHasLastControlUpdate = false;
+            g_autoActuationFirstMotionReleaseMs = 0;
             autoTelemetry.autoCommandDeg = 0.0f;
         } else if (g_autoActuationSafetyLatched) {
             autoCommandDeg = 0.0f;
             g_actuationLastCommandDeg = 0.0f;
             g_actuationHasLastControlUpdate = false;
+            g_autoActuationFirstMotionReleaseMs = 0;
             autoTelemetry.autoCommandDeg = 0.0f;
         } else if (firstMotionRequested) {
+            if (!g_autoActuationFirstMotionReleased) {
+                g_autoActuationFirstMotionReleaseMs = nowMs;
+            }
             g_autoActuationFirstMotionReleased = true;
         }
     }
