@@ -333,6 +333,11 @@ constexpr float kPredictorMaxSeedAngularRateRadPerSec = 1.5f;
 constexpr float kPredictorMaxHorizontalSpeedMps = 65.0f;
 constexpr float kPredictorMinHorizontalSpeedCapMps = 6.0f;
 constexpr float kPredictorHorizontalSpeedMarginMps = 3.0f;
+// Coast-entry predictor soft-start. This damps the immediate post-burnout
+// zenith/AoA seed while baro and attitude settle onto the corrected coast
+// trajectory, then ramps back to the full measured tilt.
+constexpr float kPredictorCoastEntryZenithInitialBlendFactor = 0.40f;
+constexpr float kPredictorCoastEntryZenithRampSeconds = 0.60f;
 // Adaptive axial-drag correction, tuned from replay scripts. This stays
 // single-state on purpose so the estimator path remains lightweight enough for
 // the flight controller hot loop.

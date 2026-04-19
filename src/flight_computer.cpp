@@ -243,7 +243,6 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
     float gyroBody[3] = {0.0f, 0.0f, 0.0f};
     const MainQuaternionSource selectedQuaternionSource =
         static_cast<MainQuaternionSource>(data.mainQuaternionSource);
-    (void)selectedQuaternionSource;
     const bool hasFreshIcmAccel = hasIcmAccel && data.icmSampleFresh;
     const bool hasFreshLsmAccel = hasLsmAccel && data.lsmSampleFresh;
     const bool hasFreshAccelMeasurement = hasFreshIcmAccel || hasFreshLsmAccel;
@@ -292,22 +291,15 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
     };
 
     // Raw estimator feed is intentionally LSM-first for this flight build.
+    // Cached accel samples are not reused for predictor seeding or filter
+    // measurement updates; if accel is stale we fall back to gyro-only attitude
+    // propagation plus predict/baro updates.
     if (hasFreshLsmAccel) {
         accelBody[0] = data.accelLSM[0];
         accelBody[1] = data.accelLSM[1];
         accelBody[2] = data.accelLSM[2];
         loadLsmGyro();
     } else if (hasFreshIcmAccel) {
-        accelBody[0] = data.accelICM[0];
-        accelBody[1] = data.accelICM[1];
-        accelBody[2] = data.accelICM[2];
-        loadIcmGyro();
-    } else if (hasLsmAccel) {
-        accelBody[0] = data.accelLSM[0];
-        accelBody[1] = data.accelLSM[1];
-        accelBody[2] = data.accelLSM[2];
-        loadLsmGyro();
-    } else if (hasIcmAccel) {
         accelBody[0] = data.accelICM[0];
         accelBody[1] = data.accelICM[1];
         accelBody[2] = data.accelICM[2];
@@ -334,20 +326,22 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
         orientation = TeasleyFilter(previousQuaternion_, gyroBody, static_cast<float>(dt), &propagatedQuaternionValid);
         quaternionValid_ = propagatedQuaternionValid;
 
-        // Keep ascent attitude anchored to the current fast-rail solution so
-        // brief gyro drift does not move zenith away from the ICM/LSM rails.
+        // The BNO055 saturates well before peak boost acceleration, so only use
+        // it as a trim reference once the vehicle has transitioned into coast.
+        // Ramp its influence up from the configured coast blend factor so the
+        // zenith estimate does not jump immediately at burnout.
         if (settings::ahrs::kEnableBnoReferenceCorrection &&
-            (status_ == FlightStatus::Burn || status_ == FlightStatus::Coast) &&
-            data.hasQuaternion &&
+            status_ == FlightStatus::Coast &&
+            data.hasBnoQuaternion &&
             (selectedQuaternionSource == MainQuaternionSource::Icm ||
              selectedQuaternionSource == MainQuaternionSource::Lsm ||
              selectedQuaternionSource == MainQuaternionSource::Blended)) {
             math_utils::Quaternion referenceQuat = math_utils::MakeQuaternion(1.0f, 0.0f, 0.0f, 0.0f);
-            if (ArrayToQuaternion(data.quaternion, referenceQuat)) {
-                const float burnBlendFactor = settings::ahrs::kBnoReferenceCorrectionBlendFactor;
-                float blendFactor = burnBlendFactor;
-                if (status_ == FlightStatus::Coast) {
-                    blendFactor = settings::ahrs::kBnoCoastCorrectionBlendFactor;
+            if (ArrayToQuaternion(data.quaternionBNO, referenceQuat)) {
+                float blendFactor = settings::ahrs::kBnoCoastCorrectionBlendFactor;
+                if (settings::ahrs::kEnableBnoCoastBlending) {
+                    const float initialBlendFactor = settings::ahrs::kBnoCoastBlendFactor;
+                    blendFactor = initialBlendFactor;
                     const double rampDurationSeconds =
                         static_cast<double>(settings::ahrs::kBnoCoastCorrectionRampSeconds);
                     if (rampDurationSeconds > 0.0 && burnoutTimestamp_ > 0.0) {
@@ -356,9 +350,9 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
                         const double rampFraction =
                             std::clamp(timeSinceBurnout / rampDurationSeconds, 0.0, 1.0);
                         blendFactor = static_cast<float>(
-                            static_cast<double>(burnBlendFactor) +
+                            static_cast<double>(initialBlendFactor) +
                             rampFraction * static_cast<double>(
-                                settings::ahrs::kBnoCoastCorrectionBlendFactor - burnBlendFactor));
+                                settings::ahrs::kBnoCoastCorrectionBlendFactor - initialBlendFactor));
                     }
                 }
                 if (blendFactor > 0.0f) {
@@ -388,7 +382,7 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
         accelBody[0],
         accelBody[1],
         accelBody[2]);
-    const math_utils::Vec3 inertialAcceleration = hasAnyAccel
+    const math_utils::Vec3 inertialAcceleration = hasFreshAccelMeasurement
         ? (quaternionValid_
                ? RotateBodyToInertial(bodyAccel, orientation)
                : RotateBodyToInertial(bodyAccel, previousQuaternion_))
@@ -538,9 +532,21 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
     if (shouldPredictApogee) {
         // Deliberately degrade to a simpler predictor seed whenever attitude
         // freshness is questionable rather than integrating unstable XY terms.
-        const double seedZenith = quaternionValid_ ? SanitizePredictorZenithRadians(zenithRadians_) : 0.0;
-        const bool freshSeedSample = PredictorSeedHasFreshSample(dt);
-        const bool canUseHorizontalSeed = quaternionValid_ && freshSeedSample;
+        double seedZenith = quaternionValid_ ? SanitizePredictorZenithRadians(zenithRadians_) : 0.0;
+        double previousSeedZenith = SanitizePredictorZenithRadians(lastZenith_);
+        if (burnoutTimestamp_ > 0.0 &&
+            (status_ == FlightStatus::Coast || status_ == FlightStatus::Overshoot)) {
+            const double timeSinceBurnout =
+                std::max(0.0, static_cast<double>(data.timestamp) - burnoutTimestamp_);
+            const double previousTimeSinceBurnout =
+                std::max(0.0, timeSinceBurnout - std::max(dt, 0.0));
+            seedZenith = ApplyPredictorCoastEntryZenithBlend(seedZenith, timeSinceBurnout);
+            previousSeedZenith =
+                ApplyPredictorCoastEntryZenithBlend(previousSeedZenith, previousTimeSinceBurnout);
+        }
+        const bool freshAccelSeedSample =
+            PredictorSeedHasFreshAccelSample(dt, hasFreshAccelMeasurement);
+        const bool canUseHorizontalSeed = quaternionValid_ && freshAccelSeedSample;
         if (!canUseHorizontalSeed) {
             ResetPredictorHorizontalVelocityTracker(predictorHorizontalVelocity_);
         }
@@ -560,7 +566,8 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
                 : 0.0;
         const double predictorAngularRate =
             canUseHorizontalSeed
-                ? ClampPredictorAngularRate(ComputePredictorAngularRate(zenithRadians_, lastZenith_, dt))
+                ? ClampPredictorAngularRate(
+                      ComputePredictorAngularRate(seedZenith, previousSeedZenith, dt))
                 : 0.0;
 
         ApogeeState predictorState;
@@ -579,6 +586,7 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
         UpdateAdaptiveDragScale(predictorState,
                                 accZ,
                                 dt,
+                                hasFreshAccelMeasurement,
                                 prediction.timeToApogee,
                                 static_cast<double>(data.flapCommandDeg),
                                 static_cast<double>(data.flapEffectiveDeg),
@@ -651,6 +659,7 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
 void FlightComputer::UpdateAdaptiveDragScale(const ApogeeState &predictorState,
                                              double measuredVerticalAcceleration,
                                              double dtSeconds,
+                                             bool hasFreshAccelMeasurement,
                                              double timeToApogeeSeconds,
                                              double flapCommandDeg,
                                              double flapEffectiveDeg,
@@ -658,7 +667,7 @@ void FlightComputer::UpdateAdaptiveDragScale(const ApogeeState &predictorState,
     if (status_ != FlightStatus::Coast ||
         predictorState.verticalVelocity <= 0.0 ||
         !quaternionValid_ ||
-        !PredictorSeedHasFreshSample(dtSeconds) ||
+        !PredictorSeedHasFreshAccelSample(dtSeconds, hasFreshAccelMeasurement) ||
         !std::isfinite(measuredVerticalAcceleration) ||
         !std::isfinite(predictorState.zenith)) {
         return;

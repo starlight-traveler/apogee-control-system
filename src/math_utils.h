@@ -290,7 +290,6 @@ inline float QuaternionToZenith(const Quaternion &q) {
     const float cosZenith = 1.0f - 2.0f * (q.x * q.x + q.y * q.y);
     return acosf(fabsf(Clamp(cosZenith, -1.0f, 1.0f)));
 }
-
 inline double QuaternionToZenith(const Quaterniond &q) {
     const double cosZenith = 1.0 - 2.0 * (q.x * q.x + q.y * q.y);
     return acos(fabs(Clamp(cosZenith, -1.0, 1.0)));

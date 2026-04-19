@@ -32,12 +32,20 @@ inline void ResetPredictorHorizontalVelocityTracker(PredictorHorizontalVelocityT
     tracker.vy = 0.0;
 }
 
-/// Returns true when a predictor seed sample is recent enough to trust.
+/// Returns true when predictor seed timing is recent enough to trust.
 ///
 /// Large or non-positive `dt` values usually indicate stale timing or skipped
 /// samples, in which case the predictor should degrade toward a simpler seed.
 inline bool PredictorSeedHasFreshSample(double dtSeconds) {
     return std::isfinite(dtSeconds) && dtSeconds > 1.0e-4 && dtSeconds <= 0.25;
+}
+
+/// Returns true when a predictor seed can safely use accelerometer-driven terms.
+///
+/// XY seed integration and adaptive drag learning should require both fresh
+/// timing and a genuinely fresh accelerometer measurement, not just cached data.
+inline bool PredictorSeedHasFreshAccelSample(double dtSeconds, bool hasFreshAccelMeasurement) {
+    return hasFreshAccelMeasurement && PredictorSeedHasFreshSample(dtSeconds);
 }
 
 /// Clamps predictor zenith to the configured safe operating envelope.
@@ -53,6 +61,34 @@ inline double SanitizePredictorZenithRadians(double zenithRadians) {
         return 0.0;
     }
     return ClampPredictorZenithRadians(zenithRadians);
+}
+
+/// Returns the coast-entry soft-start applied to zenith/AoA predictor seeding.
+///
+/// Corrected attitude can step noticeably at burnout on historical data and
+/// during the estimator handoff into coast. Ramp the predictor tilt from a
+/// conservative initial factor back to the full measured zenith over a short
+/// post-burnout window so early-coast apogee calls do not overreact.
+inline double ComputePredictorCoastEntryZenithBlend(double timeSinceBurnoutSeconds) {
+    const double initialBlend = std::clamp(
+        static_cast<double>(settings::flight::kPredictorCoastEntryZenithInitialBlendFactor),
+        0.0,
+        1.0);
+    const double rampSeconds =
+        static_cast<double>(settings::flight::kPredictorCoastEntryZenithRampSeconds);
+    if (initialBlend >= 0.999999 || rampSeconds <= 0.0 || !std::isfinite(timeSinceBurnoutSeconds)) {
+        return 1.0;
+    }
+    if (timeSinceBurnoutSeconds <= 0.0) {
+        return initialBlend;
+    }
+    const double t = std::clamp(timeSinceBurnoutSeconds / rampSeconds, 0.0, 1.0);
+    return initialBlend + (1.0 - initialBlend) * t;
+}
+
+/// Applies the coast-entry soft-start to a predictor tilt-like quantity.
+inline double ApplyPredictorCoastEntryZenithBlend(double value, double timeSinceBurnoutSeconds) {
+    return value * ComputePredictorCoastEntryZenithBlend(timeSinceBurnoutSeconds);
 }
 
 /// Clamps predictor angular rate to the configured safe operating envelope.

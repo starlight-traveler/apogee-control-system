@@ -181,7 +181,7 @@ def interp_axis(grid: Sequence[float], value: float) -> Tuple[int, int, float]:
                 hi = mid
         low, high = lo, lo + 1
     denom = grid[high] - grid[low]
-    t = (value - grid[low]) / denom if denom != 0.0 else 0.0
+    t = clamp((value - grid[low]) / denom, 0.0, 1.0) if denom != 0.0 else 0.0
     return low, high, t
 
 

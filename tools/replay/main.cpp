@@ -177,6 +177,7 @@ struct ProgramOptions {
     bool quiet = false;
     bool ignoreLoggedState = false;
     bool rebuildMainQuaternion = false;
+    bool rebuildSeededState = false;
     float sigmaAccelXY = 0.5f;
     float sigmaAccelZ = 0.5f;
     float sigmaAltimeter = 0.5f;
@@ -236,6 +237,10 @@ struct ReplaySeedIndices {
     bool HasRequiredStateColumns() const {
         return stateTime.has_value() && position[2].has_value() && velocity[2].has_value() &&
                zenith.has_value();
+    }
+
+    bool HasHorizontalVelocityColumns() const {
+        return velocity[0].has_value() || velocity[1].has_value();
     }
 };
 
@@ -719,6 +724,52 @@ bool RebuildMainQuaternionFromRails(SensorData &sample) {
     }
     CopyQuaternion(selected, sample.quaternion);
     sample.hasQuaternion = true;
+    return true;
+}
+
+math_utils::Vec3 RotateReplayBodyToInertial(const math_utils::Vec3 &bodyAccel,
+                                            const math_utils::Quaternion &orientation) {
+    const float w = orientation.w;
+    const float x = orientation.x;
+    const float y = orientation.y;
+    const float z = orientation.z;
+
+    const float r00 = 1.0f - 2.0f * (y * y + z * z);
+    const float r01 = 2.0f * (x * y - w * z);
+    const float r02 = 2.0f * (x * z + w * y);
+    const float r10 = 2.0f * (x * y + w * z);
+    const float r11 = 1.0f - 2.0f * (x * x + z * z);
+    const float r12 = 2.0f * (y * z - w * x);
+    const float r20 = 2.0f * (x * z - w * y);
+    const float r21 = 2.0f * (y * z + w * x);
+    const float r22 = 1.0f - 2.0f * (x * x + y * y);
+
+    const float earthX = r00 * bodyAccel.x + r10 * bodyAccel.y + r20 * bodyAccel.z;
+    const float earthY = r01 * bodyAccel.x + r11 * bodyAccel.y + r21 * bodyAccel.z;
+    const float earthZ = r02 * bodyAccel.x + r12 * bodyAccel.y + r22 * bodyAccel.z;
+
+    math_utils::Vec3 result;
+    result.x = -earthZ;
+    result.y = earthY;
+    result.z = earthX - constants::kGravity;
+    return result;
+}
+
+bool TryGetReplayFreshBodyAccel(const SensorData &sample,
+                                math_utils::Vec3 &bodyAccel,
+                                bool &hasFreshAccelMeasurement) {
+    hasFreshAccelMeasurement = sample.lsmSampleFresh || sample.icmSampleFresh;
+    if (!hasFreshAccelMeasurement) {
+        bodyAccel = math_utils::MakeVec3(0.0f, 0.0f, 0.0f);
+        return false;
+    }
+
+    if (sample.lsmSampleFresh) {
+        bodyAccel = math_utils::MakeVec3(sample.accelLSM[0], sample.accelLSM[1], sample.accelLSM[2]);
+        return true;
+    }
+
+    bodyAccel = math_utils::MakeVec3(sample.accelICM[0], sample.accelICM[1], sample.accelICM[2]);
     return true;
 }
 
@@ -1296,12 +1347,13 @@ bool TryPopulateSeededState(const std::vector<std::string> &row,
     return true;
 }
 
-double ComputeSeededHorizontalVelocityOption1(const FilteredState &state, float horizontalVelocityScale) {
-    const double cosZenith = std::cos(static_cast<double>(state.zenith));
+double ComputeSeededHorizontalVelocityOption1(double verticalVelocityMps,
+                                              double zenithRadians,
+                                              float horizontalVelocityScale) {
+    const double cosZenith = std::cos(zenithRadians);
     const double clampedCos = std::clamp(cosZenith, 0.1, 1.0);
-    const double speedAlongAxis = static_cast<double>(state.velocity[2]) / clampedCos;
-    const double verticalSquared =
-        static_cast<double>(state.velocity[2]) * static_cast<double>(state.velocity[2]);
+    const double speedAlongAxis = verticalVelocityMps / clampedCos;
+    const double verticalSquared = verticalVelocityMps * verticalVelocityMps;
     const double speedSquared = speedAlongAxis * speedAlongAxis;
     const double horizontalSquared = speedSquared - verticalSquared;
     const double horizontalVelocity = (horizontalSquared > 0.0) ? std::sqrt(horizontalSquared) : 0.0;
@@ -1323,10 +1375,125 @@ double ComputeSeededAngularRate(float currentTimeSeconds,
     return (static_cast<double>(currentZenithRadians) - static_cast<double>(previousZenithRadians)) / dt;
 }
 
+struct ReplayPredictorSeedState {
+    PredictorHorizontalVelocityTracker horizontalVelocityTracker;
+    bool hasPreviousZenithSample = false;
+    float previousZenithRadians = 0.0f;
+    float previousTimeSeconds = 0.0f;
+};
+
+struct ReplayPredictorInputs {
+    double zenith = 0.0;
+    double horizontalVelocity = 0.0;
+    double angularRate = 0.0;
+};
+
+ReplayPredictorInputs BuildReplayPredictorInputs(FilteredState &state,
+                                                 const SensorData &sample,
+                                                 FlightStatus status,
+                                                 const std::optional<float> &burnoutTimeSeconds,
+                                                 const ReplaySeedIndices &indices,
+                                                 const ProgramOptions &options,
+                                                 ReplayPredictorSeedState &seedState) {
+    ReplayPredictorInputs inputs;
+
+    const double dt = seedState.hasPreviousZenithSample
+                          ? static_cast<double>(state.time) - static_cast<double>(seedState.previousTimeSeconds)
+                          : 0.0;
+    inputs.zenith = SanitizePredictorZenithRadians(static_cast<double>(state.zenith));
+    double previousSeedZenith = SanitizePredictorZenithRadians(
+        static_cast<double>(seedState.previousZenithRadians));
+    if (burnoutTimeSeconds.has_value() &&
+        (status == FlightStatus::Coast || status == FlightStatus::Overshoot)) {
+        const double timeSinceBurnout =
+            std::max(0.0, static_cast<double>(state.time) - static_cast<double>(*burnoutTimeSeconds));
+        const double previousTimeSinceBurnout =
+            std::max(0.0,
+                     static_cast<double>(seedState.previousTimeSeconds) -
+                         static_cast<double>(*burnoutTimeSeconds));
+        inputs.zenith = ApplyPredictorCoastEntryZenithBlend(inputs.zenith, timeSinceBurnout);
+        previousSeedZenith =
+            ApplyPredictorCoastEntryZenithBlend(previousSeedZenith, previousTimeSinceBurnout);
+    }
+
+    if (!options.rebuildSeededState) {
+        inputs.horizontalVelocity =
+            ComputeSeededHorizontalVelocityOption1(static_cast<double>(state.velocity[2]),
+                                                  inputs.zenith,
+                                                  options.seededHorizontalVelocityScale);
+        inputs.angularRate =
+            ComputeSeededAngularRate(state.time,
+                                     static_cast<float>(inputs.zenith),
+                                     seedState.previousTimeSeconds,
+                                     static_cast<float>(previousSeedZenith),
+                                     seedState.hasPreviousZenithSample);
+        seedState.hasPreviousZenithSample = true;
+        seedState.previousZenithRadians = state.zenith;
+        seedState.previousTimeSeconds = state.time;
+        return inputs;
+    }
+
+    math_utils::Vec3 bodyAccel = math_utils::MakeVec3(0.0f, 0.0f, 0.0f);
+    bool hasFreshAccelMeasurement = false;
+    const bool hasBodyAccel = TryGetReplayFreshBodyAccel(sample, bodyAccel, hasFreshAccelMeasurement);
+    math_utils::Quaternion orientation = math_utils::MakeQuaternion(1.0f, 0.0f, 0.0f, 0.0f);
+    const bool hasValidQuaternion =
+        sample.hasQuaternion && LoadValidatedQuaternionArray(sample.quaternion, orientation);
+    const math_utils::Vec3 inertialAcceleration =
+        (hasBodyAccel && hasValidQuaternion)
+            ? RotateReplayBodyToInertial(bodyAccel, orientation)
+            : math_utils::MakeVec3(0.0f, 0.0f, 0.0f);
+    state.inertialAcceleration[0] = inertialAcceleration.x;
+    state.inertialAcceleration[1] = inertialAcceleration.y;
+    state.inertialAcceleration[2] = inertialAcceleration.z;
+
+    const bool useHorizontalSeed = PredictorSeedHasFreshAccelSample(dt, hasFreshAccelMeasurement) &&
+                                   hasValidQuaternion &&
+                                   state.velocity[2] > 0.0f;
+    if (!useHorizontalSeed) {
+        ResetPredictorHorizontalVelocityTracker(seedState.horizontalVelocityTracker);
+    }
+
+    const double trackedHorizontalVelocity =
+        useHorizontalSeed
+                ? UpdatePredictorHorizontalSpeed(seedState.horizontalVelocityTracker,
+                                                 static_cast<double>(inertialAcceleration.x),
+                                                 static_cast<double>(inertialAcceleration.y),
+                                                 dt,
+                                                 true,
+                                                 static_cast<double>(state.velocity[2]),
+                                                 inputs.zenith)
+                : 0.0;
+    inputs.horizontalVelocity =
+        useHorizontalSeed
+            ? ResolvePredictorHorizontalSpeed(trackedHorizontalVelocity,
+                                              static_cast<double>(state.velocity[2]),
+                                              inputs.zenith)
+            : 0.0;
+    inputs.angularRate =
+        useHorizontalSeed
+            ? ClampPredictorAngularRate(
+                  ComputePredictorAngularRate(inputs.zenith,
+                                              previousSeedZenith,
+                                              dt))
+            : 0.0;
+
+    if (!indices.HasHorizontalVelocityColumns()) {
+        state.velocity[0] = static_cast<float>(inputs.horizontalVelocity);
+        state.velocity[1] = 0.0f;
+    }
+
+    seedState.hasPreviousZenithSample = true;
+    seedState.previousZenithRadians = state.zenith;
+    seedState.previousTimeSeconds = state.time;
+    return inputs;
+}
+
 double RecomputeSeededApogeeEstimate(const FilteredState &state,
                                      FlightStatus status,
+                                     double predictorZenith,
                                      double angularRate,
-                                     float horizontalVelocityScale,
+                                     double horizontalVelocity,
                                      ApogeePredictor &predictor,
                                      double &lastPredictionMeters,
                                      float &lastPredictionTimeSeconds,
@@ -1342,9 +1509,8 @@ double RecomputeSeededApogeeEstimate(const FilteredState &state,
             predictorState.altitudeMeters = static_cast<double>(state.position[2]);
             predictorState.horizontalDistanceMeters = 0.0;
             predictorState.verticalVelocity = static_cast<double>(state.velocity[2]);
-            predictorState.horizontalVelocity =
-                ComputeSeededHorizontalVelocityOption1(state, horizontalVelocityScale);
-            predictorState.zenith = static_cast<double>(state.zenith);
+            predictorState.horizontalVelocity = horizontalVelocity;
+            predictorState.zenith = predictorZenith;
             predictorState.angularVelocity = angularRate;
             predictorState.acsAngleDeg = 0.0;
             lastPredictionMeters = predictor.PredictApogee(predictorState);
@@ -1653,6 +1819,7 @@ void PrintUsage(const char *program) {
               << "  --sign-check-window <sec>  Match window for sign-check sample (default 0.05).\n"
               << "  --ignore-logged-state      Recompute filtered state instead of smart-seeding from logged state columns.\n"
               << "  --rebuild-main-quaternion  Rebuild main quaternion from logged ICM/LSM rails and override seeded zenith from it.\n"
+              << "  --rebuild-seeded-state     Rebuild replay-only predictor seed inputs from raw sensors and the selected main quaternion.\n"
               << "  --include-raw-altimeter    Append raw altimeter measurements to output CSV.\n"
               << "  --include-raw <fields>    Append raw sensor fields (comma-separated).\n"
              << "  --graph <fields>          Render ASCII graphs and Matplot++ images for the requested fields.\n"
@@ -1718,6 +1885,10 @@ bool ParseArgs(int argc, char **argv, ProgramOptions &options) {
         }
         if (arg == "--rebuild-main-quaternion") {
             options.rebuildMainQuaternion = true;
+            continue;
+        }
+        if (arg == "--rebuild-seeded-state") {
+            options.rebuildSeededState = true;
             continue;
         }
         if (arg == "--cp-offset-m") {
@@ -2185,6 +2356,8 @@ int main(int argc, char **argv) {
     bool hasSeededReplayPrediction = false;
     float lastSeededReplayPredictionTimeSeconds = 0.0f;
     double lastSeededReplayPredictionMeters = 0.0;
+    ReplayPredictorSeedState replayPredictorSeedState{};
+    std::optional<float> seededReplayBurnoutTimeSeconds;
     while (std::getline(input, line)) {
         ++lineNumber;
         if (Trim(line).empty()) {
@@ -2227,17 +2400,24 @@ int main(int argc, char **argv) {
                                                emittedStatus);
         if (hasState) {
             usedSeededStateOutput = true;
-            const double seededAngularRate =
-                ComputeSeededAngularRate(state.time,
-                                         state.zenith,
-                                         previousTimeSeconds,
-                                         previousZenithRadians,
-                                         hasPreviousZenith);
+            if (!seededReplayBurnoutTimeSeconds.has_value() &&
+                (emittedStatus == FlightStatus::Coast || emittedStatus == FlightStatus::Overshoot)) {
+                seededReplayBurnoutTimeSeconds = state.time;
+            }
+            const ReplayPredictorInputs predictorInputs =
+                BuildReplayPredictorInputs(state,
+                                           sample,
+                                           emittedStatus,
+                                           seededReplayBurnoutTimeSeconds,
+                                           replaySeedIndices,
+                                           options,
+                                           replayPredictorSeedState);
             state.apogeeEstimate =
                 static_cast<float>(RecomputeSeededApogeeEstimate(state,
                                                                  emittedStatus,
-                                                                 seededAngularRate,
-                                                                 options.seededHorizontalVelocityScale,
+                                                                 predictorInputs.zenith,
+                                                                 predictorInputs.angularRate,
+                                                                 predictorInputs.horizontalVelocity,
                                                                  seededReplayPredictor,
                                                                  lastSeededReplayPredictionMeters,
                                                                  lastSeededReplayPredictionTimeSeconds,

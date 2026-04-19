@@ -565,6 +565,9 @@ class ApogeePredictor {
     }
 
     /// Locates the two table samples that bracket `value` on one CFD axis.
+    ///
+    /// Values outside the sampled CFD envelope clamp to the nearest edge cell
+    /// rather than extrapolating beyond the available force data.
     static AxisInterp InterpolateAxis(const double *grid, int count, double value, AxisHint *hint) {
         AxisInterp result{0, 0, 0.0};
         if (grid == nullptr || count < 2) {
@@ -585,7 +588,9 @@ class ApogeePredictor {
                 result.lower = low;
                 result.upper = low + 1;
                 const double denom = grid[result.upper] - grid[result.lower];
-                result.t = (denom != 0.0) ? (value - grid[result.lower]) / denom : 0.0;
+                result.t = (denom != 0.0)
+                               ? std::clamp((value - grid[result.lower]) / denom, 0.0, 1.0)
+                               : 0.0;
                 hint->lower = low;
                 hint->valid = true;
                 return result;
@@ -612,7 +617,9 @@ class ApogeePredictor {
             result.upper = low + 1;
         }
         const double denom = grid[result.upper] - grid[result.lower];
-        result.t = (denom != 0.0) ? (value - grid[result.lower]) / denom : 0.0;
+        result.t = (denom != 0.0)
+                       ? std::clamp((value - grid[result.lower]) / denom, 0.0, 1.0)
+                       : 0.0;
         if (hint != nullptr) {
             hint->lower = result.lower;
             hint->valid = true;

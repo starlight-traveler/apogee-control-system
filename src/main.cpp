@@ -2704,12 +2704,6 @@ static float ComputeAutoActuationCommandDeg(uint32_t nowMs,
         dtSeconds = static_cast<double>(state.time) - static_cast<double>(g_actuationLastStateTime);
     }
     const bool freshSeedSample = PredictorSeedHasFreshSample(dtSeconds);
-    angularRate = ComputePredictorAngularRate(static_cast<double>(state.zenith),
-                                              previousZenithRad,
-                                              dtSeconds);
-    g_actuationHasLastZenithSample = true;
-    g_actuationLastZenithRad = state.zenith;
-    g_actuationLastStateTime = state.time;
 
     const bool predictorSeedActive =
         g_actuationPredictorReady && (status == FlightStatus::Burn || status == FlightStatus::Coast) &&
@@ -2722,7 +2716,25 @@ static float ComputeAutoActuationCommandDeg(uint32_t nowMs,
     if (state.velocity[2] > 0.0f) {
         predictorSeedFlags |= kPredictorSeedFlagPositiveVerticalVelocity;
     }
-    const double clampedZenith = SanitizePredictorZenithRadians(static_cast<double>(state.zenith));
+    double clampedZenith = SanitizePredictorZenithRadians(static_cast<double>(state.zenith));
+    double previousSeedZenith = SanitizePredictorZenithRadians(previousZenithRad);
+    if (status == FlightStatus::Coast) {
+        const double burnoutTime = flightComputer.BurnoutTime();
+        if (burnoutTime > 0.0) {
+            const double timeSinceBurnout = static_cast<double>(state.time) - burnoutTime;
+            const double previousTimeSinceBurnout =
+                static_cast<double>(g_actuationLastStateTime) - burnoutTime;
+            clampedZenith =
+                ApplyPredictorCoastEntryZenithBlend(clampedZenith, std::max(0.0, timeSinceBurnout));
+            previousSeedZenith = ApplyPredictorCoastEntryZenithBlend(
+                previousSeedZenith,
+                std::max(0.0, previousTimeSinceBurnout));
+        }
+    }
+    angularRate = ComputePredictorAngularRate(clampedZenith, previousSeedZenith, dtSeconds);
+    g_actuationHasLastZenithSample = true;
+    g_actuationLastZenithRad = state.zenith;
+    g_actuationLastStateTime = state.time;
     // A stale or inactive control window is forced back to a simpler
     // vertical-only predictor seed.
     const bool useHorizontalModel = predictorSeedActive && freshSeedSample;

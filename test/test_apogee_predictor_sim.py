@@ -9,6 +9,7 @@ from python.apogee_predictor_sim import (
     build_seed_safer,
     compute_actual_apogee,
     horizontal_speed_cap,
+    interp_axis,
     legacy_horizontal_speed,
     load_force_table,
     parse_replay_rows,
@@ -65,6 +66,17 @@ class ApogeePredictorSimTests(unittest.TestCase):
         self.assertAlmostEqual(legacy_seed.vertical_v, safer_seed.vertical_v)
         self.assertAlmostEqual(legacy_h, 100.0 * math.tan(math.radians(3.0)), delta=0.25)
         self.assertAlmostEqual(safer_seed.horizontal_v, 5.0, delta=1.0e-6)
+
+    def test_interp_axis_clamps_at_table_edges(self) -> None:
+        grid = [0.675, 0.7]
+
+        lower, upper, t_low = interp_axis(grid, 0.6)
+        self.assertEqual((lower, upper), (0, 1))
+        self.assertEqual(t_low, 0.0)
+
+        lower, upper, t_high = interp_axis(grid, 1.2)
+        self.assertEqual((lower, upper), (0, 1))
+        self.assertEqual(t_high, 1.0)
 
     def test_replay_smoke_test(self) -> None:
         rows = parse_replay_rows(ROOT / "tools" / "replay" / "output.csv")

@@ -156,6 +156,7 @@ class FlightComputer {
     void UpdateAdaptiveDragScale(const ApogeeState &predictorState,
                                  double measuredVerticalAcceleration,
                                  double dtSeconds,
+                                 bool hasFreshAccelMeasurement,
                                  double timeToApogeeSeconds,
                                  double flapCommandDeg,
                                  double flapEffectiveDeg,
