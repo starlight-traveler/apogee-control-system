@@ -2200,6 +2200,14 @@ struct AutoActuationTelemetry {
     float predictorSeedConfidenceFlags = 0.0f;
 };
 
+static bool IsCoastLikeActuationPhase(FlightStatus status) {
+    return status == FlightStatus::Coast || status == FlightStatus::Overshoot;
+}
+
+static bool IsAscentActuationPhase(FlightStatus status) {
+    return status == FlightStatus::Burn || IsCoastLikeActuationPhase(status);
+}
+
 static bool ShouldBlockFirstAutoActuationMotion(const FilteredState &state,
                                                 FlightStatus status,
                                                 bool hasBaroAgl,
@@ -2208,7 +2216,7 @@ static bool ShouldBlockFirstAutoActuationMotion(const FilteredState &state,
         return false;
     }
 
-    if (status != FlightStatus::Coast) {
+    if (!IsCoastLikeActuationPhase(status)) {
         return true;
     }
 
@@ -2236,7 +2244,7 @@ static bool ShouldLatchAutoActuationSafety(const FilteredState &state,
                                            FlightStatus status,
                                            bool hasBaroAgl,
                                            float baroAltitudeAglMeters) {
-    if (status != FlightStatus::Coast) {
+    if (!IsCoastLikeActuationPhase(status)) {
         return false;
     }
 
@@ -2706,8 +2714,7 @@ static float ComputeAutoActuationCommandDeg(uint32_t nowMs,
     const bool freshSeedSample = PredictorSeedHasFreshSample(dtSeconds);
 
     const bool predictorSeedActive =
-        g_actuationPredictorReady && (status == FlightStatus::Burn || status == FlightStatus::Coast) &&
-        state.velocity[2] > 0.0f;
+        g_actuationPredictorReady && IsAscentActuationPhase(status) && state.velocity[2] > 0.0f;
     const bool canControl = predictorSeedActive;
     uint32_t predictorSeedFlags = 0;
     if (predictorSeedActive) {
@@ -2718,7 +2725,7 @@ static float ComputeAutoActuationCommandDeg(uint32_t nowMs,
     }
     double clampedZenith = SanitizePredictorZenithRadians(static_cast<double>(state.zenith));
     double previousSeedZenith = SanitizePredictorZenithRadians(previousZenithRad);
-    if (status == FlightStatus::Coast) {
+    if (IsCoastLikeActuationPhase(status)) {
         const double burnoutTime = flightComputer.BurnoutTime();
         if (burnoutTime > 0.0) {
             const double timeSinceBurnout = static_cast<double>(state.time) - burnoutTime;
@@ -2817,7 +2824,7 @@ static float ComputeAutoActuationCommandDeg(uint32_t nowMs,
     const double maxAngle = static_cast<double>(kServoMaxActuationDeg);
     double maxAllowedAngle = maxAngle;
 
-    if (status == FlightStatus::Coast) {
+    if (IsCoastLikeActuationPhase(status)) {
         const double hardDisableVz = static_cast<double>(settings::actuation::kCoastHardDisableVelocityMps);
         const double hardDisableTime = static_cast<double>(settings::actuation::kCoastHardDisableTimeToApogeeS);
         const double softDisableStart =
@@ -2838,7 +2845,7 @@ static float ComputeAutoActuationCommandDeg(uint32_t nowMs,
         }
     }
 
-    if (status == FlightStatus::Coast) {
+    if (IsCoastLikeActuationPhase(status)) {
         const double rampStartMaxAngle =
             std::min(maxAllowedAngle,
                      static_cast<double>(settings::actuation::kFirstMotionRampStartMaxAngleDeg));

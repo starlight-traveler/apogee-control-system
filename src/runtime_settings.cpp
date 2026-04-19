@@ -105,6 +105,15 @@ bool InClosedRange(double value, double minValue, double maxValue) {
     return isfinite(value) && value >= minValue && value <= maxValue;
 }
 
+bool RuntimeSettingsFilePresent() {
+    FsFile file;
+    if (!DataLoggerOpenReadFile(kRuntimeSettingsPath, file)) {
+        return false;
+    }
+    file.close();
+    return true;
+}
+
 bool BuildFileContents(const RuntimeSettings &settings, char *buffer, size_t bufferSize) {
     if (buffer == nullptr || bufferSize == 0) {
         return false;
@@ -176,24 +185,30 @@ bool RuntimeSettingsLoadOrCreate(RuntimeSettings &settings, RuntimeSettingsStora
     }
 
     status.storageAvailable = true;
+    const bool filePresent = RuntimeSettingsFilePresent();
+    status.filePresent = filePresent;
+    if (!filePresent) {
+        status.usingDefaults = true;
+        char buffer[640];
+        if (!BuildFileContents(settings, buffer, sizeof(buffer))) {
+            return false;
+        }
+        status.createdDefaultFile = DataLoggerWriteTextFile(kRuntimeSettingsPath, buffer);
+        status.filePresent = status.createdDefaultFile;
+        status.lastSaveSucceeded = status.createdDefaultFile;
+        return false;
+    }
+
     ParseContext parse{};
     const bool readOk = DataLoggerReadTextFile(kRuntimeSettingsPath, &ParseLine, &parse);
     if (readOk && !parse.parseError && parse.sawAnySetting && RuntimeSettingsValidate(parse.settings)) {
         settings = parse.settings;
-        status.filePresent = true;
         status.usingDefaults = false;
         status.lastLoadSucceeded = true;
         return true;
     }
 
     status.usingDefaults = true;
-    char buffer[640];
-    if (!BuildFileContents(settings, buffer, sizeof(buffer))) {
-        return false;
-    }
-    status.createdDefaultFile = DataLoggerWriteTextFile(kRuntimeSettingsPath, buffer);
-    status.filePresent = status.createdDefaultFile;
-    status.lastSaveSucceeded = status.createdDefaultFile;
     return false;
 }
 

@@ -34,6 +34,17 @@ uint32_t g_lastSettingsSendMs = 0;
 
 constexpr uint32_t kSettingsIntervalMs = 1000;
 
+void UpdateSubscriberEndpoint(uint32_t nowMs, const IPAddress &remoteIp, uint16_t remotePort) {
+    g_hasSubscriber = true;
+    g_lastSubscriberMs = nowMs;
+    g_subscriberIp = remoteIp;
+    g_subscriberPort = remotePort;
+}
+
+bool SubscriberMatches(const IPAddress &remoteIp, uint16_t remotePort) {
+    return g_hasSubscriber && g_subscriberIp == remoteIp && g_subscriberPort == remotePort;
+}
+
 IPAddress ConfiguredRemoteIp() {
     return IPAddress(settings::network::kTelemetryRemoteIp0,
                      settings::network::kTelemetryRemoteIp1,
@@ -98,6 +109,30 @@ bool WiFiConnected(uint32_t nowMs) {
         g_lastWifiStatusCheckMs = nowMs;
     }
     return g_wifiConnectedCached;
+}
+
+bool SubscriberActive(uint32_t nowMs) {
+    if (!g_hasSubscriber) {
+        return false;
+    }
+    const bool active = (nowMs - g_lastSubscriberMs) <= settings::network::kSubscriberHeartbeatTimeoutMs;
+    if (!active) {
+        // Force a fresh heartbeat before telemetry resumes.
+        g_hasSubscriber = false;
+        g_subscriberIp = IPAddress();
+        g_subscriberPort = settings::network::kTelemetryUdpRemotePort;
+        g_manualActuationOverride = false;
+        g_manualActuationAngleDeg = 0.0f;
+    }
+    return active;
+}
+
+bool CommandAuthorized(uint32_t nowMs, const IPAddress &remoteIp, uint16_t remotePort) {
+    if (!settings::network::kRequireSubscriberHeartbeat) {
+        UpdateSubscriberEndpoint(nowMs, remoteIp, remotePort);
+        return true;
+    }
+    return SubscriberActive(nowMs) && SubscriberMatches(remoteIp, remotePort);
 }
 
 void FillPacket(const TelemetrySnapshot &snapshot, telemetry::PacketV1 &packet) {
@@ -180,6 +215,8 @@ void FillSettingsPayload(const RuntimeSettings &settings, telemetry::RuntimeSett
 void PollSubscriberPackets(uint32_t nowMs) {
     int packetBytes = g_udp.parsePacket();
     while (packetBytes > 0) {
+        const IPAddress remoteIp = g_udp.remoteIP();
+        const uint16_t remotePort = g_udp.remotePort();
         if (packetBytes == static_cast<int>(sizeof(telemetry::HeartbeatV1))) {
             telemetry::HeartbeatV1 heartbeat{};
             const int n = g_udp.read(reinterpret_cast<uint8_t *>(&heartbeat), sizeof(heartbeat));
@@ -187,10 +224,7 @@ void PollSubscriberPackets(uint32_t nowMs) {
                 heartbeat.magic == telemetry::kHeartbeatMagic &&
                 heartbeat.version == telemetry::kHeartbeatVersion &&
                 heartbeat.size == sizeof(telemetry::HeartbeatV1)) {
-                g_hasSubscriber = true;
-                g_lastSubscriberMs = nowMs;
-                g_subscriberIp = g_udp.remoteIP();
-                g_subscriberPort = g_udp.remotePort();
+                UpdateSubscriberEndpoint(nowMs, remoteIp, remotePort);
             }
         } else if (packetBytes == static_cast<int>(sizeof(telemetry::ActuationCommandV1))) {
             telemetry::ActuationCommandV1 command{};
@@ -198,7 +232,8 @@ void PollSubscriberPackets(uint32_t nowMs) {
             if (n == static_cast<int>(sizeof(command)) &&
                 command.magic == telemetry::kActuationCommandMagic &&
                 command.version == telemetry::kActuationCommandVersion &&
-                command.size == sizeof(telemetry::ActuationCommandV1)) {
+                command.size == sizeof(telemetry::ActuationCommandV1) &&
+                CommandAuthorized(nowMs, remoteIp, remotePort)) {
                 if (command.mode == telemetry::kActuationModeManual) {
                     g_manualActuationOverride = true;
                     g_manualActuationAngleDeg = command.angleDeg;
@@ -209,10 +244,6 @@ void PollSubscriberPackets(uint32_t nowMs) {
                     g_manualActuationOverride = false;
                     g_manualActuationAngleDeg = 0.0f;
                 }
-                g_hasSubscriber = true;
-                g_lastSubscriberMs = nowMs;
-                g_subscriberIp = g_udp.remoteIP();
-                g_subscriberPort = g_udp.remotePort();
             }
         } else if (packetBytes == static_cast<int>(sizeof(telemetry::TelemetryControlV1))) {
             telemetry::TelemetryControlV1 control{};
@@ -220,12 +251,9 @@ void PollSubscriberPackets(uint32_t nowMs) {
             if (n == static_cast<int>(sizeof(control)) &&
                 control.magic == telemetry::kTelemetryControlMagic &&
                 control.version == telemetry::kTelemetryControlVersion &&
-                control.size == sizeof(telemetry::TelemetryControlV1)) {
+                control.size == sizeof(telemetry::TelemetryControlV1) &&
+                CommandAuthorized(nowMs, remoteIp, remotePort)) {
                 g_telemetryStreamingEnabled = control.telemetryEnabled != 0u;
-                g_hasSubscriber = true;
-                g_lastSubscriberMs = nowMs;
-                g_subscriberIp = g_udp.remoteIP();
-                g_subscriberPort = g_udp.remotePort();
                 if (!g_telemetryStreamingEnabled) {
                     g_manualActuationOverride = false;
                     g_manualActuationAngleDeg = 0.0f;
@@ -237,14 +265,11 @@ void PollSubscriberPackets(uint32_t nowMs) {
             if (n == static_cast<int>(sizeof(command)) &&
                 command.magic == telemetry::kSettingsCommandMagic &&
                 command.version == telemetry::kSettingsCommandVersion &&
-                command.size == sizeof(telemetry::SettingsCommandV1)) {
+                command.size == sizeof(telemetry::SettingsCommandV1) &&
+                CommandAuthorized(nowMs, remoteIp, remotePort)) {
                 g_pendingSettingsCommand = command;
                 g_hasPendingSettingsCommand = true;
                 g_settingsSnapshotDirty = true;
-                g_hasSubscriber = true;
-                g_lastSubscriberMs = nowMs;
-                g_subscriberIp = g_udp.remoteIP();
-                g_subscriberPort = g_udp.remotePort();
             }
         } else {
             while (packetBytes-- > 0) {
@@ -254,22 +279,6 @@ void PollSubscriberPackets(uint32_t nowMs) {
 
         packetBytes = g_udp.parsePacket();
     }
-}
-
-bool SubscriberActive(uint32_t nowMs) {
-    if (!g_hasSubscriber) {
-        return false;
-    }
-    const bool active = (nowMs - g_lastSubscriberMs) <= settings::network::kSubscriberHeartbeatTimeoutMs;
-    if (!active) {
-        // Force a fresh heartbeat before telemetry resumes.
-        g_hasSubscriber = false;
-        g_subscriberIp = IPAddress();
-        g_subscriberPort = settings::network::kTelemetryUdpRemotePort;
-        g_manualActuationOverride = false;
-        g_manualActuationAngleDeg = 0.0f;
-    }
-    return active;
 }
 
 }  // namespace
@@ -357,6 +366,10 @@ bool NetworkTelemetrySubscriberActive() {
 }
 
 bool NetworkTelemetryManualActuationOverride(float &angleDegOut) {
+    if (!SubscriberActive(millis())) {
+        angleDegOut = 0.0f;
+        return false;
+    }
     angleDegOut = g_manualActuationAngleDeg;
     return g_manualActuationOverride;
 }
