@@ -144,12 +144,15 @@ void FlightComputer::Begin(double sigmaAccelXY,
 /// Updates the runtime-configurable environment/vehicle parameters in-place.
 void FlightComputer::ReconfigurePredictor(const EnvironmentModel::Config &environmentConfig,
                                           const ApogeeVehicleParameters &vehicleParameters,
-                                          const ApogeeForceTable *forceTable) {
+                                          const ApogeeForceTable *forceTable,
+                                          bool preserveAdaptiveState) {
     environment_.Configure(environmentConfig);
     apogeePredictor_.SetEnvironment(environment_);
     apogeePredictor_.SetVehicleParameters(vehicleParameters);
     apogeePredictor_.SetForceTable(forceTable);
-    apogeePredictor_.ResetAxialDragScale();
+    if (!preserveAdaptiveState) {
+        apogeePredictor_.ResetAxialDragScale();
+    }
 }
 
 void FlightComputer::ResetGroundReference() {
@@ -157,6 +160,7 @@ void FlightComputer::ResetGroundReference() {
     altitudeReferenceMeters_ = 0.0;
     lastGroundRelativeAltitudeMeters_ = 0.0;
     groundRelativeVelocityMps_ = 0.0;
+    maxObservedAltitude_ = 0.0;
     groundReferenceDriftRateMps_ = 0.0;
     groundReferenceStableSince_ = 0.0;
     groundReferenceSettled_ = false;
@@ -372,11 +376,15 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
         }
     }
 
-    float yaw = 0.0f;
-    float pitch = 0.0f;
-    float roll = 0.0f;
-    math_utils::QuaternionToEuler(orientation, yaw, pitch, roll);
-    zenithRadians_ = static_cast<double>(math_utils::EulerToZenith(pitch, roll));
+    if (quaternionValid_) {
+        zenithRadians_ = static_cast<double>(math_utils::QuaternionToZenith(orientation));
+        if (!std::isfinite(zenithRadians_)) {
+            zenithRadians_ = 0.0;
+            quaternionValid_ = false;
+        }
+    } else {
+        zenithRadians_ = 0.0;
+    }
 
     const math_utils::Vec3 bodyAccel = math_utils::MakeVec3(
         accelBody[0],
@@ -478,14 +486,19 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
         }
     }
 
+    if (status_ == FlightStatus::Burn ||
+        status_ == FlightStatus::Coast ||
+        status_ == FlightStatus::Overshoot) {
+        maxObservedAltitude_ = std::max(maxObservedAltitude_, rawPosZ);
+    }
+
     if (status_ == FlightStatus::Burn) {
         const double timeSinceBurn = static_cast<double>(data.timestamp) - burnTimestamp_;
         const bool afterMinimumBurn = timeSinceBurn >= settings::flight::kBurnoutMinDurationSeconds;
         const bool accelerationSuggestsBurnout = accZ < settings::flight::kBurnoutAccelerationThresholdMps2;
         const bool stillAscending = rawVelZ > settings::flight::kBurnoutVelocityThresholdMps;
-        const bool belowTarget = rawPosZ < apogeeTargetMeters_;
 
-        if (afterMinimumBurn && accelerationSuggestsBurnout && stillAscending && belowTarget) {
+        if (afterMinimumBurn && accelerationSuggestsBurnout && stillAscending) {
             if (burnoutCandidateCount_ < 255) {
                 ++burnoutCandidateCount_;
             }
@@ -515,7 +528,7 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
         if (accZ < settings::flight::kDescentAccelerationThresholdMps2 &&
             rawVelZ <= settings::flight::kDescentVelocityThresholdMps) {
             status_ = FlightStatus::Descent;
-            apogeeAltitude_ = rawPosZ;
+            apogeeAltitude_ = maxObservedAltitude_;
             apogeeTimestamp_ = static_cast<double>(data.timestamp);
             apogeeRecorded_ = true;
             ReportEvent(true, data.timestamp, "Apogee reached");
@@ -529,20 +542,38 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
          status_ == FlightStatus::Coast ||
          status_ == FlightStatus::Overshoot) &&
         rawVelZ > 0.0;
+    double predictorHorizontalVelocity = 0.0;
+    double predictorClampedZenith = 0.0;
+    double predictorClampedAngularRate = 0.0;
+    double predictorTimeToApogee = 0.0;
+    uint32_t predictorFlags = 0;
     if (shouldPredictApogee) {
+        predictorFlags |= kPredictorSeedFlagControlActive;
+        predictorFlags |= kPredictorSeedFlagPositiveVerticalVelocity;
         // Deliberately degrade to a simpler predictor seed whenever attitude
         // freshness is questionable rather than integrating unstable XY terms.
         double seedZenith = quaternionValid_ ? SanitizePredictorZenithRadians(zenithRadians_) : 0.0;
         double previousSeedZenith = SanitizePredictorZenithRadians(lastZenith_);
+        const double rawSeedZenith = quaternionValid_ ? zenithRadians_ : 0.0;
+        if (quaternionValid_ && std::fabs(seedZenith - rawSeedZenith) > 1.0e-9) {
+            predictorFlags |= kPredictorSeedFlagZenithClamped;
+        }
+        bool coastEntryBlendActive = false;
         if (burnoutTimestamp_ > 0.0 &&
             (status_ == FlightStatus::Coast || status_ == FlightStatus::Overshoot)) {
             const double timeSinceBurnout =
                 std::max(0.0, static_cast<double>(data.timestamp) - burnoutTimestamp_);
             const double previousTimeSinceBurnout =
                 std::max(0.0, timeSinceBurnout - std::max(dt, 0.0));
+            const double blendRampSeconds =
+                static_cast<double>(settings::flight::kPredictorCoastEntryZenithRampSeconds);
+            coastEntryBlendActive = timeSinceBurnout < blendRampSeconds;
             seedZenith = ApplyPredictorCoastEntryZenithBlend(seedZenith, timeSinceBurnout);
             previousSeedZenith =
                 ApplyPredictorCoastEntryZenithBlend(previousSeedZenith, previousTimeSinceBurnout);
+        }
+        if (coastEntryBlendActive) {
+            predictorFlags |= kPredictorSeedFlagCoastEntryBlendActive;
         }
         const bool freshAccelSeedSample =
             PredictorSeedHasFreshAccelSample(dt, hasFreshAccelMeasurement);
@@ -560,30 +591,51 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
                                                  rawVelZ,
                                                  seedZenith)
                 : 0.0;
-        const double predictorHorizontalVelocity =
+        predictorHorizontalVelocity =
             canUseHorizontalSeed
                 ? ResolvePredictorHorizontalSpeed(trackedHorizontalVelocity, rawVelZ, seedZenith)
                 : 0.0;
-        const double predictorAngularRate =
+        if (canUseHorizontalSeed) {
+            predictorFlags |= kPredictorSeedFlagUsingHorizontalModel;
+        }
+        const double rawPredictorAngularRate =
+            ComputePredictorAngularRate(seedZenith, previousSeedZenith, dt);
+        predictorClampedAngularRate =
             canUseHorizontalSeed
-                ? ClampPredictorAngularRate(
-                      ComputePredictorAngularRate(seedZenith, previousSeedZenith, dt))
+                ? ClampPredictorAngularRate(rawPredictorAngularRate)
                 : 0.0;
+        predictorClampedZenith = seedZenith;
+        if (canUseHorizontalSeed &&
+            std::fabs(predictorClampedAngularRate - rawPredictorAngularRate) > 1.0e-9) {
+            predictorFlags |= kPredictorSeedFlagAngularRateClamped;
+        }
+        const double horizontalSpeedCap = PredictorHorizontalSpeedCap(rawVelZ, seedZenith);
+        if (canUseHorizontalSeed &&
+            predictorHorizontalVelocity >= (horizontalSpeedCap - 1.0e-6)) {
+            predictorFlags |= kPredictorSeedFlagHorizontalSpeedCapped;
+        }
 
         ApogeeState predictorState;
         predictorState.altitudeMeters = rawPosZ;
         predictorState.horizontalDistanceMeters = 0.0;
         predictorState.verticalVelocity = rawVelZ;
         predictorState.horizontalVelocity = predictorHorizontalVelocity;
-        predictorState.zenith = seedZenith;
-        predictorState.angularVelocity = predictorAngularRate;
+        predictorState.zenith = predictorClampedZenith;
+        predictorState.angularVelocity = predictorClampedAngularRate;
         predictorState.acsAngleDeg =
             std::clamp(static_cast<double>(data.flapEffectiveDeg),
                        0.0,
                        static_cast<double>(settings::actuation::kServoMaxActuationDeg));
+        predictorState.acsCommandDeg =
+            std::clamp(static_cast<double>(data.flapCommandDeg),
+                       0.0,
+                       static_cast<double>(settings::actuation::kServoMaxActuationDeg));
         // Single integration pass returns both altitude and time-to-apogee
         const PredictResult prediction = apogeePredictor_.PredictApogeeWithTime(predictorState);
+        predictorFlags |= apogeePredictor_.LastPredictionFlags();
+        predictorTimeToApogee = prediction.timeToApogee;
         UpdateAdaptiveDragScale(predictorState,
+                                predictorFlags,
                                 accZ,
                                 dt,
                                 hasFreshAccelMeasurement,
@@ -646,6 +698,11 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
     output.inertialAcceleration[2] = static_cast<float>(inertialAcceleration.z);
     output.zenith = static_cast<float>(zenithRadians_);
     output.apogeeEstimate = static_cast<float>(lastApogeePrediction_);
+    output.predictorTimeToApogeeS = static_cast<float>(std::max(0.0, predictorTimeToApogee));
+    output.predictorSeedHorizontalSpeedMps = static_cast<float>(predictorHorizontalVelocity);
+    output.predictorSeedClampedZenithRad = static_cast<float>(predictorClampedZenith);
+    output.predictorSeedClampedAngularRateRadPerSec = static_cast<float>(predictorClampedAngularRate);
+    output.predictorSeedConfidenceFlags = static_cast<float>(predictorFlags);
     output.padReferenceDriftMps = static_cast<float>(groundReferenceDriftRateMps_);
     output.padReferenceSettled = groundReferenceSettled_ ? 1.0f : 0.0f;
 
@@ -657,6 +714,7 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
 /// Updates the adaptive axial drag correction during coast.
 /// Now supports both legacy single-scale and Mach-dependent adaptation.
 void FlightComputer::UpdateAdaptiveDragScale(const ApogeeState &predictorState,
+                                             uint32_t predictorFlags,
                                              double measuredVerticalAcceleration,
                                              double dtSeconds,
                                              bool hasFreshAccelMeasurement,
@@ -669,8 +727,20 @@ void FlightComputer::UpdateAdaptiveDragScale(const ApogeeState &predictorState,
         !quaternionValid_ ||
         !PredictorSeedHasFreshAccelSample(dtSeconds, hasFreshAccelMeasurement) ||
         !std::isfinite(measuredVerticalAcceleration) ||
-        !std::isfinite(predictorState.zenith)) {
+        !std::isfinite(predictorState.zenith) ||
+        (predictorFlags & kPredictorSeedFlagCoastEntryBlendActive) != 0u ||
+        PredictorFlagsHasModelInvalidity(predictorFlags)) {
         return;
+    }
+
+    if (burnoutTimestamp_ > 0.0) {
+        const double timeSinceBurnout = std::max(0.0, lastTimestamp_ - burnoutTimestamp_);
+        const double minAdaptDelay = std::max(
+            static_cast<double>(settings::actuation::kPostBurnoutHoldoffSeconds),
+            static_cast<double>(settings::flight::kPredictorCoastEntryZenithRampSeconds));
+        if (timeSinceBurnout < minAdaptDelay) {
+            return;
+        }
     }
 
     const double flapTrackingErrorDeg = std::fabs(flapCommandDeg - flapEffectiveDeg);
@@ -683,7 +753,9 @@ void FlightComputer::UpdateAdaptiveDragScale(const ApogeeState &predictorState,
     double axialModelAcceleration = 0.0;
     const double predictedVerticalAcceleration =
         apogeePredictor_.ComputeVerticalAcceleration(predictorState, &axialModelAcceleration);
-    if (!std::isfinite(predictedVerticalAcceleration) || !std::isfinite(axialModelAcceleration)) {
+    const uint32_t modelFlags = apogeePredictor_.LastPredictionFlags();
+    if (!std::isfinite(predictedVerticalAcceleration) || !std::isfinite(axialModelAcceleration) ||
+        PredictorFlagsHasModelInvalidity(modelFlags)) {
         return;
     }
 
@@ -723,7 +795,7 @@ void FlightComputer::UpdateAdaptiveDragScale(const ApogeeState &predictorState,
     const double maxScale =
         static_cast<double>(settings::flight::kAdaptiveAxialDragScaleMax);
     const double targetScale =
-        std::clamp(currentScale + (residual / axialModelAcceleration), minScale, maxScale);
+        std::clamp(currentScale + currentScale * (residual / axialModelAcceleration), minScale, maxScale);
 
     const double tauSeconds =
         static_cast<double>(settings::flight::kAdaptiveAxialDragTauSeconds);
@@ -777,6 +849,7 @@ void FlightComputer::ResetInternalState() {
     previousQuaternion_ = math_utils::MakeQuaternion(1.0f, 0.0f, 0.0f, 0.0f);
     lastApogeePrediction_ = 0.0;
     apogeeAltitude_ = 0.0;
+    maxObservedAltitude_ = 0.0;
     apogeeRecorded_ = false;
     burnTimestamp_ = 0.0;
     burnDetectTimestamp_ = 0.0;

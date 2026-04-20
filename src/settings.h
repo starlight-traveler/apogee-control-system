@@ -5,6 +5,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "imu_orientation.h"
+
 #ifndef DATA_LOGGER_BUFFER_SIZE
 #define DATA_LOGGER_BUFFER_SIZE 4096
 #endif
@@ -376,6 +378,7 @@ constexpr int8_t kResetPin = -1;
 constexpr uint32_t kSampleIntervalUs = 10000;
 // If no complete sample arrives for this long, force a full reinit.
 constexpr uint32_t kDataTimeoutUs = 250000;
+inline constexpr const float (&kMountRotation)[3][3] = imu_orientation::kBnoMountRotation;
 }
 
 namespace wt901 {
@@ -403,11 +406,7 @@ constexpr float kGyroRangeDps = 2000.0f;
 // body +X = sensor +Z
 // body +Y = sensor -X
 // body +Z = sensor +Y
-constexpr float kMountRotation[3][3] = {
-    {0.0f, 0.0f, 1.0f},
-    {-1.0f, 0.0f, 0.0f},
-    {0.0f, 1.0f, 0.0f},
-};
+inline constexpr const float (&kMountRotation)[3][3] = imu_orientation::kWt901MountRotation;
 }
 
 namespace bno085 {
@@ -428,6 +427,7 @@ constexpr uint32_t kStartupSettleDelayMs = 250;
 // Duration of the active-low reset pulse when reset wiring is available.
 constexpr uint32_t kResetPulseDelayMs = 10;
 // Delay after releasing reset before starting SPI traffic.
+inline constexpr const float (&kMountRotation)[3][3] = imu_orientation::kBnoMountRotation;
 constexpr uint32_t kPostResetBootDelayMs = 150;
 // Number of bounded startup retries performed during setup.
 constexpr uint8_t kStartupRetryCount = 4;
@@ -503,11 +503,7 @@ constexpr float kAccelAinv[3][3] = {
     {0.0f, 1.0f, 0.0f},
     {0.0f, 0.0f, 1.0f},
 };
-constexpr float kMountRotation[3][3] = {
-    {1.0f, 0.0f, 0.0f},
-    {0.0f, 1.0f, 0.0f},
-    {0.0f, 0.0f, 1.0f},
-};
+inline constexpr const float (&kMountRotation)[3][3] = imu_orientation::kEllipse20MountRotation;
 constexpr float kMagBias[3] = {0.0f, 0.0f, 0.0f};
 constexpr float kMagAinv[3][3] = {
     {1.0f, 0.0f, 0.0f},
@@ -582,8 +578,8 @@ constexpr bool kUseLibraryMagOffsets = false;
 // body +X = sensor +Z
 // body +Y = sensor -Y
 // body +Z = sensor +X
-constexpr uint8_t kAxisMap[3] = {0, 1, 2};
-constexpr int8_t kAxisSign[3] = {1, 1, 1};
+inline constexpr const uint8_t (&kAxisMap)[3] = imu_orientation::kLsm9ds1AxisMap;
+inline constexpr const int8_t (&kAxisSign)[3] = imu_orientation::kLsm9ds1AxisSign;
 constexpr float kMagDeclinationDeg = -14.84f;
 constexpr float kAccelCorrectionGainGround = 18.0f;
 constexpr float kAccelCorrectionGainDescent = 9.0f;
@@ -634,11 +630,7 @@ constexpr float kAccelAinv[3][3] = {
 // body +X = sensor +Z
 // body +Y = sensor -Y
 // body +Z = sensor +X
-constexpr float kMountRotation[3][3] = {
-  {0.0f, 0.0f, 1.0f},
-  {0.0f, -1.0f, 0.0f},
-  {1.0f, 0.0f, 0.0f},
-};
+inline constexpr const float (&kMountRotation)[3][3] = imu_orientation::kLsm9ds1MountRotation;
 
 constexpr float kMagBias[3] = {-3751.00f, 5702.00f, -6056.00f};
 constexpr float kMagAinv[3][3] = {
@@ -771,17 +763,13 @@ constexpr float kAccelAinv[3][3] = {
 // body +X = sensor +Z
 // body +Y = sensor -Y
 // body +Z = sensor -X
-constexpr float kMountRotation[3][3] = {
-    {0.0f, 0.0f, 1.0f},
-    {0.0f, -1.0f, 0.0f},
-    {-1.0f, 0.0f, 0.0f},
-};
+inline constexpr const float (&kMountRotation)[3][3] = imu_orientation::kIcm20948MountRotation;
 // Keep the ICM magnetometer in the same calibrated sensor frame as the
 // accel/gyro before applying the common mount rotation. The SparkFun reference
 // workflow and the latest cross-check capture both show that the AK09916 mag
 // needs Y and Z reflected to reconcile with the accel/gyro frame.
-constexpr uint8_t kMagAxisMap[3] = {0, 1, 2};
-constexpr int8_t kMagAxisSign[3] = {1, -1, -1};
+inline constexpr const uint8_t (&kMagAxisMap)[3] = imu_orientation::kIcm20948MagAxisMap;
+inline constexpr const int8_t (&kMagAxisSign)[3] = imu_orientation::kIcm20948MagAxisSign;
 // Calibrated magnetometer hard-iron offsets.
 constexpr float kMagBias[3] = {88.50f, -511.50f, 2301.50f};
 constexpr float kMagAinv[3][3] = {

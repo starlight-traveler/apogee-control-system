@@ -37,6 +37,8 @@ enum class FieldId {
     Timestamp,
     AltitudeFeet,
     AltitudeMeters,
+    FlapCommandDeg,
+    FlapEffectiveDeg,
     AccelBnoX,
     AccelBnoY,
     AccelBnoZ,
@@ -85,6 +87,12 @@ const std::vector<FieldInfo> &AllFields() {
         {FieldId::AltitudeMeters,
          "altitude_meters",
          {"altitude_m", "altitude_meters", "alt_m", "sensor_altitude_meters"}},
+        {FieldId::FlapCommandDeg,
+         "flap_command_deg",
+         {"flap_command_deg", "sensor_flap_command_deg", "servo_command_deg"}},
+        {FieldId::FlapEffectiveDeg,
+         "flap_effective_deg",
+         {"flap_effective_deg", "sensor_flap_effective_deg", "servo_effective_deg"}},
         {FieldId::AccelBnoX,
          "accel_bno_x",
          {"accel_bno_x", "bno_ax", "accel_x_bno", "sensor_accel_bno_x"}},
@@ -170,6 +178,12 @@ struct FieldIdHash {
 
 using FieldOverrideMap = std::unordered_map<FieldId, std::string, FieldIdHash>;
 
+enum class SeededFlapSource {
+    Zero,
+    LoggedEffective,
+    LoggedCommand,
+};
+
 struct ProgramOptions {
     std::string csvPath;
     std::string cfdPath = "lib/cfd.csv";
@@ -189,6 +203,7 @@ struct ProgramOptions {
     std::optional<float> dryMassKgOverride;
     float seededZenithScale = 1.0f;
     float seededHorizontalVelocityScale = 1.0f;
+    SeededFlapSource seededFlapSource = SeededFlapSource::Zero;
     std::optional<float> signCheckTimeSeconds;
     float signCheckWindowSeconds = 0.05f;
     FieldOverrideMap fieldOverrides;
@@ -200,6 +215,8 @@ struct FieldIndices {
     std::optional<std::size_t> timestamp;
     std::optional<std::size_t> altitudeFeet;
     std::optional<std::size_t> altitudeMeters;
+    std::optional<std::size_t> flapCommandDeg;
+    std::optional<std::size_t> flapEffectiveDeg;
     std::array<std::optional<std::size_t>, 3> accelBno{};
     std::array<std::optional<std::size_t>, 3> accelIcm{};
     std::array<std::optional<std::size_t>, 3> accelLsm{};
@@ -633,6 +650,32 @@ std::optional<bool> ParseBool(const std::string &value) {
     return std::nullopt;
 }
 
+const char *SeededFlapSourceName(SeededFlapSource source) {
+    switch (source) {
+    case SeededFlapSource::Zero:
+        return "zero";
+    case SeededFlapSource::LoggedEffective:
+        return "logged-effective";
+    case SeededFlapSource::LoggedCommand:
+        return "logged-command";
+    }
+    return "zero";
+}
+
+std::optional<SeededFlapSource> ParseSeededFlapSource(const std::string &value) {
+    const std::string lowered = ToLower(Trim(value));
+    if (lowered == "zero" || lowered == "none" || lowered == "no-flap") {
+        return SeededFlapSource::Zero;
+    }
+    if (lowered == "logged-effective" || lowered == "effective" || lowered == "logged_effective") {
+        return SeededFlapSource::LoggedEffective;
+    }
+    if (lowered == "logged-command" || lowered == "command" || lowered == "logged_command") {
+        return SeededFlapSource::LoggedCommand;
+    }
+    return std::nullopt;
+}
+
 bool LoadValidatedQuaternionArray(const float values[4], math_utils::Quaternion &quat) {
     quat = math_utils::MakeQuaternion(values[0], values[1], values[2], values[3]);
     return math_utils::ValidateQuaternion(quat);
@@ -946,6 +989,8 @@ FieldIndices BuildFieldIndices(const std::vector<std::string> &headers, const Fi
     resolve(FieldId::Timestamp, indices.timestamp);
     resolve(FieldId::AltitudeFeet, indices.altitudeFeet);
     resolve(FieldId::AltitudeMeters, indices.altitudeMeters);
+    resolve(FieldId::FlapCommandDeg, indices.flapCommandDeg);
+    resolve(FieldId::FlapEffectiveDeg, indices.flapEffectiveDeg);
     resolve(FieldId::AccelBnoX, indices.accelBno[0]);
     resolve(FieldId::AccelBnoY, indices.accelBno[1]);
     resolve(FieldId::AccelBnoZ, indices.accelBno[2]);
@@ -1103,6 +1148,9 @@ bool PopulateSensorData(const std::vector<std::string> &row,
         error = "missing altitude";
         return false;
     }
+
+    AssignFloat(row, indices.flapCommandDeg, out.flapCommandDeg);
+    AssignFloat(row, indices.flapEffectiveDeg, out.flapEffectiveDeg);
 
     bool hasIcmAccel = false;
     for (int i = 0; i < 3; ++i) {
@@ -1490,10 +1538,12 @@ ReplayPredictorInputs BuildReplayPredictorInputs(FilteredState &state,
 }
 
 double RecomputeSeededApogeeEstimate(const FilteredState &state,
+                                     const SensorData &sample,
                                      FlightStatus status,
                                      double predictorZenith,
                                      double angularRate,
                                      double horizontalVelocity,
+                                     SeededFlapSource seededFlapSource,
                                      ApogeePredictor &predictor,
                                      double &lastPredictionMeters,
                                      float &lastPredictionTimeSeconds,
@@ -1512,7 +1562,18 @@ double RecomputeSeededApogeeEstimate(const FilteredState &state,
             predictorState.horizontalVelocity = horizontalVelocity;
             predictorState.zenith = predictorZenith;
             predictorState.angularVelocity = angularRate;
-            predictorState.acsAngleDeg = 0.0;
+            double seededFlapDeg = 0.0;
+            if (seededFlapSource == SeededFlapSource::LoggedEffective) {
+                seededFlapDeg = sample.flapEffectiveDeg;
+            } else if (seededFlapSource == SeededFlapSource::LoggedCommand) {
+                seededFlapDeg = sample.flapCommandDeg;
+            }
+            seededFlapDeg =
+                std::clamp(seededFlapDeg,
+                           0.0,
+                           static_cast<double>(settings::actuation::kServoMaxActuationDeg));
+            predictorState.acsAngleDeg = seededFlapDeg;
+            predictorState.acsCommandDeg = seededFlapDeg;
             lastPredictionMeters = predictor.PredictApogee(predictorState);
             lastPredictionTimeSeconds = state.time;
             hasLastPrediction = true;
@@ -1815,6 +1876,7 @@ void PrintUsage(const char *program) {
               << "  --dry-mass-kg <value>      Override replay vehicle dry mass in kilograms.\n"
               << "  --seed-zenith-scale <f>    Scale seeded zenith before replay recomputes apogee (default 1.0).\n"
               << "  --seed-horizontal-scale <f> Scale replay-only seeded horizontal speed (default 1.0).\n"
+              << "  --seeded-flap-source <mode> Seed seeded apogee with zero, logged-effective, or logged-command flap state.\n"
               << "  --sign-check-time <sec>    Evaluate apogee at ACS 0/10/20 deg near this time.\n"
               << "  --sign-check-window <sec>  Match window for sign-check sample (default 0.05).\n"
               << "  --ignore-logged-state      Recompute filtered state instead of smart-seeding from logged state columns.\n"
@@ -1957,6 +2019,19 @@ bool ParseArgs(int argc, char **argv, ProgramOptions &options) {
             options.seededHorizontalVelocityScale = *value;
             continue;
         }
+        if (arg == "--seeded-flap-source") {
+            if (i + 1 >= argc) {
+                std::cerr << "Missing value for --seeded-flap-source" << std::endl;
+                return false;
+            }
+            const auto value = ParseSeededFlapSource(argv[++i]);
+            if (!value.has_value()) {
+                std::cerr << "Invalid value for --seeded-flap-source: " << argv[i] << std::endl;
+                return false;
+            }
+            options.seededFlapSource = *value;
+            continue;
+        }
         if (arg == "--include-raw-altimeter") {
             if (!AppendSampleValueId(SampleValueId::AltimeterRawMeters, false, options.extraOutputFields)) {
                 return false;
@@ -2027,6 +2102,16 @@ bool ParseArgs(int argc, char **argv, ProgramOptions &options) {
                 return false;
             }
             options.seededHorizontalVelocityScale = *value;
+            continue;
+        }
+        if (arg.rfind("--seeded-flap-source=", 0) == 0) {
+            const std::string valueText = arg.substr(21);
+            const auto value = ParseSeededFlapSource(valueText);
+            if (!value.has_value()) {
+                std::cerr << "Invalid value for --seeded-flap-source: " << valueText << std::endl;
+                return false;
+            }
+            options.seededFlapSource = *value;
             continue;
         }
         if (arg == "--graph") {
@@ -2222,6 +2307,8 @@ void PrintFieldMappingSummary(const FieldIndices &indices, const std::vector<std
     printEntry("has_icm_quaternion", indices.hasIcmQuaternionFlag);
     printEntry("has_lsm_quaternion", indices.hasLsmQuaternionFlag);
     printEntry("main_quaternion_source", indices.mainQuaternionSource);
+    printEntry("flap_command_deg", indices.flapCommandDeg);
+    printEntry("flap_effective_deg", indices.flapEffectiveDeg);
 }
 
 }  // namespace
@@ -2236,6 +2323,8 @@ int main(int argc, char **argv) {
         PrintUsage(argv[0]);
         return 0;
     }
+
+    std::cerr << "Seeded flap source: " << SeededFlapSourceName(options.seededFlapSource) << std::endl;
 
     std::ifstream input(options.csvPath);
     if (!input.is_open()) {
@@ -2414,10 +2503,12 @@ int main(int argc, char **argv) {
                                            replayPredictorSeedState);
             state.apogeeEstimate =
                 static_cast<float>(RecomputeSeededApogeeEstimate(state,
+                                                                 sample,
                                                                  emittedStatus,
                                                                  predictorInputs.zenith,
                                                                  predictorInputs.angularRate,
                                                                  predictorInputs.horizontalVelocity,
+                                                                 options.seededFlapSource,
                                                                  seededReplayPredictor,
                                                                  lastSeededReplayPredictionMeters,
                                                                  lastSeededReplayPredictionTimeSeconds,

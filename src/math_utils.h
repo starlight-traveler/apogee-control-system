@@ -1,6 +1,7 @@
 #pragma once
 
-#include <math.h>
+#include <cmath>
+#include <cstdint>
 
 #if __has_include(<arm_math.h>)
 #ifndef ARM_MATH_CM7
@@ -44,12 +45,13 @@ struct Quaterniond {
 inline Vec3 MakeVec3(float x, float y, float z) { return Vec3{x, y, z}; }
 inline Vec3d MakeVec3d(double x, double y, double z) { return Vec3d{x, y, z}; }
 
-inline void FastSinCos(float angle, float &sineOut, float &cosineOut) {
+inline void FastSinCos(float angleRadians, float &sineOut, float &cosineOut) {
 #if MATHUTILS_HAVE_ARM_MATH
-    arm_sin_cos_f32(angle, &sineOut, &cosineOut);
+    constexpr float kRadToDeg = 57.295779513082320876f;
+    arm_sin_cos_f32(angleRadians * kRadToDeg, &sineOut, &cosineOut);
 #else
-    sineOut = sinf(angle);
-    cosineOut = cosf(angle);
+    sineOut = sinf(angleRadians);
+    cosineOut = cosf(angleRadians);
 #endif
 }
 
@@ -221,13 +223,8 @@ inline void QuaternionToEuler(const Quaternion &q, float &yaw, float &pitch, flo
 
     roll = FastAtan2(r32, r33);
 
-    const float denom = 1.0f - r31 * r31;
-    const float root = (denom >= 0.0f) ? FastSqrt(denom) : sqrtf(denom);
-    if (root != 0.0f) {
-        pitch = -atanf(r31 / root);
-    } else {
-        pitch = (r31 >= 0.0f ? -1.0f : 1.0f) * (3.14159265358979323846f * 0.5f);
-    }
+    const float r31Clamped = Clamp(r31, -1.0f, 1.0f);
+    pitch = -asinf(r31Clamped);
 
     yaw = FastAtan2(r21, r11);
 }
@@ -247,13 +244,8 @@ inline void QuaternionToEuler(const Quaterniond &q, double &yaw, double &pitch, 
 
     roll = FastAtan2(r32, r33);
 
-    const double denom = 1.0 - r31 * r31;
-    const double root = (denom >= 0.0) ? FastSqrt(denom) : sqrt(denom);
-    if (root != 0.0) {
-        pitch = -atan(r31 / root);
-    } else {
-        pitch = (r31 >= 0.0 ? -1.0 : 1.0) * (3.14159265358979323846 * 0.5);
-    }
+    const double r31Clamped = Clamp(r31, -1.0, 1.0);
+    pitch = -asin(r31Clamped);
 
     yaw = FastAtan2(r21, r11);
 }
@@ -269,7 +261,8 @@ inline float EulerToZenith(float pitch, float roll) {
     (void)sinRoll;
     // Folded zenith: use |cosZenith| to get tilt from vertical (0-90°)
     // regardless of sensor mounting convention (whether +Z points to nose or tail)
-    return acosf(fabsf(cosPitch * cosRoll));
+    const float value = Clamp(cosPitch * cosRoll, -1.0f, 1.0f);
+    return acosf(fabsf(value));
 }
 
 inline double EulerToZenith(double pitch, double roll) {
@@ -401,11 +394,23 @@ inline bool ValidateQuaternion(Quaterniond &q) {
     return true;
 }
 
-/// Validates a quaternion stored as float array [w, x, y, z].
-/// Returns true if valid, false if corrupted (and resets to identity).
-inline bool ValidateQuaternionArray(float* q) {
+/// Returns true when the quaternion array is finite and close to unit length.
+inline bool IsQuaternionArrayValid(const float *q) {
+    if (q == nullptr) {
+        return false;
+    }
     const float normSq = q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3];
-    if (!std::isfinite(normSq) || normSq < 0.5f || normSq > 2.0f) {
+    return std::isfinite(normSq) && normSq >= 0.5f && normSq <= 2.0f;
+}
+
+/// Validates and, when possible, renormalizes a quaternion array in-place.
+/// Returns true if valid, false if corrupted (and resets to identity).
+inline bool SanitizeQuaternionArray(float *q) {
+    if (q == nullptr) {
+        return false;
+    }
+    const float normSq = q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3];
+    if (!IsQuaternionArrayValid(q)) {
         q[0] = 1.0f;
         q[1] = 0.0f;
         q[2] = 0.0f;
@@ -420,6 +425,11 @@ inline bool ValidateQuaternionArray(float* q) {
         q[3] *= inv;
     }
     return true;
+}
+
+/// Backward-compatible alias for callers that expect in-place repair behavior.
+inline bool ValidateQuaternionArray(float *q) {
+    return SanitizeQuaternionArray(q);
 }
 
 // ---------------------------------------------------------------------------
@@ -484,7 +494,7 @@ inline Quaternion Slerp(const Quaternion &a, const Quaternion &b, float t) {
     result.x = ratioA * a.x + ratioB * bAdjusted.x;
     result.y = ratioA * a.y + ratioB * bAdjusted.y;
     result.z = ratioA * a.z + ratioB * bAdjusted.z;
-    return result;
+    return Normalize(result);
 }
 
 inline Quaterniond Slerp(const Quaterniond &a, const Quaterniond &b, double t) {
@@ -529,7 +539,7 @@ inline Quaterniond Slerp(const Quaterniond &a, const Quaterniond &b, double t) {
     result.x = ratioA * a.x + ratioB * bAdjusted.x;
     result.y = ratioA * a.y + ratioB * bAdjusted.y;
     result.z = ratioA * a.z + ratioB * bAdjusted.z;
-    return result;
+    return Normalize(result);
 }
 
 // ---------------------------------------------------------------------------

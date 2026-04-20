@@ -2,16 +2,20 @@
 
 #include <math.h>
 
+#include "imu_orientation.h"
+
 namespace bno085_orientation {
 
-// Sensor-to-body basis change for the current BNO mounting:
-// body +X = sensor +Z
-// body +Y = sensor -Y
-// body +Z = sensor -X
 inline void TransformBasisVector(float x, float y, float z, float &outX, float &outY, float &outZ) {
-    outX = z;
-    outY = -y;
-    outZ = -x;
+    outX = imu_orientation::kBnoMountRotation[0][0] * x +
+           imu_orientation::kBnoMountRotation[0][1] * y +
+           imu_orientation::kBnoMountRotation[0][2] * z;
+    outY = imu_orientation::kBnoMountRotation[1][0] * x +
+           imu_orientation::kBnoMountRotation[1][1] * y +
+           imu_orientation::kBnoMountRotation[1][2] * z;
+    outZ = imu_orientation::kBnoMountRotation[2][0] * x +
+           imu_orientation::kBnoMountRotation[2][1] * y +
+           imu_orientation::kBnoMountRotation[2][2] * z;
 }
 
 inline void TransformVector(float x, float y, float z, float &outX, float &outY, float &outZ) {

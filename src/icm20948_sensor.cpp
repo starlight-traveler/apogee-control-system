@@ -23,6 +23,8 @@ constexpr uint8_t kQuaternionInvalidDropThreshold = 2;
 constexpr uint8_t kDmpFastSampleRateDivider = 4;  // 225 Hz fast-DMP mode from SparkFun Example10.
 constexpr float kDmpQuaternionScale = 1073741824.0f;  // 2^30
 constexpr uint8_t kDmpMaxDrainFrames = 8;
+constexpr uint8_t kMaxConsecutiveReadFailures = 3;
+constexpr uint8_t kMaxConsecutiveDmpFailures = 2;
 
 ICM_20948_SPI g_icm;
 volatile bool g_dataReadyInterrupt = false;
@@ -78,6 +80,8 @@ bool g_lastAcquireUsedInterrupt = false;
 bool g_interruptConfigured = false;
 bool g_dmpQuaternionActive = false;
 float g_crossCheckTrust = 1.0f;
+uint8_t g_consecutiveReadFailures = 0;
+uint8_t g_consecutiveDmpFailures = 0;
 
 // Outlier detection state
 bool g_hasPreviousGyro = false;
@@ -1106,9 +1110,10 @@ void AdaptiveQuaternionUpdate(const float accelNorm[3],
         const float qy = g_q[2];
         const float qz = g_q[3];
 
-        // Compute predicted up vector in body frame directly from quaternion.
-        const float ux = 2.0f * (qx * qz - qw * qy);
-        const float uy = 2.0f * (qw * qx + qy * qz);
+        // Keep this convention aligned with QuaternionFromEarthBasisInBody()
+        // and GravityVectorFromQuaternion().
+        const float ux = 2.0f * (qx * qz + qw * qy);
+        const float uy = 2.0f * (qy * qz - qw * qx);
         const float uz = qw * qw - qx * qx - qy * qy + qz * qz;
 
         // Compute predicted east direction in body frame from accel × mag.
@@ -1121,10 +1126,10 @@ void AdaptiveQuaternionUpdate(const float accelNorm[3],
             hx = hy = hz = 0.0f;
         }
 
-        // Expected east from quaternion.
-        const float wx = 2.0f * (qx * qy + qw * qz);
+        // Expected east from the same body-from-earth rotation matrix.
+        const float wx = 2.0f * (qx * qy - qw * qz);
         const float wy = qw * qw - qx * qx + qy * qy - qz * qz;
-        const float wz = 2.0f * (qy * qz - qw * qx);
+        const float wz = 2.0f * (qy * qz + qw * qx);
 
         // Compute errors using cross products.
         float accelError[3] = {
@@ -1501,6 +1506,87 @@ bool ConfigureInterrupt() {
     return true;
 }
 
+void ResetAcquireFailureCounters() {
+    g_consecutiveReadFailures = 0;
+    g_consecutiveDmpFailures = 0;
+}
+
+bool ResetDmpFifoState() {
+    bool success = true;
+    if (g_icm.resetFIFO() != ICM_20948_Stat_Ok) {
+        success = false;
+    }
+    if (g_dmpQuaternionActive && g_icm.resetDMP() != ICM_20948_Stat_Ok) {
+        success = false;
+    }
+    return success;
+}
+
+bool ReconfigureSensorTransport() {
+    g_dataReadyInterrupt = false;
+    g_interruptConfigured = false;
+    g_dmpQuaternionActive = false;
+    SPI1.begin();
+    g_icm.begin(kChipSelectPin, SPI1);
+    if (g_icm.status != ICM_20948_Stat_Ok) {
+        LOG_PRINTLN("ICM-20948: reinitialize begin failed");
+        return false;
+    }
+    ConfigureSensorScales();
+    if (!ConfigureSampleMode()) {
+        return false;
+    }
+    if (!ConfigureFullScale()) {
+        return false;
+    }
+    if (!ConfigureLowPassFilter()) {
+        return false;
+    }
+    if (!ConfigureSampleRate()) {
+        return false;
+    }
+    if (!ConfigureDmpQuaternion()) {
+        g_dmpQuaternionActive = false;
+    }
+    if (!ConfigureInterrupt()) {
+        LOG_PRINTLN("ICM-20948: interrupt setup failed; continuing in polling mode");
+    }
+    g_lastSampleUs = 0;
+    return true;
+}
+
+bool HandleAcquireFailure(SensorData &out, uint32_t nowUs, const char *reason, bool dmpFailure) {
+    if (g_consecutiveReadFailures < 0xff) {
+        ++g_consecutiveReadFailures;
+    }
+    if (dmpFailure && g_consecutiveDmpFailures < 0xff) {
+        ++g_consecutiveDmpFailures;
+    }
+
+    if (dmpFailure &&
+        g_dmpQuaternionActive &&
+        g_consecutiveDmpFailures >= kMaxConsecutiveDmpFailures) {
+        if (ResetDmpFifoState()) {
+            LOG_PRINT("ICM-20948: reset FIFO after ");
+            LOG_PRINTLN(reason);
+            g_consecutiveDmpFailures = 0;
+        } else {
+            LOG_PRINT("ICM-20948: FIFO reset failed after ");
+            LOG_PRINTLN(reason);
+        }
+    }
+
+    if (g_consecutiveReadFailures >= kMaxConsecutiveReadFailures) {
+        LOG_PRINT("ICM-20948: reinitializing after ");
+        LOG_PRINTLN(reason);
+        if (ReconfigureSensorTransport()) {
+            ResetAcquireFailureCounters();
+        }
+    }
+
+    return PopulateFromCache(out, nowUs);
+}
+
 }  // namespace
 
 #if defined(ICM_20948_USE_DMP)
@@ -1779,32 +1865,8 @@ bool Icm20948SensorBegin() {
         return true;
     }
 
-    g_dataReadyInterrupt = false;
-    g_interruptConfigured = false;
-    g_dmpQuaternionActive = false;
-    SPI1.begin();
-    g_icm.begin(kChipSelectPin, SPI1);
-    if (g_icm.status != ICM_20948_Stat_Ok) {
+    if (!ReconfigureSensorTransport()) {
         return false;
-    }
-    ConfigureSensorScales();
-    if (!ConfigureSampleMode()) {
-        return false;
-    }
-    if (!ConfigureFullScale()) {
-        return false;
-    }
-    if (!ConfigureLowPassFilter()) {
-        return false;
-    }
-    if (!ConfigureSampleRate()) {
-        return false;
-    }
-    if (!ConfigureDmpQuaternion()) {
-        g_dmpQuaternionActive = false;
-    }
-    if (!ConfigureInterrupt()) {
-        LOG_PRINTLN("ICM-20948: interrupt setup failed; continuing in polling mode");
     }
 
     g_lastSampleUs = 0;
@@ -1873,6 +1935,7 @@ bool Icm20948SensorBegin() {
     g_lastAcquireUsedCache = false;
     g_lastAcquireUsedInterrupt = false;
     g_crossCheckTrust = 1.0f;
+    ResetAcquireFailureCounters();
     g_initialized = true;
     return true;
 }
@@ -1969,10 +2032,13 @@ bool Icm20948SensorAcquire(SensorData &out) {
     float dmpQuaternion[4] = {1.0f, 0.0f, 0.0f, 0.0f};
     if (g_dmpQuaternionActive) {
         if (!TryReadDmpQuaternion(dmpQuaternion)) {
-            return PopulateFromCache(out, nowUs);
+            return HandleAcquireFailure(out, nowUs, "DMP FIFO read failure", true);
         }
         g_lastSampleUs = nowUs;
         g_icm.getAGMT();
+        if (g_icm.status != ICM_20948_Stat_Ok) {
+            return HandleAcquireFailure(out, nowUs, "AGMT read failure (DMP)", true);
+        }
         g_lastAcquireFresh = true;
         g_lastAcquireUsedInterrupt = interruptTriggered;
     } else {
@@ -1992,9 +2058,13 @@ bool Icm20948SensorAcquire(SensorData &out) {
 
         g_lastSampleUs = nowUs;
         g_icm.getAGMT();
+        if (g_icm.status != ICM_20948_Stat_Ok) {
+            return HandleAcquireFailure(out, nowUs, "AGMT read failure", false);
+        }
         g_lastAcquireFresh = true;
         g_lastAcquireUsedInterrupt = interruptTriggered;
     }
+    ResetAcquireFailureCounters();
 
     if (out.timestamp == 0.0f) {
         out.timestamp = static_cast<float>(nowUs) * 1.0e-6f;
@@ -2109,19 +2179,18 @@ bool Icm20948SensorAcquire(SensorData &out) {
         ApplyQuaternionContinuity();
     } else {
         UpdateBootstrapYprDiagnostics(accelCalNorm, magCalNorm);
-        UpdateMagMagnitudeReference(magMagnitude, startupMagTrust);
-        UpdateGroundAlignment(accelCalNorm, startupAccelTrust, magCalNorm, startupMagTrust, gyroNorm);
+        UpdateMagMagnitudeReference(magMagnitude, magTrust);
+        UpdateGroundAlignment(accelCalNorm, accelTrust, magCalNorm, magTrust, gyroNorm);
 
         if (g_groundAlignmentReady && !gyroSaturated) {
             // Re-enable pad-time magnetic correction now that the direct body-frame
             // mag diagnostics show the ICM field vector points in the same general
             // direction as the trusted LSM rail.
-            const float correctionMagTrust = startupMagTrust;
-            AdaptiveQuaternionUpdate(accelCalNorm, startupAccelTrust, gyroCal, magCalNorm, correctionMagTrust, dt);
-            UpdateEarthMagReference(magCalNorm, startupAccelTrust, correctionMagTrust);
-            CaptureRailReferenceQuaternion(startupAccelTrust, correctionMagTrust);
+            AdaptiveQuaternionUpdate(accelCalNorm, accelTrust, gyroCal, magCalNorm, magTrust, dt);
+            UpdateEarthMagReference(magCalNorm, accelTrust, magTrust);
+            CaptureRailReferenceQuaternion(accelTrust, magTrust);
         }
-        LearnGyroBias(gyroCal, startupAccelTrust, gyroNorm, dt);
+        LearnGyroBias(gyroCal, accelTrust, gyroNorm, dt);
     }
     const bool quaternionValidNow = math_utils::ValidateQuaternionArray(g_q);
     if (quaternionValidNow) {
@@ -2162,8 +2231,8 @@ bool Icm20948SensorAcquire(SensorData &out) {
     out.icmRailConstrained = g_railConstraintActive;
     g_lastTemperatureC = temperatureC;
     g_lastAhrsDt = dt;
-    g_lastAccelTrust = startupAccelTrust;
-    g_lastMagTrust = startupMagTrust;
+    g_lastAccelTrust = accelTrust;
+    g_lastMagTrust = magTrust;
     g_lastAccelSaturated = accelSaturated;
     g_lastGyroSaturated = gyroSaturated;
     g_lastRailConstrained = g_railConstraintActive;

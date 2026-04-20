@@ -24,7 +24,23 @@ enum PredictorSeedConfidenceFlag : uint32_t {
     kPredictorSeedFlagHorizontalSpeedCapped = 1u << 3,
     kPredictorSeedFlagZenithClamped = 1u << 4,
     kPredictorSeedFlagAngularRateClamped = 1u << 5,
+    kPredictorSeedFlagCoastEntryBlendActive = 1u << 6,
+    kPredictorSeedFlagCfdAcsClamped = 1u << 7,
+    kPredictorSeedFlagCfdAtkClamped = 1u << 8,
+    kPredictorSeedFlagCfdMachClamped = 1u << 9,
+    kPredictorSeedFlagPredictionStepLimit = 1u << 10,
+    kPredictorSeedFlagPredictionUncertain = 1u << 11,
 };
+
+inline bool PredictorFlagsHasCfdClamp(uint32_t flags) {
+    return (flags & (kPredictorSeedFlagCfdAcsClamped |
+                     kPredictorSeedFlagCfdAtkClamped |
+                     kPredictorSeedFlagCfdMachClamped)) != 0u;
+}
+
+inline bool PredictorFlagsHasModelInvalidity(uint32_t flags) {
+    return PredictorFlagsHasCfdClamp(flags) || (flags & kPredictorSeedFlagPredictionStepLimit) != 0u;
+}
 
 /// Clears the horizontal predictor seed state.
 inline void ResetPredictorHorizontalVelocityTracker(PredictorHorizontalVelocityTracker &tracker) {
@@ -125,36 +141,18 @@ inline double PredictorHorizontalSpeedCap(double verticalVelocityMps, double zen
                       static_cast<double>(settings::flight::kPredictorMaxHorizontalSpeedMps));
 }
 
-/// Estimates horizontal speed directly from the measured tilt/vertical velocity.
+/// Resolves the bounded predictor-only horizontal speed estimate.
 ///
-/// This gives the predictor an immediate lower bound on cross-axis motion
-/// instead of waiting for the bounded XY acceleration integrator to ramp up.
-inline double PredictorGeometricHorizontalSpeed(double verticalVelocityMps, double zenithRadians) {
-    if (!std::isfinite(verticalVelocityMps) || !std::isfinite(zenithRadians)) {
-        return 0.0;
-    }
-
-    const double verticalSpeed = std::fabs(verticalVelocityMps);
-    if (verticalSpeed <= 0.0) {
-        return 0.0;
-    }
-
-    float sinZenith = 0.0f;
-    float cosZenith = 1.0f;
-    math_utils::FastSinCos(static_cast<float>(zenithRadians), sinZenith, cosZenith);
-    const double clampedCosZenith = std::clamp(std::fabs(static_cast<double>(cosZenith)), 0.1, 1.0);
-    const double speedAlongAxis = verticalSpeed / clampedCosZenith;
-    const double horizontalSpeedSquared = speedAlongAxis * speedAlongAxis - verticalSpeed * verticalSpeed;
-    return (horizontalSpeedSquared > 0.0) ? math_utils::FastSqrt(horizontalSpeedSquared) : 0.0;
-}
-
-/// Merges the tracked XY-speed estimate with a capped tilt-derived lower bound.
+/// The tracker is intentionally conservative: do not force a geometric lower
+/// bound from body tilt because that can erase real angle-of-attack whenever
+/// attitude and velocity direction diverge.
 inline double ResolvePredictorHorizontalSpeed(double trackedHorizontalSpeedMps,
                                               double verticalVelocityMps,
                                               double zenithRadians) {
+    (void)verticalVelocityMps;
+    (void)zenithRadians;
     const double cap = PredictorHorizontalSpeedCap(verticalVelocityMps, zenithRadians);
-    const double geometricSpeed = PredictorGeometricHorizontalSpeed(verticalVelocityMps, zenithRadians);
-    return std::clamp(std::max(trackedHorizontalSpeedMps, geometricSpeed), 0.0, cap);
+    return std::clamp(trackedHorizontalSpeedMps, 0.0, cap);
 }
 
 /// Updates the bounded predictor-only horizontal speed estimate.

@@ -82,6 +82,11 @@ struct FilteredState {
     float inertialAcceleration[3] = {0.0f, 0.0f, 0.0f};
     float zenith = 0.0f;
     float apogeeEstimate = 0.0f;
+    float predictorTimeToApogeeS = 0.0f;
+    float predictorSeedHorizontalSpeedMps = 0.0f;
+    float predictorSeedClampedZenithRad = 0.0f;
+    float predictorSeedClampedAngularRateRadPerSec = 0.0f;
+    float predictorSeedConfidenceFlags = 0.0f;
     float padReferenceDriftMps = 0.0f;
     float padReferenceSettled = 0.0f;
 };
@@ -109,7 +114,8 @@ class FlightComputer {
     /// Reapplies runtime-editable predictor dependencies without resetting the estimator.
     void ReconfigurePredictor(const EnvironmentModel::Config &environmentConfig,
                               const ApogeeVehicleParameters &vehicleParameters,
-                              const ApogeeForceTable *forceTable = nullptr);
+                              const ApogeeForceTable *forceTable = nullptr,
+                              bool preserveAdaptiveState = false);
 
     /// Resets pad-referenced altitude/velocity latches while staying in Ground.
     void ResetGroundReference();
@@ -139,6 +145,8 @@ class FlightComputer {
     double ApogeeTime() const { return apogeeTimestamp_; }
     /// Returns the current adaptive axial drag scale used by the predictor.
     double AdaptiveAxialDragScale() const { return apogeePredictor_.AxialDragScale(); }
+    /// Returns the current Mach-binned adaptive drag state used by the predictor.
+    const MachDependentDragScale &AdaptiveMachDragScale() const { return apogeePredictor_.MachDragScale(); }
 
   private:
     /// Resets filter state, phase counters, and predictor-side caches.
@@ -154,6 +162,7 @@ class FlightComputer {
     bool ArrayToQuaternion(const float values[4], math_utils::Quaternion &out) const;
     /// Updates the predictor's adaptive axial drag scale from measured/model accel mismatch.
     void UpdateAdaptiveDragScale(const ApogeeState &predictorState,
+                                 uint32_t predictorFlags,
                                  double measuredVerticalAcceleration,
                                  double dtSeconds,
                                  bool hasFreshAccelMeasurement,
@@ -183,6 +192,7 @@ class FlightComputer {
 
     double lastApogeePrediction_ = 0.0;
     double apogeeAltitude_ = 0.0;
+    double maxObservedAltitude_ = 0.0;
     bool apogeeRecorded_ = false;
     double burnTimestamp_ = 0.0;
     double burnDetectTimestamp_ = 0.0;

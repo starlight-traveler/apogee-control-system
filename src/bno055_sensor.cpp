@@ -80,17 +80,19 @@ bool RecoverSensor(const char *reason) {
 }
 
 void PopulateOutput(SensorData &out, uint32_t nowUs) {
-    const bool quaternionValid = g_haveQuat && math_utils::ValidateQuaternionArray(g_lastQuat);
+    float sanitizedQuat[4] = {g_lastQuat[0], g_lastQuat[1], g_lastQuat[2], g_lastQuat[3]};
+    const bool quaternionValid =
+        g_haveQuat && math_utils::SanitizeQuaternionArray(sanitizedQuat);
     out.accelBNO[0] = g_haveAccel ? g_lastAccel[0] : 0.0f;
     out.accelBNO[1] = g_haveAccel ? g_lastAccel[1] : 0.0f;
     out.accelBNO[2] = g_haveAccel ? g_lastAccel[2] : 0.0f;
     out.gyroBNO[0] = g_haveGyro ? g_lastGyro[0] : 0.0f;
     out.gyroBNO[1] = g_haveGyro ? g_lastGyro[1] : 0.0f;
     out.gyroBNO[2] = g_haveGyro ? g_lastGyro[2] : 0.0f;
-    out.quaternionBNO[0] = quaternionValid ? g_lastQuat[0] : 1.0f;
-    out.quaternionBNO[1] = quaternionValid ? g_lastQuat[1] : 0.0f;
-    out.quaternionBNO[2] = quaternionValid ? g_lastQuat[2] : 0.0f;
-    out.quaternionBNO[3] = quaternionValid ? g_lastQuat[3] : 0.0f;
+    out.quaternionBNO[0] = quaternionValid ? sanitizedQuat[0] : 1.0f;
+    out.quaternionBNO[1] = quaternionValid ? sanitizedQuat[1] : 0.0f;
+    out.quaternionBNO[2] = quaternionValid ? sanitizedQuat[2] : 0.0f;
+    out.quaternionBNO[3] = quaternionValid ? sanitizedQuat[3] : 0.0f;
     out.hasBnoQuaternion = quaternionValid;
 }
 
@@ -140,7 +142,7 @@ bool Bno055SensorAcquire(SensorData &out) {
                                         g_lastGyro[0], g_lastGyro[1], g_lastGyro[2]);
     float adjustedQuat[4] = {1.0f, 0.0f, 0.0f, 0.0f};
     bno085_orientation::AdjustQuaternion(quat.w(), quat.x(), quat.y(), quat.z(), adjustedQuat);
-    if (math_utils::ValidateQuaternionArray(adjustedQuat)) {
+    if (math_utils::SanitizeQuaternionArray(adjustedQuat)) {
         for (int i = 0; i < 4; ++i) {
             g_lastQuat[i] = adjustedQuat[i];
         }
@@ -170,10 +172,12 @@ bool Bno055SensorIsInitialized() {
 BnoDiagnostics Bno055SensorGetDiagnostics() {
     BnoDiagnostics diagnostics;
     const uint32_t nowUs = micros();
+    float sanitizedQuat[4] = {g_lastQuat[0], g_lastQuat[1], g_lastQuat[2], g_lastQuat[3]};
     diagnostics.transportReady = g_initialized;
     diagnostics.hasAccel = g_haveAccel && g_lastHealthyEventUs != 0 && (nowUs - g_lastHealthyEventUs) <= kDataTimeoutUs;
     diagnostics.hasGyro = diagnostics.hasAccel && g_haveGyro;
-    diagnostics.hasQuaternion = diagnostics.hasAccel && g_haveQuat && math_utils::ValidateQuaternionArray(g_lastQuat);
+    diagnostics.hasQuaternion =
+        diagnostics.hasAccel && g_haveQuat && math_utils::SanitizeQuaternionArray(sanitizedQuat);
     diagnostics.lastAcquireFresh = g_lastAcquireFresh;
     diagnostics.accelBodyMps2[0] = g_lastAccel[0];
     diagnostics.accelBodyMps2[1] = g_lastAccel[1];
@@ -183,7 +187,7 @@ BnoDiagnostics Bno055SensorGetDiagnostics() {
         float pitch = 0.0f;
         float roll = 0.0f;
         const math_utils::Quaternion quat =
-            math_utils::MakeQuaternion(g_lastQuat[0], g_lastQuat[1], g_lastQuat[2], g_lastQuat[3]);
+            math_utils::MakeQuaternion(sanitizedQuat[0], sanitizedQuat[1], sanitizedQuat[2], sanitizedQuat[3]);
         math_utils::QuaternionToEuler(quat, yaw, pitch, roll);
         diagnostics.yprDeg[0] = yaw * 57.295779513082320876f;
         diagnostics.yprDeg[1] = pitch * 57.295779513082320876f;
@@ -196,9 +200,10 @@ BnoSample Bno055SensorGetSample() {
     BnoSample sample;
     const uint32_t nowUs = micros();
     const bool fresh = g_lastHealthyEventUs != 0 && (nowUs - g_lastHealthyEventUs) <= kDataTimeoutUs;
+    float sanitizedQuat[4] = {g_lastQuat[0], g_lastQuat[1], g_lastQuat[2], g_lastQuat[3]};
     sample.hasAccel = fresh && g_haveAccel;
     sample.hasGyro = fresh && g_haveGyro;
-    sample.hasQuaternion = fresh && g_haveQuat && math_utils::ValidateQuaternionArray(g_lastQuat);
+    sample.hasQuaternion = fresh && g_haveQuat && math_utils::SanitizeQuaternionArray(sanitizedQuat);
     sample.accelMicros = sample.hasAccel ? g_lastHealthyEventUs : 0;
     sample.gyroMicros = sample.hasGyro ? g_lastHealthyEventUs : 0;
     sample.quaternionMicros = sample.hasQuaternion ? g_lastHealthyEventUs : 0;
@@ -215,7 +220,7 @@ BnoSample Bno055SensorGetSample() {
     }
     if (sample.hasQuaternion) {
         for (int i = 0; i < 4; ++i) {
-            sample.quaternion[i] = g_lastQuat[i];
+            sample.quaternion[i] = sanitizedQuat[i];
         }
     }
     return sample;
