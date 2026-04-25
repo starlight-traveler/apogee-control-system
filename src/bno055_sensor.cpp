@@ -13,6 +13,15 @@
 
 namespace {
 
+/*
+ * BNO055 path:
+ *
+ * This chip provides fused attitude internally, but it has known high-accel
+ * limits. The firmware treats it as an absolute-orientation/reference rail, not
+ * as the only truth source during boost. Freshness and validity flags tell the
+ * selector whether the cached fused attitude is usable this loop.
+ */
+
 constexpr uint32_t kSampleIntervalUs = settings::sensors::bno055::kSampleIntervalUs;
 constexpr uint8_t kBnoI2cAddress = settings::sensors::bno055::kI2cAddress;
 constexpr uint32_t kBnoI2cClockHz = settings::sensors::bno055::kI2cClockHz;
@@ -21,6 +30,8 @@ constexpr uint32_t kDataTimeoutUs = settings::sensors::bno055::kDataTimeoutUs;
 constexpr uint8_t kQuaternionInvalidDropThreshold = 2;
 
 Adafruit_BNO055 g_bno(55, kBnoI2cAddress, &Wire);
+// Cached BNO055 state is reused for diagnostics, but `lastAcquireFresh` tells
+// the estimator whether this loop actually read new hardware data.
 bool g_initialized = false;
 uint32_t g_lastSampleUs = 0;
 uint32_t g_lastHealthyEventUs = 0;
@@ -51,6 +62,8 @@ bool StartSensorTransport() {
     }
     Wire.begin();
     Wire.setClock(kBnoI2cClockHz);
+    // The Adafruit driver owns the actual chip init; this layer handles timing,
+    // mount-frame conversion, and recovery.
     if (!g_bno.begin()) {
         return false;
     }
@@ -64,6 +77,8 @@ bool StartSensorTransport() {
 }
 
 bool RecoverSensor(const char *reason) {
+    // Drop cached validity before trying to restart so stale quaternions are not
+    // published after a timeout.
     g_initialized = false;
     ResetCachedState();
 
@@ -85,6 +100,8 @@ void PopulateOutput(SensorData &out, uint32_t nowUs) {
     float sanitizedQuat[4] = {g_lastQuat[0], g_lastQuat[1], g_lastQuat[2], g_lastQuat[3]};
     const bool quaternionValid =
         g_haveQuat && math_utils::SanitizeQuaternionArray(sanitizedQuat);
+    // Publish zeros for unavailable accel/gyro but publish identity only when
+    // the quaternion is invalid, with hasBnoQuaternion marking the difference.
     out.accelBNO[0] = g_haveAccel ? g_lastAccel[0] : 0.0f;
     out.accelBNO[1] = g_haveAccel ? g_lastAccel[1] : 0.0f;
     out.accelBNO[2] = g_haveAccel ? g_lastAccel[2] : 0.0f;
@@ -115,6 +132,7 @@ bool Bno055SensorAcquire(SensorData &out) {
     const uint32_t nowUs = micros();
     g_lastAcquireFresh = false;
     if (g_lastHealthyEventUs != 0 && (nowUs - g_lastHealthyEventUs) > kDataTimeoutUs) {
+        // A long data gap probably means the I2C device wedged; restart it.
         return RecoverSensor("data timeout");
     }
     if (g_lastSampleUs != 0 && (nowUs - g_lastSampleUs) < kSampleIntervalUs) {
@@ -131,6 +149,7 @@ bool Bno055SensorAcquire(SensorData &out) {
     imu::Quaternion quat = g_bno.getQuat();
 
     if (quat.w() == 0.0f && quat.x() == 0.0f && quat.y() == 0.0f && quat.z() == 0.0f) {
+        // All-zero quaternion is a sensor/library failure mode, not a real attitude.
         if (!g_haveQuat) {
             return false;
         }
@@ -145,6 +164,7 @@ bool Bno055SensorAcquire(SensorData &out) {
     float adjustedQuat[4] = {1.0f, 0.0f, 0.0f, 0.0f};
     bno085_orientation::AdjustQuaternion(quat.w(), quat.x(), quat.y(), quat.z(), adjustedQuat);
     if (math_utils::SanitizeQuaternionArray(adjustedQuat)) {
+        // Only replace the cached attitude after mount transform and validation pass.
         for (int i = 0; i < 4; ++i) {
             g_lastQuat[i] = adjustedQuat[i];
         }
@@ -154,6 +174,8 @@ bool Bno055SensorAcquire(SensorData &out) {
         if (g_haveQuat && g_invalidQuaternionStreak < 0xff) {
             ++g_invalidQuaternionStreak;
         }
+        // Tolerate one bad quaternion when a previous attitude exists, but drop
+        // the BNO attitude if invalid samples persist.
         if (!g_haveQuat || g_invalidQuaternionStreak >= kQuaternionInvalidDropThreshold) {
             g_haveQuat = false;
         }

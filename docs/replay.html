@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Replay | ACS Docs</title>
+    <meta name="description" content="Replay and analysis workflow for ACS flight logs.">
+    <meta name="color-scheme" content="light dark">
+    <link rel="stylesheet" href="assets/acs-docs.css">
+    <script src="assets/acs-docs.js" defer></script>
+</head>
+<body>
+<div class="page">
+    <nav class="top-nav" aria-label="Primary">
+        <a class="site-name" href="index.html"><strong>ACS</strong> Docs</a>
+        <ul class="top-links">
+            <li><a href="index.html">Overview</a></li>
+            <li><a href="flight-loop.html">Loop</a></li>
+            <li><a href="predictor.html">Predictor</a></li>
+            <li><a href="sensors.html">Sensors</a></li>
+            <li><a href="replay.html" aria-current="page">Replay</a></li>
+        </ul>
+    </nav>
+
+    <main>
+        <section class="hero-full reveal">
+            <div class="section-label">Post-flight analysis</div>
+            <h1>Replay turns guesses into evidence.</h1>
+            <p class="desc">
+                The data logger writes a binary record of what the firmware knew at each loop. Replay decodes that record, reruns estimator and predictor logic, and lets you compare logged decisions against the current code.
+            </p>
+        </section>
+
+        <section class="reveal">
+            <div class="section-head">
+                <h2>Workflow</h2>
+                <div class="section-label">Decode to plot</div>
+            </div>
+            <div class="flow">
+                <div class="step">
+                    <div class="step-num">01 log</div>
+                    <div><h3>Record binary telemetry</h3><p>Firmware writes dense telemetry records and sparse event records into <code>SENSxxx.BIN</code> on SD.</p></div>
+                </div>
+                <div class="step">
+                    <div class="step-num">02 decode</div>
+                    <div><h3>Convert to CSV and events JSON</h3><p><code>decode_log.py</code> turns binary records into tabular data that Python and the native replay tool can inspect.</p></div>
+                </div>
+                <div class="step">
+                    <div class="step-num">03 replay</div>
+                    <div><h3>Run current code against recorded data</h3><p><code>acs_replay</code> can ignore logged state and rebuild the estimator path from raw sensor data.</p></div>
+                </div>
+                <div class="step">
+                    <div class="step-num">04 plot</div>
+                    <div><h3>Explain the flight</h3><p>Plots should show real apogee, predictor values, velocity, baro/state altitude, flap command/effective angle, and confidence flags.</p></div>
+                </div>
+            </div>
+            <div class="terminal"><code>python3 tools/replay/scripts/decode_log.py tools/replay/data/SENS065.BIN -o tools/replay/data/SENS065.csv
+tools/build/bin/acs_replay tools/replay/data/SENS065.csv --ignore-logged-state --rebuild-main-quaternion
+python3 tools/replay/scripts/plot_flight.py --flight fullscale_4 --view validation</code></div>
+        </section>
+
+        <section class="reveal">
+            <div class="section-head">
+                <h2>What to inspect</h2>
+                <div class="section-label">High signal</div>
+            </div>
+            <div class="grid-two">
+                <div class="card">
+                    <h3>First prediction</h3>
+                    <p>Check the first coast prediction after holdoff. If it is badly wrong, inspect burnout timing, velocity, attitude, AoA table coverage, and baro/state altitude agreement.</p>
+                </div>
+                <div class="card">
+                    <h3>Velocity trace</h3>
+                    <p>Vertical velocity tells you whether the estimator believes the vehicle still has enough energy to reach target. Bad velocity usually means bad apogee.</p>
+                </div>
+                <div class="card">
+                    <h3>Frame agreement</h3>
+                    <p>Compare ICM, LSM, BNO, Pulse, and WT901 gravity vectors on the pad. A sign or rotation error can look like drag-model error during coast.</p>
+                </div>
+                <div class="card">
+                    <h3>Predictor flags</h3>
+                    <p>Flags explain why a prediction should not be trusted: CFD clamp, step limit, baro-vz guard, angular rate clamp, horizontal speed cap, or high-AoA fallback.</p>
+                </div>
+            </div>
+        </section>
+
+        <section class="reveal">
+            <div class="section-head">
+                <h2>Curated artifacts</h2>
+                <div class="section-label">Repository policy</div>
+            </div>
+            <div class="table">
+                <table>
+                    <thead>
+                    <tr>
+                        <th>Location</th>
+                        <th>Use</th>
+                        <th>Commit policy</th>
+                    </tr>
+                    </thead>
+                    <tbody>
+                    <tr>
+                        <td><code>tools/replay/data/</code></td>
+                        <td>Raw logs, generated CSVs, local exports</td>
+                        <td>Usually ignored; commit only deliberate fixtures.</td>
+                    </tr>
+                    <tr>
+                        <td><code>tools/replay/plots/</code></td>
+                        <td>Reviewable SVG plots</td>
+                        <td>Commit curated plots that explain behavior.</td>
+                    </tr>
+                    <tr>
+                        <td><code>tools/replay/scripts/</code></td>
+                        <td>Stable commands</td>
+                        <td>Keep generic; move one-off experiments to archive.</td>
+                    </tr>
+                    <tr>
+                        <td><code>tools/replay/experiments/</code></td>
+                        <td>Flight-specific investigations</td>
+                        <td>Keep for reproducibility, not as primary commands.</td>
+                    </tr>
+                    </tbody>
+                </table>
+            </div>
+        </section>
+    </main>
+
+    <footer>
+        <span>Replay notes</span>
+        <ul class="footer-links">
+            <li><a href="../tools/replay/README.md">Replay README</a></li>
+            <li><a href="../tools/replay/scripts/README.md">Scripts</a></li>
+            <li><a href="index.html">Back to overview</a></li>
+        </ul>
+    </footer>
+</div>
+</body>
+</html>

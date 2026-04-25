@@ -38,6 +38,8 @@ bool StartsWith(const char *text, const char *prefix) {
 }
 
 bool IsNoisyProtocolLog(const char *pFileName, SbgDebugLogType logType, const char *message) {
+    // During startup baud probing the SBG parser may see garbage bytes.  Suppress
+    // repetitive protocol-noise messages but keep real errors visible.
     if (logType != SBG_DEBUG_LOG_TYPE_ERROR && logType != SBG_DEBUG_LOG_TYPE_WARNING) {
         return false;
     }
@@ -61,6 +63,8 @@ void FlushSuppressedParserLogSummary(uint32_t nowMs) {
     if ((nowMs - g_lastSuppressedParserLogMs) < 1000u) {
         return;
     }
+    // Summarize suppressed parser noise once per second instead of flooding serial
+    // logging and slowing the flight loop.
     LOG_PRINT("SBG WRN: suppressed ");
     LOG_PRINT(g_suppressedParserLogCount);
     LOG_PRINTLN(" protocol parser errors");
@@ -99,6 +103,8 @@ extern "C" void sbgPlatformDebugLogMsg(const char *pFileName,
     const uint32_t nowMs = millis();
 
     if (IsNoisyProtocolLog(pFileName, logType, message)) {
+        // Count noisy parser messages and return early; the summary keeps enough
+        // visibility to know the link is seeing bad frames.
         ++g_suppressedParserLogCount;
         FlushSuppressedParserLogSummary(nowMs);
         return;

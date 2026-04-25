@@ -11,6 +11,21 @@
 
 namespace {
 
+/*
+ * LSM rail overview:
+ *
+ * The LSM path mirrors the ICM software-AHRS idea with a different physical IMU.
+ * Keeping the two rails conceptually similar makes cross-checking meaningful:
+ * if both sensors see the same body motion after their own calibration/mount
+ * transforms, the selector can trust the selected attitude more.
+ *
+ * The important separation is:
+ *   - raw counts are just chip-frame electrical readings,
+ *   - calibration removes bias/scale/misalignment,
+ *   - axis/mount transforms put the result in rocket body frame,
+ *   - the AHRS decides when accel/mag are safe references for gyro drift.
+ */
+
 constexpr uint8_t kAccelGyroChipSelectPin = settings::sensors::lsm9ds1::kAccelGyroChipSelectPin;
 constexpr uint8_t kMagChipSelectPin = settings::sensors::lsm9ds1::kMagChipSelectPin;
 constexpr int8_t kInterruptPin = settings::sensors::lsm9ds1::kInterruptPin;
@@ -21,6 +36,8 @@ constexpr float kRadToDeg = 57.295779513082320876f;
 constexpr uint8_t kQuaternionInvalidDropThreshold = 2;
 
 LSM9DS1 g_lsm;
+// The LSM path is a software AHRS: raw accel/gyro/mag samples are calibrated,
+// rotated into body frame, then fused into g_q.
 volatile bool g_dataReadyInterrupt = false;
 bool g_initialized = false;
 bool g_hasCachedSample = false;
@@ -76,6 +93,7 @@ float g_calibrationMagGaussPerLsb = 0.00014f;
 void ApplyQuaternionContinuity();
 
 void DataReadyISR() {
+    // Only latch the interrupt.  SPI reads and filter updates run outside the ISR.
     g_dataReadyInterrupt = true;
 }
 
@@ -159,6 +177,7 @@ float MagGaussPerLsbForRange(uint8_t rangeGauss) {
 }
 
 void Apply3x3(const float matrix[3][3], const float in[3], float out[3]) {
+    // Apply the calibrated inverse scale/misalignment matrix.
     const float x = in[0];
     const float y = in[1];
     const float z = in[2];
@@ -169,6 +188,7 @@ void Apply3x3(const float matrix[3][3], const float in[3], float out[3]) {
 }
 
 void ApplyMountRotation(float vector[3]) {
+    // Convert the board/sensor frame into the rocket body frame.
     float rotated[3] = {0.0f, 0.0f, 0.0f};
     Apply3x3(settings::sensors::lsm9ds1::kMountRotation, vector, rotated);
     vector[0] = rotated[0];
@@ -185,6 +205,8 @@ void ApplyGyroCalibration(float vector[3]) {
 }
 
 void ApplyAxisTransform(float vector[3]) {
+    // The LSM library axis order does not have to match the rocket convention.
+    // This remap/sign step makes the following calibration math body-axis aware.
     float remapped[3] = {0.0f, 0.0f, 0.0f};
     for (int i = 0; i < 3; ++i) {
         const uint8_t source = settings::sensors::lsm9ds1::kAxisMap[i];
@@ -201,6 +223,7 @@ bool Normalize3(float &x, float &y, float &z) {
         return false;
     }
     const float inv = 1.0f / norm;
+    // Normalization keeps only direction, which is what accel/mag correction needs.
     x *= inv;
     y *= inv;
     z *= inv;
@@ -228,6 +251,8 @@ float WindowTrust(float value, float minValue, float maxValue) {
     }
     const float center = 0.5f * (minValue + maxValue);
     const float halfWidth = 0.5f * (maxValue - minValue);
+    // Full trust at the center of the window, linearly fading to zero at either
+    // edge.
     return Clamp01(1.0f - fabsf(value - center) / halfWidth);
 }
 
@@ -257,6 +282,7 @@ bool QuaternionFromEarthBasisInBody(const float northBody[3],
                                     const float upBody[3],
                                     float quaternion[4]) {
 
+    // Convert the body-frame north/east/up basis into a quaternion.
     const float r00 = northBody[0];
     const float r01 = eastBody[0];
     const float r02 = upBody[0];
@@ -329,6 +355,8 @@ bool QuaternionFromAccelMag(const float accelNorm[3], const float magNorm[3], fl
     }
 
     float eastBody[3] = {
+        // Gravity gives up and magnetometer gives a heading reference; their cross
+        // product builds the horizontal east vector.
         upBody[1] * magneticBody[2] - upBody[2] * magneticBody[1],
         upBody[2] * magneticBody[0] - upBody[0] * magneticBody[2],
         upBody[0] * magneticBody[1] - upBody[1] * magneticBody[0],
@@ -382,6 +410,8 @@ void ApplyQuaternionContinuity() {
         return;
     }
     if (QuaternionDot(g_q, g_lastQuaternion) < 0.0f) {
+        // Quaternions have a sign ambiguity.  Keep the sign close to the previous
+        // sample so logs and blending do not jump even though attitude is the same.
         NegateQuaternion(g_q);
     }
     for (int i = 0; i < 4; ++i) {
@@ -431,11 +461,13 @@ float ComputeAccelTrust(float accelMagnitudeG, float gyroNorm) {
             phaseTrust = 0.75f;
             break;
         case FlightStatus::Burn:
-            // During burn, accelerometer reads thrust, not gravity - no trust
+            // During burn the accelerometer is dominated by thrust, so it should
+            // not pull the attitude estimate toward a fake gravity vector.
             return 0.0f;
         case FlightStatus::Coast:
         case FlightStatus::Overshoot:
-            // Burnout correction burst: aggressive correction right after burnout
+            // After burnout, accel can briefly be useful again for correcting
+            // boost-time gyro drift before the coast dynamics get noisy.
             if (settings::ahrs::kEnableBurnoutCorrectionBurst && g_burnoutTimestampSeconds > 0.0f) {
                 const float timeSinceBurnout = g_currentTimestampSeconds - g_burnoutTimestampSeconds;
                 if (timeSinceBurnout >= 0.0f && timeSinceBurnout < settings::ahrs::kBurnoutCorrectionWindowSeconds) {
@@ -444,7 +476,8 @@ float ComputeAccelTrust(float accelMagnitudeG, float gyroNorm) {
                     break;
                 }
             }
-            // After burnout window, maintain moderate trust for ongoing correction
+            // Later in coast, only allow correction when accel magnitude and gyro
+            // rate both say the sample is close to a gravity-only measurement.
             phaseTrust = settings::ahrs::kCoastAccelTrust;
             flightSuppression =
                 DescendingTrust(fabsf(accelMagnitudeG - 1.0f),
@@ -486,12 +519,16 @@ float ComputeMagTrust(float magMagnitude, float gyroNorm) {
         return 0.0f;
     }
     if (!g_hasMagReference || !(g_magReferenceNorm > 0.0f)) {
+        // Until the local field magnitude baseline exists, phase and spin rate are
+        // the only magnetic quality checks available.
         return phaseTrust * DescendingTrust(gyroNorm,
                                             settings::sensors::lsm9ds1::kMagTrustGyroFadeStartRadPerSec,
                                             settings::sensors::lsm9ds1::kMagTrustGyroFadeEndRadPerSec);
     }
     const float relativeError = fabsf(magMagnitude - g_magReferenceNorm) / g_magReferenceNorm;
     if (relativeError >= settings::sensors::lsm9ds1::kMagCorrectionMaxRelativeError) {
+        // Reject magnetic samples whose field strength no longer matches the local
+        // baseline.
         return 0.0f;
     }
     const float magnitudeTrust =
@@ -522,6 +559,7 @@ void UpdateGroundAlignment(const float accelNorm[3], float accelTrust, const flo
     if (accelTrust < settings::sensors::lsm9ds1::kGroundAlignmentAccelTrustMin ||
         magTrust < settings::sensors::lsm9ds1::kGroundAlignmentMagTrustMin ||
         gyroNorm > settings::sensors::lsm9ds1::kStationaryGyroMaxRadPerSec) {
+        // Ground alignment should be built from quiet pad samples only.
         g_groundAlignmentSampleCount = 0;
         g_groundAlignmentAccelSum[0] = 0.0f;
         g_groundAlignmentAccelSum[1] = 0.0f;
@@ -664,14 +702,16 @@ void AdaptiveQuaternionUpdate(const float accelNorm[3],
         q1 * q1 - q2 * q2 - q3 * q3 + q4 * q4,
     };
 
-    // Tilt correction: predicted up x measured up.
+    // Tilt correction: predicted up x measured up gives the small rotation that
+    // would move the current attitude toward the accel-derived up vector.
     float accelError[3] = {
         upBody[1] * accelNorm[2] - upBody[2] * accelNorm[1],
         upBody[2] * accelNorm[0] - upBody[0] * accelNorm[2],
         upBody[0] * accelNorm[1] - upBody[1] * accelNorm[0],
     };
 
-    // Yaw-only mag correction so mag cannot tilt pitch/roll.
+    // Yaw-only mag correction so magnetic disturbances cannot directly tilt
+    // pitch/roll.
     float magError[3] = {0.0f, 0.0f, 0.0f};
     if (magTrust > 0.0f) {
         const float magUpDot = Dot3(magNorm, upBody);
@@ -731,6 +771,8 @@ void AdaptiveQuaternionUpdate(const float accelNorm[3],
     const float qd = g_q[3];
 
     g_q[0] += (-qb * gx - qc * gy - qd * gz);
+    // Integrate angular rate into the quaternion, then renormalize to prevent
+    // floating point drift from turning it into a non-unit rotation.
     g_q[1] += (qa * gx + qc * gz - qd * gy);
     g_q[2] += (qa * gy - qb * gz + qd * gx);
     g_q[3] += (qa * gz + qb * gy - qc * gx);
@@ -757,6 +799,8 @@ void AdaptiveQuaternionUpdate(const float accelNorm[3],
 }
 
 void PublishFromState(SensorData &out, uint32_t nowUs) {
+    // The estimator consumes the LSM rail through the ICM-named fields because the
+    // rest of the code treats this as a selectable fast IMU rail.
     out.timestamp = static_cast<float>(nowUs) * 1.0e-6f;
     out.accelICM[0] = g_lastAccel[0];
     out.accelICM[1] = g_lastAccel[1];
@@ -872,6 +916,8 @@ bool UpdateSensorCache() {
         fifoSamples = g_lsm.getFIFOSamples();
     }
 
+    // FIFO lets us drain a short burst after an interrupt.  Without FIFO, each
+    // available flag is read once.
     const bool accelReady = fifoSamples > 0 || g_lsm.accelAvailable();
     const bool gyroReady = fifoSamples > 0 || g_lsm.gyroAvailable();
     uint8_t burstSamples = 1;
@@ -979,6 +1025,8 @@ bool Lsm9ds1SensorAcquire(SensorData &out) {
         if (!g_hasCachedSample) {
             return false;
         }
+        // Preserve loop-rate output without pretending the hardware produced a new
+        // sample.
         g_lastAcquireUsedCache = true;
         PublishFromState(out, nowUs);
         return true;
@@ -1012,6 +1060,8 @@ bool Lsm9ds1SensorAcquire(SensorData &out) {
         if (!g_hasCachedSample) {
             return false;
         }
+        // No fresh interrupt/data-ready signal: publish the last valid sample and
+        // mark diagnostics accordingly.
         g_lastAcquireUsedCache = true;
         PublishFromState(out, nowUs);
         return true;
@@ -1056,6 +1106,7 @@ bool Lsm9ds1SensorAcquire(SensorData &out) {
                                          g_calibrationGyroLsbPerDps),
     };
     ApplyAxisTransform(gyroRaw);
+    // Counts -> rad/s, with zero-rate offset and optional temperature bias removed.
     float gyroRadPerSec[3] = {
         gyroRaw[0] * g_activeGyroRadPerSecPerLsb -
             settings::sensors::lsm9ds1::kGyroTempBiasSlopeRadPerSecPerC[0] * temperatureDeltaC,
@@ -1082,6 +1133,8 @@ bool Lsm9ds1SensorAcquire(SensorData &out) {
     ApplyAxisTransform(accelRaw);
     ApplyMountRotation(accelRaw);
     const float accelMagnitudeG = Magnitude3(accelRaw[0], accelRaw[1], accelRaw[2]) / g_activeAccelLsbPerG;
+    // accelNorm is direction only for the attitude correction; accelMagnitudeG is
+    // kept separately for trust gating.
     float accelNorm[3] = {accelRaw[0], accelRaw[1], accelRaw[2]};
     Normalize3(accelNorm[0], accelNorm[1], accelNorm[2]);
 
@@ -1112,6 +1165,8 @@ bool Lsm9ds1SensorAcquire(SensorData &out) {
     g_lastMagBody[1] = magRaw[1];
     g_lastMagBody[2] = magRaw[2];
     const float magMagnitude = Magnitude3(magRaw[0], magRaw[1], magRaw[2]);
+    // Magnetic field magnitude gates quality, while the normalized vector provides
+    // yaw direction.
     float magNorm[3] = {magRaw[0], magRaw[1], magRaw[2]};
     Normalize3(magNorm[0], magNorm[1], magNorm[2]);
 
@@ -1121,6 +1176,8 @@ bool Lsm9ds1SensorAcquire(SensorData &out) {
     }
     g_lastFilterUs = nowUs;
     if (!(dt > 0.0f) || dt > 0.1f) {
+        // Clamp bad timing gaps to the nominal filter period so a delayed loop
+        // does not inject a huge gyro integration step.
         dt = static_cast<float>(kSampleIntervalUs) * 1.0e-6f;
     }
     g_lastAhrsDt = dt;

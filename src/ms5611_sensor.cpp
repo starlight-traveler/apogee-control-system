@@ -10,8 +10,18 @@
 
 namespace {
 
+/*
+ * Secondary barometer path:
+ *
+ * The MS5611 is treated as a comparison instrument. It helps diagnose pressure
+ * disagreement without creating a second altitude source that can silently fight
+ * the primary estimator.
+ */
+
 MS5611_SPI g_pressureSensor(settings::sensors::ms5611::kChipSelectPin, &SPI);
 
+// MS5611 is kept as a secondary/comparison barometer. It does not feed the
+// primary estimator today, but its diagnostics are useful for baro sanity checks.
 constexpr float kMaxValidAltitudeFeet = settings::sensors::ms5611::kMaxValidAltitudeFeet;
 constexpr uint32_t kMinReadSpacingUs = settings::sensors::ms5611::kMinReadSpacingUs;
 constexpr osr_t kOversampling = OSR_ULTRA_LOW;
@@ -91,6 +101,8 @@ bool Ms5611SensorAcquire() {
 
     const uint32_t nowMicros = micros();
     if (g_lastReadMicros != 0 && static_cast<uint32_t>(nowMicros - g_lastReadMicros) < kMinReadSpacingUs) {
+        // Respect the ADC conversion time and keep callers from treating the
+        // cached value as a new pressure sample.
         return false;
     }
     g_lastReadMicros = nowMicros;
@@ -113,6 +125,8 @@ bool Ms5611SensorAcquire() {
 
     const float altitudeFeet = ComputeAltitudeFeet(pressureHpa);
     if (!isfinite(altitudeFeet) || std::fabs(altitudeFeet) > kMaxValidAltitudeFeet) {
+        // Refuse impossible pressure-altitude values so comparison diagnostics
+        // do not chase a sensor glitch.
         return false;
     }
 
@@ -144,12 +158,14 @@ BarometerDiagnostics Ms5611SensorGetDiagnostics() {
 }
 
 void Ms5611SensorSetSeaLevelPressureHpa(float pressureHpa) {
+    // Keep comparison altitude in the same pressure reference frame as BMP585.
     if (!(pressureHpa > 0.0f) || !isfinite(pressureHpa)) {
         return;
     }
     g_seaLevelPressureHpa = pressureHpa;
     g_seaLevelPressureInv = 1.0f / pressureHpa;
     if (g_lastPressureHpa > 0.0f) {
+        // Reproject the cached pressure through the new reference immediately.
         g_lastAltitudeFeet = ComputeAltitudeFeet(g_lastPressureHpa);
     }
 }

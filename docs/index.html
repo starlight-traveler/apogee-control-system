@@ -1,0 +1,859 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Apogee Control System Docs</title>
+    <meta name="description" content="Architecture notes for a Teensy-based active apogee control system: sensors, estimator, predictor, flaps, logging, and replay.">
+    <meta name="color-scheme" content="light dark">
+    <style>
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        :root {
+            --bg: #f7f7f4;
+            --panel: #ffffff;
+            --ink: #111111;
+            --mid: #777777;
+            --faint: #d0d0cc;
+            --soft: #eeeeea;
+            --inverse: #ffffff;
+        }
+
+        html {
+            scroll-behavior: smooth;
+            font-size: 16px;
+        }
+
+        body {
+            min-height: 100vh;
+            background:
+                linear-gradient(90deg, rgba(17, 17, 17, 0.035) 1px, transparent 1px),
+                linear-gradient(180deg, rgba(17, 17, 17, 0.035) 1px, transparent 1px),
+                var(--bg);
+            background-size: 36px 36px;
+            color: var(--ink);
+            font-family: ui-monospace, "SF Mono", "Cascadia Mono", "Consolas", monospace;
+            line-height: 1.65;
+        }
+
+        a {
+            color: inherit;
+            text-decoration-thickness: 1px;
+            text-underline-offset: 3px;
+        }
+
+        a:hover {
+            color: var(--mid);
+        }
+
+        .page {
+            max-width: 1040px;
+            margin: 0 auto;
+            padding: 56px 24px 40px;
+        }
+
+        .top-nav {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 16px;
+            row-gap: 10px;
+            flex-wrap: wrap;
+            margin-bottom: 42px;
+            padding-bottom: 18px;
+            border-bottom: 1px solid var(--faint);
+        }
+
+        .site-name {
+            font-size: 12px;
+            letter-spacing: 0.16em;
+            text-transform: uppercase;
+            color: var(--mid);
+            text-decoration: none;
+        }
+
+        .site-name strong {
+            color: var(--ink);
+            font-weight: 600;
+        }
+
+        .top-links {
+            display: flex;
+            gap: 16px;
+            list-style: none;
+            font-size: 11px;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+            color: var(--mid);
+            flex-wrap: wrap;
+        }
+
+        .hero {
+            display: grid;
+            grid-template-columns: minmax(0, 1.25fr) minmax(280px, 0.75fr);
+            gap: 32px;
+            align-items: end;
+            margin-bottom: 48px;
+        }
+
+        h1 {
+            font-size: clamp(42px, 8vw, 82px);
+            font-weight: 400;
+            letter-spacing: -0.035em;
+            line-height: 0.98;
+            margin-bottom: 22px;
+            max-width: 820px;
+        }
+
+        .desc {
+            color: var(--mid);
+            max-width: 680px;
+            font-size: 14px;
+        }
+
+        .hero-aside {
+            border: 1px solid var(--faint);
+            background: var(--panel);
+            padding: 18px;
+        }
+
+        .section-label {
+            font-size: 10px;
+            letter-spacing: 0.14em;
+            text-transform: uppercase;
+            color: var(--mid);
+            margin-bottom: 14px;
+        }
+
+        .mono-line {
+            display: flex;
+            justify-content: space-between;
+            gap: 16px;
+            padding: 8px 0;
+            border-top: 1px solid var(--soft);
+            font-size: 12px;
+        }
+
+        .mono-line:first-of-type {
+            border-top: none;
+        }
+
+        .mono-line span:first-child {
+            color: var(--mid);
+        }
+
+        .mono-line span:last-child {
+            text-align: right;
+        }
+
+        .stats {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 1px;
+            background: var(--faint);
+            border: 1px solid var(--faint);
+            margin-bottom: 48px;
+        }
+
+        .stat {
+            background: var(--panel);
+            padding: 20px;
+            min-height: 116px;
+        }
+
+        .stat-label {
+            font-size: 10px;
+            letter-spacing: 0.12em;
+            text-transform: uppercase;
+            color: var(--mid);
+            margin-bottom: 10px;
+        }
+
+        .stat-value {
+            font-size: 24px;
+            line-height: 1.1;
+            margin-bottom: 8px;
+        }
+
+        .stat-sub {
+            font-size: 11px;
+            color: var(--mid);
+        }
+
+        section {
+            margin-bottom: 56px;
+        }
+
+        .section-head {
+            display: flex;
+            align-items: baseline;
+            justify-content: space-between;
+            gap: 16px;
+            border-bottom: 1px solid var(--faint);
+            padding-bottom: 12px;
+            margin-bottom: 22px;
+        }
+
+        h2 {
+            font-size: clamp(24px, 4vw, 38px);
+            font-weight: 400;
+            letter-spacing: -0.02em;
+            line-height: 1.15;
+        }
+
+        h3 {
+            font-size: 15px;
+            font-weight: 600;
+            margin-bottom: 8px;
+        }
+
+        p {
+            margin-bottom: 14px;
+        }
+
+        .lede {
+            max-width: 780px;
+            color: var(--mid);
+            font-size: 13px;
+        }
+
+        .grid-two {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 1px;
+            border: 1px solid var(--faint);
+            background: var(--faint);
+        }
+
+        .grid-three {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 1px;
+            border: 1px solid var(--faint);
+            background: var(--faint);
+        }
+
+        .card {
+            background: var(--panel);
+            padding: 20px;
+        }
+
+        .card-link {
+            display: block;
+            text-decoration: none;
+            transition: background 0.15s, color 0.15s;
+        }
+
+        .card-link:hover {
+            color: var(--ink);
+            background: var(--soft);
+        }
+
+        .card p,
+        .step p {
+            color: var(--mid);
+            font-size: 13px;
+            margin-bottom: 0;
+        }
+
+        .flow {
+            border: 1px solid var(--faint);
+            background: var(--panel);
+        }
+
+        .step {
+            display: grid;
+            grid-template-columns: 86px 1fr;
+            gap: 18px;
+            padding: 18px 20px;
+            border-top: 1px solid var(--faint);
+        }
+
+        .step:first-child {
+            border-top: none;
+        }
+
+        .step-num {
+            color: var(--mid);
+            font-size: 11px;
+            letter-spacing: 0.12em;
+            text-transform: uppercase;
+            padding-top: 2px;
+        }
+
+        .phase-strip {
+            display: grid;
+            grid-template-columns: repeat(5, 1fr);
+            gap: 1px;
+            background: var(--faint);
+            border: 1px solid var(--faint);
+        }
+
+        .phase {
+            background: var(--panel);
+            padding: 18px 16px;
+            min-height: 132px;
+        }
+
+        .phase .name {
+            font-size: 13px;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            margin-bottom: 10px;
+        }
+
+        .phase .text {
+            font-size: 12px;
+            color: var(--mid);
+        }
+
+        .callout {
+            border: 1px solid var(--ink);
+            background: var(--ink);
+            color: var(--inverse);
+            padding: 22px;
+            margin: 22px 0;
+        }
+
+        .callout p {
+            color: inherit;
+            margin-bottom: 0;
+            font-size: 13px;
+        }
+
+        .terminal {
+            background: var(--ink);
+            color: var(--inverse);
+            padding: 18px;
+            overflow-x: auto;
+            border: 1px solid var(--ink);
+            font-size: 12px;
+            line-height: 1.7;
+            margin-top: 16px;
+        }
+
+        code,
+        .path {
+            font-family: inherit;
+            background: var(--soft);
+            padding: 1px 4px;
+        }
+
+        .terminal code {
+            background: transparent;
+            padding: 0;
+        }
+
+        .table {
+            border: 1px solid var(--faint);
+            background: var(--panel);
+            overflow-x: auto;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 12px;
+            min-width: 620px;
+        }
+
+        th,
+        td {
+            padding: 12px 14px;
+            border-bottom: 1px solid var(--faint);
+            text-align: left;
+            vertical-align: top;
+        }
+
+        th {
+            font-size: 10px;
+            letter-spacing: 0.12em;
+            text-transform: uppercase;
+            color: var(--mid);
+            font-weight: 400;
+        }
+
+        tr:last-child td {
+            border-bottom: none;
+        }
+
+        .diagram {
+            border: 1px solid var(--faint);
+            background: var(--panel);
+            padding: 20px;
+            overflow-x: auto;
+        }
+
+        .diagram pre {
+            font-family: inherit;
+            font-size: 12px;
+            line-height: 1.65;
+            min-width: 680px;
+        }
+
+        .checklist {
+            list-style: none;
+            border: 1px solid var(--faint);
+            background: var(--panel);
+        }
+
+        .checklist li {
+            display: grid;
+            grid-template-columns: 24px 1fr;
+            gap: 10px;
+            padding: 13px 16px;
+            border-top: 1px solid var(--faint);
+            font-size: 13px;
+        }
+
+        .checklist li:first-child {
+            border-top: none;
+        }
+
+        .mark {
+            color: var(--mid);
+        }
+
+        footer {
+            border-top: 1px solid var(--faint);
+            padding-top: 22px;
+            display: flex;
+            justify-content: space-between;
+            gap: 16px;
+            flex-wrap: wrap;
+            color: var(--mid);
+            font-size: 11px;
+        }
+
+        .footer-links {
+            display: flex;
+            gap: 18px;
+            list-style: none;
+            flex-wrap: wrap;
+        }
+
+        @media (prefers-color-scheme: dark) {
+            :root {
+                --bg: #0f0f0e;
+                --panel: #171716;
+                --ink: #eeeeea;
+                --mid: #858585;
+                --faint: #30302e;
+                --soft: #242422;
+                --inverse: #0f0f0e;
+            }
+        }
+
+        @media (max-width: 840px) {
+            .hero,
+            .grid-two,
+            .grid-three {
+                grid-template-columns: 1fr;
+            }
+
+            .stats {
+                grid-template-columns: 1fr 1fr;
+            }
+
+            .phase-strip {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        @media (max-width: 520px) {
+            .page {
+                padding: 34px 16px 30px;
+            }
+
+            .stats {
+                grid-template-columns: 1fr;
+            }
+
+            .step {
+                grid-template-columns: 1fr;
+                gap: 4px;
+            }
+        }
+    </style>
+</head>
+<body>
+<div class="page">
+    <nav class="top-nav" aria-label="Primary">
+        <a class="site-name" href="../README.md"><strong>ACS</strong> Docs</a>
+        <ul class="top-links">
+            <li><a href="flight-loop.html">Loop</a></li>
+            <li><a href="predictor.html">Predictor</a></li>
+            <li><a href="sensors.html">Sensors</a></li>
+            <li><a href="replay.html">Replay</a></li>
+        </ul>
+    </nav>
+
+    <main>
+        <section class="hero" id="overview">
+            <div>
+                <div class="section-label">Active apogee control</div>
+                <h1>Predict coast.<br>Trim drag.<br>Hit target.</h1>
+                <p class="desc">
+                    This repository is the flight software, calibration workflow, telemetry format, and replay tooling for a Teensy 4.1 active apogee controller. The controller estimates the rocket state, predicts coast apogee, and commands synchronized drag flaps only when the estimator and predictor are healthy enough to trust.
+                </p>
+            </div>
+            <aside class="hero-aside" aria-label="Project facts">
+                <div class="section-label">Flight build</div>
+                <div class="mono-line"><span>MCU</span><span>Teensy 4.1</span></div>
+                <div class="mono-line"><span>Primary baro</span><span>BMP585</span></div>
+                <div class="mono-line"><span>Fast IMUs</span><span>ICM20948 / LSM9DS1</span></div>
+                <div class="mono-line"><span>Reference rails</span><span>BNO / WT901 / Pulse20</span></div>
+                <div class="mono-line"><span>Actuator</span><span>paired flaps</span></div>
+            </aside>
+        </section>
+
+        <div class="stats" aria-label="System summary">
+            <div class="stat">
+                <div class="stat-label">Target</div>
+                <div class="stat-value">1569 m</div>
+                <div class="stat-sub">default AGL target in firmware settings</div>
+            </div>
+            <div class="stat">
+                <div class="stat-label">Loop purpose</div>
+                <div class="stat-value">coast</div>
+                <div class="stat-sub">predictor physics become meaningful after burnout</div>
+            </div>
+            <div class="stat">
+                <div class="stat-label">Safety bias</div>
+                <div class="stat-value">retract</div>
+                <div class="stat-sub">uncertain prediction commands low drag</div>
+            </div>
+            <div class="stat">
+                <div class="stat-label">Replay</div>
+                <div class="stat-value">native</div>
+                <div class="stat-sub">logs can be decoded and replayed offboard</div>
+            </div>
+        </div>
+
+        <section>
+            <div class="section-head">
+                <h2>Deep dives</h2>
+                <div class="section-label">Pages</div>
+            </div>
+            <div class="grid-two">
+                <a class="card card-link" href="flight-loop.html">
+                    <h3>Flight loop</h3>
+                    <p>Interactive phase explorer and runtime signal path, from sensor freshness to flap command gates.</p>
+                </a>
+                <a class="card card-link" href="predictor.html">
+                    <h3>Predictor</h3>
+                    <p>Interactive apogee intuition tool plus the real CFD/RK4 predictor pipeline and uncertainty behavior.</p>
+                </a>
+                <a class="card card-link" href="sensors.html">
+                    <h3>Sensors</h3>
+                    <p>Rail-by-rail explanation of barometer, ICM, LSM, BNO, Pulse, and WT901 frame/freshness roles.</p>
+                </a>
+                <a class="card card-link" href="replay.html">
+                    <h3>Replay</h3>
+                    <p>Decode, replay, plot, and inspect flight logs using the current estimator and predictor code.</p>
+                </a>
+            </div>
+        </section>
+
+        <section>
+            <div class="section-head">
+                <h2>What the system does</h2>
+                <div class="section-label">Control objective</div>
+            </div>
+            <p class="lede">
+                The apogee controller is not trying to fly the rocket like a full autopilot. It is trying to answer a narrower question quickly and repeatedly: if the rocket continues coasting from the current state with a given flap angle, where will vertical velocity reach zero?
+            </p>
+            <div class="grid-two">
+                <div class="card">
+                    <h3>Estimator</h3>
+                    <p>
+                        The estimator turns barometer and IMU data into pad-relative altitude, vertical velocity, acceleration, zenith angle, and health flags. It keeps stale samples from pretending to be fresh measurements and publishes confidence signals that the control path can inspect.
+                    </p>
+                </div>
+                <div class="card">
+                    <h3>Predictor</h3>
+                    <p>
+                        The predictor rolls the current coast state forward through gravity, wind-relative aerodynamics, CFD table forces, pitch dynamics, and flap latency. The output is a predicted apogee and time to apogee, plus flags when the model had to clamp or fall back.
+                    </p>
+                </div>
+                <div class="card">
+                    <h3>Controller</h3>
+                    <p>
+                        The controller evaluates flap angles and chooses a command that moves predicted apogee toward the target. It is deliberately conservative: if the predictor is invalid, uncertain, stale, or outside coverage, the command flows through the normal actuator path toward zero degrees.
+                    </p>
+                </div>
+                <div class="card">
+                    <h3>Logger and replay</h3>
+                    <p>
+                        The logger writes dense binary telemetry and sparse event records to SD. Replay tooling decodes those records into CSV and runs the flight computer logic offline, so estimator and predictor behavior can be tested against real flights.
+                    </p>
+                </div>
+            </div>
+        </section>
+
+        <section id="loop">
+            <div class="section-head">
+                <h2>Firmware loop</h2>
+                <div class="section-label">Hot path</div>
+            </div>
+            <div class="flow">
+                <div class="step">
+                    <div class="step-num">01 read</div>
+                    <div>
+                        <h3>Acquire sensors</h3>
+                        <p>Drivers collect BMP585 pressure altitude, optional MS5611 comparison pressure, fast ICM/LSM IMU data, BNO attitude/reference data, WT901 comparison data, and optional Ellipse/Pulse20 raw IMU logs. Each path carries freshness flags so cached continuity does not become new evidence.</p>
+                    </div>
+                </div>
+                <div class="step">
+                    <div class="step-num">02 frame</div>
+                    <div>
+                        <h3>Normalize frames</h3>
+                        <p>Sensor axes are rotated into the rocket body frame. This matters because attitude from one rail and acceleration from another rail can create a vertical acceleration bias if their frame mappings disagree.</p>
+                    </div>
+                </div>
+                <div class="step">
+                    <div class="step-num">03 fuse</div>
+                    <div>
+                        <h3>Update attitude and vertical state</h3>
+                        <p>The flight computer propagates attitude with gyro data, trims it with guarded reference rails, and updates Kalman filters with fresh acceleration and barometer samples. Ground constraints keep the pad state stable before liftoff.</p>
+                    </div>
+                </div>
+                <div class="step">
+                    <div class="step-num">04 phase</div>
+                    <div>
+                        <h3>Advance the state machine</h3>
+                        <p>Flight phase moves through Ground, Burn, Coast, Overshoot, and Descent. Transitions require confirmed evidence: liftoff uses accel first with a strict baro backup, burnout requires sustained low acceleration while ascending, and descent records the maximum observed altitude.</p>
+                    </div>
+                </div>
+                <div class="step">
+                    <div class="step-num">05 predict</div>
+                    <div>
+                        <h3>Build a guarded predictor seed</h3>
+                        <p>The seed uses vertical Kalman state, bounded zenith, bounded angular rate, and a conservative horizontal speed estimate only when attitude and accel are fresh enough. Suspicious inputs raise confidence flags instead of quietly entering the optimizer.</p>
+                    </div>
+                </div>
+                <div class="step">
+                    <div class="step-num">06 act</div>
+                    <div>
+                        <h3>Command flaps through the actuator model</h3>
+                        <p>Automatic flap motion is gated by phase, post-burn holdoff, baro/state agreement, predictor validity, and actuator state. Commands always pass through clamp, deadband, rate, PWM, and settling logic.</p>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <section>
+            <div class="section-head">
+                <h2>Flight phases</h2>
+                <div class="section-label">State machine</div>
+            </div>
+            <div class="phase-strip">
+                <div class="phase">
+                    <div class="name">Ground</div>
+                    <div class="text">Pad altitude is learned, barometer drift is tracked slowly, and vertical state is constrained near zero.</div>
+                </div>
+                <div class="phase">
+                    <div class="name">Burn</div>
+                    <div class="text">The motor is adding energy. The predictor may produce telemetry, but it is not yet the final coast model.</div>
+                </div>
+                <div class="phase">
+                    <div class="name">Coast</div>
+                    <div class="text">Burnout is confirmed. Apogee prediction and automatic flap control are meaningful after holdoff and safety gates.</div>
+                </div>
+                <div class="phase">
+                    <div class="name">Overshoot</div>
+                    <div class="text">Measured altitude is already above target. The rocket may still be ascending, so prediction and attitude propagation continue.</div>
+                </div>
+                <div class="phase">
+                    <div class="name">Descent</div>
+                    <div class="text">Vertical velocity has crossed downward. The maximum observed altitude is recorded as apogee.</div>
+                </div>
+            </div>
+        </section>
+
+        <section id="predictor">
+            <div class="section-head">
+                <h2>Apogee predictor</h2>
+                <div class="section-label">Coast model</div>
+            </div>
+            <p class="lede">
+                The predictor propagates a compact two-dimensional state: altitude, vertical velocity, horizontal speed, zenith angle, angular rate, physical flap angle, and requested flap command. It does not model motor thrust, so burnout detection and post-burn holdoff are launch-critical.
+            </p>
+            <div class="diagram" aria-label="Apogee predictor data flow">
+<pre>filtered vertical state     attitude seed          flap state
+        |                       |                    |
+        v                       v                    v
+  altitude / vz -----> predictor seed -----> candidate flap command
+                              |
+                              v
+          wind-relative velocity + atmosphere + Mach
+                              |
+                              v
+              CFD axial/normal force interpolation
+                              |
+                              v
+                 gravity + aero + pitch moment
+                              |
+                              v
+                    RK4 rollout to vz = 0
+                              |
+                              v
+               predicted apogee + confidence flags</pre>
+            </div>
+            <div class="callout">
+                <p>Important rule: a better-looking number is not enough. If the integration hits the step limit, the CFD table clamps outside coverage, the seed is stale, or uncertainty bounds spread too wide, the prediction is flagged so actuation can retract rather than keep commanding drag.</p>
+            </div>
+            <div class="grid-three">
+                <div class="card">
+                    <h3>Atmosphere</h3>
+                    <p>The environment model supplies temperature, density ratio, and wind. Aero uses air-relative speed, not ground speed, so wind is subtracted before Mach and angle of attack are computed.</p>
+                </div>
+                <div class="card">
+                    <h3>CFD table</h3>
+                    <p>The table is indexed by flap angle, angle of attack, and Mach. It stores absolute axial and normal forces, which are scaled by density ratio and adaptive drag correction before being projected into vertical and horizontal axes.</p>
+                </div>
+                <div class="card">
+                    <h3>Integration</h3>
+                    <p>RK4 is used for the normal prediction path. The rollout stops when vertical velocity crosses zero, then refines inside the final bracket instead of returning the first descending sample.</p>
+                </div>
+            </div>
+        </section>
+
+        <section id="actuation">
+            <div class="section-head">
+                <h2>Flap control</h2>
+                <div class="section-label">Drag authority</div>
+            </div>
+            <p class="lede">
+                The flaps are drag devices. More angle generally lowers apogee. Because undershoot is the worse failure mode for this vehicle, uncertain prediction behavior biases toward low drag through the normal command path.
+            </p>
+            <div class="grid-two">
+                <div class="card">
+                    <h3>Command angle</h3>
+                    <p>The controller-requested angle after clamping and deadband. This is what guidance wants the actuator to chase.</p>
+                </div>
+                <div class="card">
+                    <h3>Effective angle</h3>
+                    <p>A first-order model of where the flaps have physically moved after servo latency. The predictor uses this to avoid assuming instant drag changes.</p>
+                </div>
+                <div class="card">
+                    <h3>First motion</h3>
+                    <p>The first automatic deployment is limited by a conservative ramp. This prevents a large initial command before coast state, baro agreement, and actuator feedback have settled.</p>
+                </div>
+                <div class="card">
+                    <h3>Late coast</h3>
+                    <p>As time to apogee shrinks, command authority tapers and then disables. Near apogee, flap motion can be too late to help and too risky to explain cleanly.</p>
+                </div>
+            </div>
+        </section>
+
+        <section>
+            <div class="section-head">
+                <h2>Sensor roles</h2>
+                <div class="section-label">Rails</div>
+            </div>
+            <div class="table">
+                <table>
+                    <thead>
+                    <tr>
+                        <th>Path</th>
+                        <th>Role</th>
+                        <th>What the flight code cares about</th>
+                    </tr>
+                    </thead>
+                    <tbody>
+                    <tr>
+                        <td>BMP585</td>
+                        <td>Primary pressure altitude</td>
+                        <td>Fresh finite altitude defines pad-relative AGL, baro velocity guard, liftoff backup, and state/baro agreement gates.</td>
+                    </tr>
+                    <tr>
+                        <td>ICM20948</td>
+                        <td>Fast IMU rail</td>
+                        <td>High-rate accel/gyro and optional DMP attitude. Selected ICM attitude should use fresh ICM accel when available.</td>
+                    </tr>
+                    <tr>
+                        <td>LSM9DS1</td>
+                        <td>Fast IMU rail</td>
+                        <td>Independent accel/gyro/mag observer. Selected LSM attitude should use fresh LSM accel when available.</td>
+                    </tr>
+                    <tr>
+                        <td>BNO055 / BNO085</td>
+                        <td>Reference attitude rail</td>
+                        <td>Useful as a guarded coast trim after burnout, but not allowed to step the predictor from stale or disagreeing samples.</td>
+                    </tr>
+                    <tr>
+                        <td>WT901</td>
+                        <td>Comparison rail</td>
+                        <td>Logged in body-frame units for cross-check plots and frame debugging.</td>
+                    </tr>
+                    <tr>
+                        <td>Ellipse / Pulse20</td>
+                        <td>Optional high-quality sidecar IMU</td>
+                        <td>Raw IMU and mag logs are parsed through bounded serial service, then fused by the same freshness/trust philosophy.</td>
+                    </tr>
+                    </tbody>
+                </table>
+            </div>
+        </section>
+
+        <section id="replay">
+            <div class="section-head">
+                <h2>Logging and replay</h2>
+                <div class="section-label">Post-flight proof</div>
+            </div>
+            <p class="lede">
+                The system is built to be replayed. Binary logs preserve raw rails, selected attitude, filtered state, flap command/effective angle, predictor output, confidence flags, and event records. That lets you inspect whether the flight computer made the right decision from the information it had at the time.
+            </p>
+            <div class="terminal"><code>python3 tools/replay/scripts/decode_log.py path/to/SENS010.BIN -o tools/replay/data/SENS010.csv
+cmake -S tools -B tools/build -DACS_TOOLS_ENABLE_NATIVE_CPP_GUI=OFF
+cmake --build tools/build --target acs_replay -j
+tools/build/bin/acs_replay tools/replay/data/SENS010.csv --ignore-logged-state</code></div>
+            <div class="grid-two" style="margin-top: 22px;">
+                <div class="card">
+                    <h3>Use replay for behavior</h3>
+                    <p>Replay answers whether the current estimator and predictor would have produced the observed flight decisions from the recorded sensor stream.</p>
+                </div>
+                <div class="card">
+                    <h3>Use plots for explanation</h3>
+                    <p>Plots should show actual apogee, predicted apogee, state AGL, baro AGL, vertical velocity, flap command, and predictor flags when evaluating a flight.</p>
+                </div>
+            </div>
+        </section>
+
+        <section>
+            <div class="section-head">
+                <h2>Launch review checklist</h2>
+                <div class="section-label">Before flight</div>
+            </div>
+            <ul class="checklist">
+                <li><span class="mark">01</span><span>Build the flight firmware cleanly with <code>pio run -e flight</code>.</span></li>
+                <li><span class="mark">02</span><span>Verify flashed settings are correct; SD settings are a mirror/status record, not the boot source of truth.</span></li>
+                <li><span class="mark">03</span><span>Confirm pad barometer reference settles and fresh baro AGL is required before AGL-dependent gates.</span></li>
+                <li><span class="mark">04</span><span>Check ICM/LSM/Pulse frame directions with a static gravity orientation test.</span></li>
+                <li><span class="mark">05</span><span>Confirm no flap motion during Burn and no automatic motion before post-burn holdoff.</span></li>
+                <li><span class="mark">06</span><span>Replay a recent flight and inspect predictor flags, baro velocity guard, command/effective flap angle, and actual apogee alignment.</span></li>
+            </ul>
+        </section>
+    </main>
+
+    <footer>
+        <span>Apogee Control System documentation</span>
+        <ul class="footer-links">
+            <li><a href="README.md">Docs index</a></li>
+            <li><a href="flight-loop.html">Flight loop</a></li>
+            <li><a href="predictor.html">Predictor</a></li>
+            <li><a href="sensors.html">Sensors</a></li>
+            <li><a href="replay.html">Replay</a></li>
+            <li><a href="apogee-predictor.md">Predictor notes</a></li>
+            <li><a href="flow.md">Program flow</a></li>
+            <li><a href="../README.md">Repository</a></li>
+        </ul>
+    </footer>
+</div>
+</body>
+</html>

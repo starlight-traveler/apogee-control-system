@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Predictor | ACS Docs</title>
+    <meta name="description" content="Interactive apogee predictor documentation for the apogee control system.">
+    <meta name="color-scheme" content="light dark">
+    <link rel="stylesheet" href="assets/acs-docs.css">
+    <script src="assets/acs-docs.js" defer></script>
+</head>
+<body>
+<div class="page">
+    <nav class="top-nav" aria-label="Primary">
+        <a class="site-name" href="index.html"><strong>ACS</strong> Docs</a>
+        <ul class="top-links">
+            <li><a href="index.html">Overview</a></li>
+            <li><a href="flight-loop.html">Loop</a></li>
+            <li><a href="predictor.html" aria-current="page">Predictor</a></li>
+            <li><a href="sensors.html">Sensors</a></li>
+            <li><a href="replay.html">Replay</a></li>
+        </ul>
+    </nav>
+
+    <main>
+        <section class="hero-full reveal">
+            <div class="section-label">Apogee model</div>
+            <h1>One coast rollout, many guardrails.</h1>
+            <p class="desc">
+                The predictor takes a compact coast seed and rolls it forward until vertical velocity reaches zero. The implementation is practical rather than magical: bounded inputs, CFD interpolation, density scaling, actuator lag, RK integration, and flags whenever the answer leaves trusted ground.
+            </p>
+        </section>
+
+        <section class="reveal">
+            <div class="section-head">
+                <h2>Interactive intuition</h2>
+                <div class="section-label">Not flight math</div>
+            </div>
+            <p class="lede">
+                This small calculator is intentionally simplified. It shows the direction of the effects: higher vertical speed raises apogee, flap angle increases drag, and tilt makes the rollout less clean. The firmware model is more detailed and uses CFD table forces.
+            </p>
+            <div class="interactive-panel">
+                <div class="slider-row">
+                    <label for="demo-altitude">Current altitude</label>
+                    <input id="demo-altitude" data-predictor-input type="range" min="0" max="1400" value="420">
+                    <span id="demo-altitude-value">420 m</span>
+                </div>
+                <div class="slider-row">
+                    <label for="demo-velocity">Vertical velocity</label>
+                    <input id="demo-velocity" data-predictor-input type="range" min="20" max="330" value="210">
+                    <span id="demo-velocity-value">210 m/s</span>
+                </div>
+                <div class="slider-row">
+                    <label for="demo-flap">Flap angle</label>
+                    <input id="demo-flap" data-predictor-input type="range" min="0" max="45" value="0">
+                    <span id="demo-flap-value">0 deg</span>
+                </div>
+                <div class="slider-row">
+                    <label for="demo-tilt">Zenith angle</label>
+                    <input id="demo-tilt" data-predictor-input type="range" min="0" max="20" value="4">
+                    <span id="demo-tilt-value">4 deg</span>
+                </div>
+                <div class="bar-track" aria-label="Flap deployment">
+                    <div class="bar-fill" id="demo-bar-fill"></div>
+                </div>
+                <div class="readout">
+                    <div class="readout-cell">
+                        <div class="label">Predicted apogee</div>
+                        <div class="value" id="demo-apogee">0 m</div>
+                    </div>
+                    <div class="readout-cell">
+                        <div class="label">Time to apogee</div>
+                        <div class="value" id="demo-time">0 s</div>
+                    </div>
+                    <div class="readout-cell">
+                        <div class="label">Drag loss</div>
+                        <div class="value" id="demo-drag-loss">0 m</div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <section class="reveal">
+            <div class="section-head">
+                <h2>Real predictor pipeline</h2>
+                <div class="section-label">Firmware path</div>
+            </div>
+            <div class="flow">
+                <div class="step">
+                    <div class="step-num">seed</div>
+                    <div><h3>Sanitize state</h3><p>Use raw vertical Kalman altitude and velocity, clamp zenith and angular rate, and use horizontal speed only when attitude and accel are fresh enough.</p></div>
+                </div>
+                <div class="step">
+                    <div class="step-num">air</div>
+                    <div><h3>Build air-relative state</h3><p>Subtract wind, compute local temperature, density ratio, speed of sound, Mach, and relative velocity angle.</p></div>
+                </div>
+                <div class="step">
+                    <div class="step-num">cfd</div>
+                    <div><h3>Interpolate force table</h3><p>Look up axial and normal force by flap angle, angle of attack, and Mach. Out-of-table values clamp and raise flags.</p></div>
+                </div>
+                <div class="step">
+                    <div class="step-num">force</div>
+                    <div><h3>Project forces</h3><p>Scale by density and learned drag, rotate axial/normal forces into vertical/horizontal axes, add gravity, and compute pitch moment.</p></div>
+                </div>
+                <div class="step">
+                    <div class="step-num">roll</div>
+                    <div><h3>Integrate to apogee</h3><p>RK4 advances state until vertical velocity crosses zero. The last bracket is refined so apogee is not the first descending sample.</p></div>
+                </div>
+            </div>
+        </section>
+
+        <section class="reveal">
+            <div class="section-head">
+                <h2>Uncertainty behavior</h2>
+                <div class="section-label">Control safety</div>
+            </div>
+            <div class="grid-two">
+                <div class="card">
+                    <h3>Step limit</h3>
+                    <p>When the integration cap is hit while still climbing, the returned value is only a conservative telemetry bound. The prediction is flagged uncertain so control should retract rather than trust it.</p>
+                </div>
+                <div class="card">
+                    <h3>High AoA fallback</h3>
+                    <p>If AoA is above CFD coverage, the table edge can be too drag-heavy. Telemetry can blend toward a low-drag bound, but the model still marks the result uncertain.</p>
+                </div>
+                <div class="card">
+                    <h3>Wide bounds</h3>
+                    <p>Drag perturbation bounds are not a formal confidence interval. They are a sensitivity test: if small drag changes move apogee a lot, the command should be conservative.</p>
+                </div>
+                <div class="card">
+                    <h3>Adaptive drag</h3>
+                    <p>Drag learning happens only in clean coast when the flaps are settled and predictor seed flags are healthy. Learning from bad input would make future predictions worse.</p>
+                </div>
+            </div>
+        </section>
+    </main>
+
+    <footer>
+        <span>Predictor notes</span>
+        <ul class="footer-links">
+            <li><a href="apogee-predictor.md">Markdown notes</a></li>
+            <li><a href="../src/apogee_model.h">Source</a></li>
+            <li><a href="sensors.html">Next: sensors</a></li>
+        </ul>
+    </footer>
+</div>
+</body>
+</html>

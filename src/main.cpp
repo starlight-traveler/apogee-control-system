@@ -29,6 +29,19 @@
 
 namespace {
 
+/*
+ * Big-picture flow for this file:
+ *
+ *   sensors -> SensorData -> FlightComputer -> FilteredState -> actuation optimizer
+ *          -> actuator model/servos -> logger + telemetry
+ *
+ * The important rule is that each stage carries freshness forward. A cached IMU
+ * value may be useful for continuity or diagnostics, but it should not be
+ * treated as a new measurement for launch detection, pad altitude, or flap
+ * safety decisions. Most defensive checks in this file prevent stale data from
+ * looking like a real flight event.
+ */
+
 /// Flight-loop constants mirrored locally to keep `main.cpp` readable.
 constexpr uint8_t kStatusLedPin = settings::hardware::kStatusLedPin;
 constexpr uint8_t kBootLedPin = 0;
@@ -1366,6 +1379,8 @@ static float ComputeCrossCheckTrust(const float accelA[3],
                                     const float gyroA[3],
                                     const float accelB[3],
                                     const float gyroB[3]) {
+    // Agreement trust falls from 1 to 0 as accel or gyro disagreement grows.
+    // The lower of accel/gyro trust is used so one bad channel can de-rate a rail.
     const float accelTrust = DescendingTrust(VectorDiffNorm3(accelA, accelB),
                                              kCrossCheckAccelFullTrustMps2,
                                              kCrossCheckAccelZeroTrustMps2);
@@ -1382,6 +1397,7 @@ static float ApplyTiltTrust(float baseTrust, bool hasTiltDifference, float tiltD
     const float tiltTrust = DescendingTrust(tiltDifferenceDeg,
                                             kCrossCheckQuaternionFullTrustDeg,
                                             kCrossCheckQuaternionZeroTrustDeg);
+    // Tilt agreement can only reduce trust; it cannot hide bad accel/gyro agreement.
     return std::max(0.0f, std::min(1.0f, std::min(baseTrust, tiltTrust)));
 }
 
@@ -1571,6 +1587,7 @@ static void SetMainQuaternion(SensorData &data, const float quaternion[4], MainQ
         sanitizedQuaternion[i] = quaternion[i];
     }
     if (!math_utils::SanitizeQuaternionArray(sanitizedQuaternion)) {
+        // Refuse corrupted attitude instead of publishing identity as a real source.
         data.hasQuaternion = false;
         data.mainQuaternionSource = static_cast<uint8_t>(MainQuaternionSource::None);
         return;
@@ -1584,6 +1601,8 @@ static void SetMainQuaternion(SensorData &data, const float quaternion[4], MainQ
     for (int i = 0; i < 4; ++i) {
         g_lastMainQuaternion[i] = sanitizedQuaternion[i];
     }
+    // Coast rail-health logic uses the last accepted main attitude as a local
+    // reference when fast rails no longer agree with raw acceleration.
     g_haveMainQuaternionReference = true;
 }
 
@@ -1607,6 +1626,8 @@ static bool BnoComparableWithFastRail(uint32_t nowUs,
     if (requireQuaternion && !bnoData.hasQuaternion) {
         return false;
     }
+    // BNO runs slower than the fast rails, so comparisons require both sample
+    // age and pair skew to be inside their own limits.
     return SamplesComparable(nowUs,
                              bnoData.accelMicros,
                              kCrossCheckBnoSampleMaxAgeUs,
@@ -1637,6 +1658,8 @@ static bool AcquireSensorData(SensorData &data) {
     bool hasPulseData = false;
 
     if (kPulseEnabled) {
+        // Feed each sensor its current cross-check trust before acquiring so
+        // internal AHRS code can de-weight suspect rails.
         Ellipse20SensorSetCrossCheckTrust(g_pulseCrossCheckTrust);
         Ellipse20SensorService();
     }
@@ -1660,6 +1683,8 @@ static bool AcquireSensorData(SensorData &data) {
     if (pulseDiagnostics.hasImu || pulseDiagnostics.hasQuaternion || pulseDiagnostics.hasYpr) {
         CopyPulseFields(data, pulseData);
     }
+    // Fresh means this loop got a new sample. Cached values may be logged, but
+    // the estimator should not treat them as a fresh measurement update.
     data.icmSampleFresh = hasIcmImu && icmDiagnostics.lastAcquireFresh;
     data.lsmSampleFresh = hasLsmImu && lsmDiagnostics.lastAcquireFresh;
     data.pulseSampleFresh = hasPulseData && pulseDiagnostics.lastAcquireFresh;
@@ -1707,7 +1732,8 @@ static bool AcquireSensorData(SensorData &data) {
     }
     bool updatedBnoReferenceTrust = false;
     float bnoReferenceTargetTrust = 1.0f;
-    // Track ICM/LSM trust target - influenced by ICM-LSM comparison AND Pulse comparisons.
+    // Track ICM/LSM trust target, influenced by direct fast-rail comparison
+    // and by Pulse agreement when Pulse is available.
     float icmLsmTargetTrust = 1.0f;
     bool updatedIcmLsmTrust = false;
     const bool compareIcmLsm =
@@ -1719,6 +1745,8 @@ static bool AcquireSensorData(SensorData &data) {
                           kCrossCheckFastSampleMaxAgeUs,
                           kCrossCheckFastPairMaxSkewUs);
     if (compareIcmLsm) {
+        // Prefer quaternion/YPR tilt disagreement when available because it
+        // catches attitude divergence even if raw accel/gyro look close.
         float tiltDifferenceDeg = 0.0f;
         const bool hasTiltDifference =
             ComputeIcmLsmTiltDifference(data, icmDiagnostics, lsmData, lsmDiagnostics, tiltDifferenceDeg);
@@ -1875,7 +1903,8 @@ static bool AcquireSensorData(SensorData &data) {
         updatedPulseTrust = true;
         updatedBnoReferenceTrust = true;
     }
-    // Apply ICM/LSM trust update (now includes bidirectional Pulse cross-checks).
+    // Apply ICM/LSM trust update. Hysteresis slows sudden direction changes in
+    // trust so the selected attitude source does not flap back and forth.
     if (updatedIcmLsmTrust) {
         float blendRate = kCrossCheckTrustBlend;
         if (settings::ahrs::kEnableTrustHysteresis) {
@@ -1889,7 +1918,8 @@ static bool AcquireSensorData(SensorData &data) {
         g_icmLsmPairAgreementTrust +=
             blendRate * (icmLsmTargetTrust - g_icmLsmPairAgreementTrust);
     } else {
-        // Trust recovery with hysteresis.
+        // No fresh comparison this loop: recover slowly instead of instantly
+        // marking the rail healthy.
         float recoveryRate = kCrossCheckTrustRecoveryPerLoop;
         if (settings::ahrs::kEnableTrustHysteresis && g_icmLsmTrustWasDecreasing) {
             recoveryRate *= settings::ahrs::kTrustHysteresisReductionFactor;
@@ -1898,7 +1928,7 @@ static bool AcquireSensorData(SensorData &data) {
         g_icmLsmPairAgreementTrust = std::min(1.0f, g_icmLsmPairAgreementTrust + recoveryRate);
     }
     if (updatedBnoReferenceTrust) {
-        // Trust hysteresis for BNO
+        // Same trust hysteresis for the BNO reference path.
         float blendRate = kCrossCheckTrustBlend;
         if (settings::ahrs::kEnableTrustHysteresis) {
             const bool isDecreasing = bnoReferenceTargetTrust < g_bnoReferencePairAgreementTrust;
@@ -1911,7 +1941,7 @@ static bool AcquireSensorData(SensorData &data) {
         g_bnoReferencePairAgreementTrust +=
             blendRate * (bnoReferenceTargetTrust - g_bnoReferencePairAgreementTrust);
     } else {
-        // Trust recovery with hysteresis.
+        // Let BNO trust recover slowly when it is not comparable this loop.
         float recoveryRate = kCrossCheckTrustRecoveryPerLoop;
         if (settings::ahrs::kEnableTrustHysteresis && g_bnoTrustWasDecreasing) {
             recoveryRate *= settings::ahrs::kTrustHysteresisReductionFactor;
@@ -2031,6 +2061,7 @@ static bool AcquireSensorData(SensorData &data) {
 
     if (g_healthPhase == FlightStatus::Ground) {
         if (hasFastConsensus) {
+            // On the pad, raw acceleration is a good gravity reference.
             referenceGravity[0] = fastConsensusGravity[0];
             referenceGravity[1] = fastConsensusGravity[1];
             referenceGravity[2] = fastConsensusGravity[2];
@@ -2038,12 +2069,15 @@ static bool AcquireSensorData(SensorData &data) {
         }
     } else if (g_healthPhase == FlightStatus::Burn) {
         if (hasFastConsensus) {
+            // During boost, only use fast-rail consensus because BNO can lag or saturate.
             referenceGravity[0] = fastConsensusGravity[0];
             referenceGravity[1] = fastConsensusGravity[1];
             referenceGravity[2] = fastConsensusGravity[2];
             hasReferenceGravity = true;
         }
     } else {
+        // In coast, raw acceleration is no longer pure gravity. Use the last
+        // accepted main quaternion as the reference when available.
         hasReferenceGravity = g_haveMainQuaternionReference &&
                               GravityVectorFromQuaternion(g_lastMainQuaternion, referenceGravity);
         if (!hasReferenceGravity && hasFastConsensus) {
@@ -2091,6 +2125,7 @@ static bool AcquireSensorData(SensorData &data) {
                                        referenceGravity,
                                        g_healthPhase);
     if (fastConsensusReacquire) {
+        // If both fast rails strongly agree again, let them recover quickly.
         g_icmRailTrust = std::max(g_icmRailTrust, 0.98f);
         g_lsmRailTrust = std::max(g_lsmRailTrust, 0.98f);
     }
@@ -2136,8 +2171,8 @@ static bool AcquireSensorData(SensorData &data) {
     }
     data.hasQuaternion = false;
     data.mainQuaternionSource = static_cast<uint8_t>(MainQuaternionSource::None);
-    // Multi-IMU Quaternion Blending: When multiple sources have trust > threshold,
-    // blend via weighted SLERP using cross-check trust values.
+    // Multi-IMU attitude selection: prefer healthy fast rails, blend ICM+LSM
+    // only when they agree, then fall back to one usable fast rail, then Pulse.
     if (settings::ahrs::kEnableQuaternionBlending) {
         const bool icmHealthy = data.hasIcmQuaternion && g_icmHealth == SensorRailHealth::Healthy;
         const bool lsmHealthy = lsmData.hasIcmQuaternion && g_lsmHealth == SensorRailHealth::Healthy;
@@ -2156,6 +2191,7 @@ static bool AcquireSensorData(SensorData &data) {
         bool hasFastQuaternion = false;
 
         if (icmHealthy && lsmHealthy && g_icmLsmCrossCheckTrust >= settings::ahrs::kMinBlendTrust) {
+            // Equal-weight SLERP keeps the output on the unit quaternion sphere.
             blendedQuat = math_utils::Normalize(math_utils::MakeQuaternion(
                 data.icmQuaternion[0], data.icmQuaternion[1],
                 data.icmQuaternion[2], data.icmQuaternion[3]));
@@ -2218,6 +2254,8 @@ static bool AcquireSensorData(SensorData &data) {
         }
     }
     const bool hasAltimeter = Bmp585SensorAcquire(data);
+    // Baro freshness is carried separately so pad altitude and actuation safety
+    // can reject stale/default altitude samples.
     data.baroSampleFresh = hasAltimeter;
     if (hasAltimeter) {
         ++g_sensorAcquireStats.bmpHits;
@@ -2310,10 +2348,21 @@ static bool IsAscentActuationPhase(FlightStatus status) {
     return status == FlightStatus::Burn || IsCoastLikeActuationPhase(status);
 }
 
+/// Returns true until automatic control is allowed to move flaps for the first time.
+///
+/// The first motion gate requires coast-like phase, a real burnout timestamp,
+/// post-burnout holdoff, and fresh baro/state altitude agreement.
 static bool ShouldBlockFirstAutoActuationMotion(const FilteredState &state,
                                                 FlightStatus status,
                                                 bool hasBaroAgl,
                                                 float baroAltitudeAglMeters) {
+    /*
+     * First-motion gating is a "do no harm" layer before the optimizer gets to
+     * move the flaps for the first time. Once the flaps start moving, they can
+     * disturb the barometer and change drag. This check asks for the simple
+     * agreement that should be true during a healthy coast: filtered altitude
+     * and fresh baro AGL should be close enough.
+     */
     if (g_autoActuationFirstMotionReleased) {
         return false;
     }
@@ -2338,14 +2387,26 @@ static bool ShouldBlockFirstAutoActuationMotion(const FilteredState &state,
 
     const double altitudeAgreementError =
         std::fabs(static_cast<double>(state.position[2]) - static_cast<double>(baroAltitudeAglMeters));
+    // A first flap move is blocked if the pressure altitude and estimator state
+    // disagree too much. That protects against opening flaps from a bad state seed.
     return altitudeAgreementError >
            static_cast<double>(settings::actuation::kFirstFlapBaroStateAgreementMeters);
 }
 
+/// Returns true when coast actuation should retract and stay disabled.
+///
+/// This is a latch, not a one-sample command, so it only checks hard safety
+/// evidence: bad baro/state agreement or acceleration that does not look like coast.
 static bool ShouldLatchAutoActuationSafety(const FilteredState &state,
                                            FlightStatus status,
                                            bool hasBaroAgl,
                                            float baroAltitudeAglMeters) {
+    /*
+     * This latch is intentionally sticky. In coast, a large disagreement between
+     * filtered altitude and fresh baro AGL means the controller may be seeded in
+     * the wrong altitude frame. The safer behavior is to retract and wait until
+     * the next Ground phase clears the latch.
+     */
     if (!IsCoastLikeActuationPhase(status)) {
         return false;
     }
@@ -2356,6 +2417,8 @@ static bool ShouldLatchAutoActuationSafety(const FilteredState &state,
         if (!std::isfinite(altitudeAgreementError) ||
             altitudeAgreementError >
                 static_cast<double>(settings::actuation::kCoastBaroStateAgreementMeters)) {
+            // Fresh baro says the filter altitude is not trustworthy enough
+            // for coast flap control.
             return true;
         }
     }
@@ -2368,10 +2431,22 @@ static bool ShouldLatchAutoActuationSafety(const FilteredState &state,
            inertialAccelerationZ > coastAccelerationLimit || filteredAccelerationZ > coastAccelerationLimit;
 }
 
+/// Chooses which altitude the actuation predictor should use.
+///
+/// Coast can optionally use fresh baro AGL instead of state altitude, but only
+/// when the two agree closely. If they disagree, keep the filtered state rather
+/// than silently switching to a conflicting measurement.
 static double ResolveActuationPredictorAltitudeMeters(const FilteredState &state,
                                                       FlightStatus status,
                                                       bool hasBaroAgl,
                                                       float baroAltitudeAglMeters) {
+    /*
+     * Altitude frame mistakes are an easy way to get a plausible but wrong apogee
+     * number. The filtered state is AGL by construction, while the barometer is
+     * the direct altitude sensor. During coast we can seed the actuation predictor
+     * with fresh baro AGL if it agrees with the filtered state. If they disagree,
+     * keep the state estimate rather than silently switching frames.
+     */
     const double stateAltitudeMeters = static_cast<double>(state.position[2]);
     if (!settings::actuation::kUseBaroAglForCoastPredictorAltitude ||
         !IsCoastLikeActuationPhase(status) ||
@@ -2384,6 +2459,7 @@ static double ResolveActuationPredictorAltitudeMeters(const FilteredState &state
     const double altitudeAgreementError = std::fabs(stateAltitudeMeters - baroAltitudeMeters);
     if (!std::isfinite(altitudeAgreementError) ||
         altitudeAgreementError > static_cast<double>(settings::actuation::kCoastBaroStateAgreementMeters)) {
+        // Disagreement means this is not a clean baro override.
         return stateAltitudeMeters;
     }
     return baroAltitudeMeters;
@@ -2938,6 +3014,19 @@ static float ComputeAutoActuationCommandDeg(uint32_t nowMs,
                                             float baroAltitudeAglMeters,
                                             float currentEffectiveAngleDeg,
                                             AutoActuationTelemetry *telemetry) {
+    /*
+     * This is a small model-predictive controller rather than a PID loop:
+     *
+     *   1. take the current estimated state,
+     *   2. simulate coast for many possible flap commands,
+     *   3. choose the command whose predicted apogee is best,
+     *   4. send that command through the normal servo model and limits.
+     *
+     * The "prefer overshoot over undershoot" policy is represented by a larger
+     * undershoot cost. Separately, if the predictor marks itself uncertain, the
+     * allowed command range collapses to zero so the normal actuator path retracts
+     * instead of holding a stale high-drag command.
+     */
     if (telemetry != nullptr) {
         telemetry->autoCommandDeg = std::numeric_limits<float>::quiet_NaN();
         telemetry->bestPredictedApogeeM = std::numeric_limits<float>::quiet_NaN();
@@ -2950,6 +3039,8 @@ static float ComputeAutoActuationCommandDeg(uint32_t nowMs,
     }
 
     if (status == FlightStatus::Overshoot) {
+        // Overshoot is treated as a hard "make drag now" state because the
+        // measured altitude has already exceeded the target.
         g_actuationLastCommandDeg = kServoMaxActuationDeg;
         g_actuationHasLastControlUpdate = true;
         g_actuationLastControlUpdateMs = nowMs;
@@ -2976,6 +3067,12 @@ static float ComputeAutoActuationCommandDeg(uint32_t nowMs,
                            kPredictorSeedFlagAngularRateClamped |
                            kPredictorSeedFlagBaroVzGuardActive |
                            kPredictorSeedFlagVerticalAccelDeweighted)) != 0u;
+    /*
+     * Low-confidence does not mean "the rocket is definitely wrong"; it means
+     * the optimizer should not be trusted to add drag. Step limits, CFD clamps,
+     * early-coast attitude blending, and baro-vz guard activity all say the model
+     * may be outside the envelope where a high flap command is a good idea.
+     */
     const double clampedZenith =
         SanitizePredictorZenithRadians(static_cast<double>(state.predictorSeedClampedZenithRad));
     const double clampedAngularRate =
@@ -3006,6 +3103,7 @@ static float ComputeAutoActuationCommandDeg(uint32_t nowMs,
         telemetry->timeToApogeeS = static_cast<float>(timeToApogeeSeconds);
     }
     if (!canControl) {
+        // No trusted predictor seed means retract through the normal actuator path.
         g_actuationLastCommandDeg = 0.0f;
         if (telemetry != nullptr) {
             telemetry->autoCommandDeg = 0.0f;
@@ -3015,6 +3113,7 @@ static float ComputeAutoActuationCommandDeg(uint32_t nowMs,
 
     if (g_actuationHasLastControlUpdate &&
         (nowMs - g_actuationLastControlUpdateMs) < settings::actuation::kControlUpdateIntervalMs) {
+        // Keep the optimizer rate bounded; the servo model still updates every loop.
         if (telemetry != nullptr) {
             telemetry->autoCommandDeg = g_actuationLastCommandDeg;
         }
@@ -3043,6 +3142,8 @@ static float ComputeAutoActuationCommandDeg(uint32_t nowMs,
         const double timeToApogee = std::max(0.0, timeToApogeeSeconds);
 
         if (state.velocity[2] <= hardDisableVz || timeToApogee <= hardDisableTime) {
+            // Near apogee, late flap movement is more likely to add noise than
+            // useful correction. Retract and stop commanding drag.
             g_actuationLastCommandDeg = 0.0f;
             if (telemetry != nullptr) {
                 telemetry->autoCommandDeg = 0.0f;
@@ -3064,6 +3165,8 @@ static float ComputeAutoActuationCommandDeg(uint32_t nowMs,
             std::min(maxAllowedAngle,
                      static_cast<double>(settings::actuation::kFirstMotionRampStartMaxAngleDeg));
         if (!g_autoActuationFirstMotionReleased) {
+            // First motion starts with a small cap so an initial overconfident
+            // command cannot jump straight to a large flap angle.
             maxAllowedAngle = rampStartMaxAngle;
         } else {
             const double rampDurationSeconds =
@@ -3080,6 +3183,8 @@ static float ComputeAutoActuationCommandDeg(uint32_t nowMs,
     }
 
     if (seedLowConfidence) {
+        // Uncertain predictor, step-limit, baro-vz guard, or clamped attitude:
+        // command zero by limiting the normal optimizer range to zero.
         maxAllowedAngle = 0.0;
     }
 
@@ -3094,10 +3199,18 @@ static float ComputeAutoActuationCommandDeg(uint32_t nowMs,
     };
 
     const auto nominalCostForApogee = [&](double predictedApogee, double commandedAngleDeg) {
+        /*
+         * Cost is deliberately simple:
+         *   - miss distance outside the deadband dominates,
+         *   - undershoot is multiplied harder than overshoot,
+         *   - large/fast flap moves have smaller penalties so the result is not
+         *     twitchy when several commands predict similar apogees.
+         */
         const double apogeeError = predictedApogee - targetApogeeMeters;
         const double errorOutsideDeadband = std::max(0.0, std::fabs(apogeeError) - deadbandMeters);
         double errorCost = errorOutsideDeadband * errorOutsideDeadband;
         if (apogeeError < -deadbandMeters) {
+            // Undershoot is intentionally penalized harder than overshoot.
             errorCost *= undershootPenalty;
         }
         const double deltaAngle = commandedAngleDeg - static_cast<double>(currentEffectiveAngleDeg);
@@ -3110,6 +3223,14 @@ static float ComputeAutoActuationCommandDeg(uint32_t nowMs,
     const auto boundedCostForPrediction = [&](const ApogeePredictionResult &prediction,
                                               double commandedAngleDeg,
                                               uint32_t flags) {
+        /*
+         * The bounded pass asks a different question than the nominal pass:
+         *
+         *   "If drag is a little wrong, does this command still look acceptable?"
+         *
+         * A narrow lower/upper bracket means the model is locally confident. A
+         * wide bracket means the command is too sensitive to aero uncertainty.
+         */
         const double upperOutsideDeadband =
             std::max(0.0, prediction.upper - targetApogeeMeters - deadbandMeters);
         const double lowerOutsideDeadband =
@@ -3119,6 +3240,8 @@ static float ComputeAutoActuationCommandDeg(uint32_t nowMs,
                            undershootPenalty * lowerOutsideDeadband * lowerOutsideDeadband;
         if (uncertaintyWidth > (2.0 * deadbandMeters)) {
             flags |= kPredictorSeedFlagPredictionUncertain;
+            // Wide bounds mean the model is not sure enough; add cost even if
+            // the nominal estimate sits near target.
             errorCost += 0.05 * uncertaintyWidth * uncertaintyWidth;
         }
         if (PredictorFlagsHasModelInvalidity(flags) && commandedAngleDeg > holdCommandLimit + 1.0e-6) {
@@ -3143,6 +3266,10 @@ static float ComputeAutoActuationCommandDeg(uint32_t nowMs,
 
     const double sweepStepDeg = std::max(0.1, static_cast<double>(kActuationSweepStepDeg));
     const int sweepSteps = std::max(1, static_cast<int>(std::ceil(maxAllowedAngle / sweepStepDeg)));
+    /*
+     * First pass: scan the whole flap range quickly using midpoint integration.
+     * This finds the neighborhood; it is not the final safety decision.
+     */
     for (int step = 0; step <= sweepSteps; ++step) {
         const double candidateAngleDeg =
             std::min(maxAllowedAngle, static_cast<double>(step) * sweepStepDeg);
@@ -3190,6 +3317,8 @@ static float ComputeAutoActuationCommandDeg(uint32_t nowMs,
 
     const int validationStart = std::max(0, bestStep - 2);
     const int validationEnd = std::min(sweepSteps, bestStep + 2);
+    // Validate a small neighborhood around the midpoint winner using the
+    // slower bounded RK4 path. This catches uncertain candidates before command.
     uint32_t bestValidationFlags = predictorFlags;
     double validatedBestCost = INFINITY;
     bool hasValidatedCandidate = false;
@@ -3230,6 +3359,8 @@ static float ComputeAutoActuationCommandDeg(uint32_t nowMs,
     if (hasValidatedCandidate) {
         bestCost = validatedBestCost;
     } else {
+        // If the validation pass cannot find a finite trusted candidate,
+        // retract instead of holding an old high-drag command.
         bestCost = INFINITY;
         bestAngleDeg = 0.0f;
         bestPredictedApogeeM = std::numeric_limits<float>::quiet_NaN();
@@ -3540,6 +3671,18 @@ void setup() {
 /// 4. compute actuation
 /// 5. log/telemetry/service diagnostics
 void loop() {
+    /*
+     * The loop is structured so failures degrade locally:
+     *
+     *   - no sensor data: keep servicing logger/LEDs and wait,
+     *   - no filtered state: do not command auto flaps,
+     *   - uncertain predictor: command zero through the actuator,
+     *   - manual override: still uses the same servo limiting path,
+     *   - overshoot: maximum drag is explicit and visible in logs.
+     *
+     * That separation matters because a flight computer should avoid turning
+     * "unknown" into "do the last aggressive thing again."
+     */
     const uint32_t loopStartUs = micros();
     const uint32_t nowMs = millis();
     NetworkTelemetryPollControl();
@@ -3626,6 +3769,8 @@ void loop() {
     const bool hasFreshBaroAltitude =
         data.baroSampleFresh && std::isfinite(data.altitudeFeet);
     if (!g_hasPadAltitude && hasFreshBaroAltitude && data.altitudeFeet != 0.0f) {
+        // Pad altitude must come from a fresh baro sample. Stored/default zero
+        // is not enough to define AGL.
         g_padAltitudeFeet = data.altitudeFeet;
         g_hasPadAltitude = true;
         LOG_PRINT("Pad altitude reference (ft): ");
@@ -3634,6 +3779,7 @@ void loop() {
 
     float altitudeAglFeet = 0.0f;
     if (g_hasPadAltitude && hasFreshBaroAltitude) {
+        // AGL is only valid on loops with fresh barometer data.
         altitudeAglFeet = data.altitudeFeet - g_padAltitudeFeet;
         if (altitudeAglFeet < 0.0f) {
             altitudeAglFeet = 0.0f;
@@ -3644,6 +3790,11 @@ void loop() {
 
     const bool baroTransientActive =
         g_flapActuator.IsSettling() || (nowMs < g_altimeterTransientUntilMs);
+    /*
+     * Moving flaps can disturb pressure around the static port. Rather than
+     * throwing baro away completely, temporarily widen the innovation gate and
+     * scale its sigma so the filter treats those samples as weaker evidence.
+     */
     data.altimeterGateSigma = baroTransientActive
         ? settings::actuation::kBaroInnovationGateSigmaTransient
         : settings::actuation::kBaroInnovationGateSigmaNominal;
@@ -3681,6 +3832,7 @@ void loop() {
         }
         if (!forceOvershootActuation &&
             ShouldLatchAutoActuationSafety(state, flightStatus, hasBaroAgl, altitudeAglMeters)) {
+            // Safety latch persists until the next Ground phase.
             g_autoActuationSafetyLatched = true;
         }
 
@@ -3696,9 +3848,16 @@ void loop() {
         }
         const bool firstMotionRequested =
             autoCommandDeg > settings::actuation::kServoSettlingAngleEpsilonDeg;
+        /*
+         * The first-motion block and safety latch command zero before the actuator
+         * update. That means retraction, rate limits, and settling flags are all
+         * handled by one path instead of hidden special-case servo writes.
+         */
         if (!forceOvershootActuation &&
             firstMotionRequested &&
             ShouldBlockFirstAutoActuationMotion(state, flightStatus, hasBaroAgl, altitudeAglMeters)) {
+            // Block the first automatic movement cleanly by commanding zero
+            // through the same actuator update path as normal control.
             autoCommandDeg = 0.0f;
             g_actuationLastCommandDeg = 0.0f;
             g_actuationHasLastControlUpdate = false;
@@ -3720,6 +3879,7 @@ void loop() {
     UpdateMaxTiming(micros() - actuationPredictorStartUs, g_timingStats.maxActuationPredictorUs);
     float commandedActuationDeg = 0.0f;
     if (forceOvershootActuation) {
+        // Overshoot bypasses normal optimization and commands maximum drag.
         commandedActuationDeg = kServoMaxActuationDeg;
     } else if (manualOverrideActive) {
         commandedActuationDeg = manualOverrideDeg;

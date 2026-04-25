@@ -8,6 +8,17 @@
 
 namespace {
 
+/*
+ * Runtime settings are split into two roles:
+ *
+ *   - flashed defaults are the source of truth at boot,
+ *   - the SD text file is a mirror/status record and can store applied
+ *     ground-station edits after validation.
+ *
+ * This avoids the risky launch-day failure where a stale card file silently
+ * overrides the firmware values the operator just flashed.
+ */
+
 constexpr const char *kRuntimeSettingsPath = "ACSCFG.TXT";
 
 bool PositiveFinite(double value) {
@@ -19,6 +30,8 @@ bool InClosedRange(double value, double minValue, double maxValue) {
 }
 
 bool RuntimeSettingsFilePresent() {
+    // The file is only a mirror/status artifact at boot.  Flashed constants still
+    // win so an old SD card cannot silently override the firmware configuration.
     FsFile file;
     if (!DataLoggerOpenReadFile(kRuntimeSettingsPath, file)) {
         return false;
@@ -32,6 +45,8 @@ bool BuildFileContents(const RuntimeSettings &settings, char *buffer, size_t buf
         return false;
     }
 
+    // Write a human-readable key/value file so launch-day changes can be inspected
+    // on the SD card without a custom decoder.
     const int written = snprintf(
         buffer,
         bufferSize,
@@ -64,6 +79,8 @@ bool BuildFileContents(const RuntimeSettings &settings, char *buffer, size_t buf
 }  // namespace
 
 RuntimeSettings RuntimeSettingsDefaults() {
+    // Start from compile-time constants.  These are the values that were flashed
+    // with the firmware and therefore have priority over any stored file.
     RuntimeSettings settings;
     settings.environment = EnvironmentModel::Config{};
     settings.vehicle.centerOfPressureOffsetMeters = settings::vehicle::kCenterOfPressureOffsetMeters;
@@ -75,6 +92,8 @@ RuntimeSettings RuntimeSettingsDefaults() {
 bool RuntimeSettingsValidate(const RuntimeSettings &settings) {
     const EnvironmentModel::Config &environment = settings.environment;
     const ApogeeVehicleParameters &vehicle = settings.vehicle;
+    // Keep ground-station edits inside physically plausible ranges before they can
+    // affect the apogee model or be written back to storage.
     return InClosedRange(environment.groundTemperatureF, -100.0, 150.0) &&
            InClosedRange(environment.seaLevelPressureHpa, 800.0, 1100.0) &&
            InClosedRange(environment.windSpeedMph, 0.0, 200.0) &&
@@ -94,6 +113,8 @@ bool RuntimeSettingsUseFlashedDefaults(RuntimeSettings &settings, RuntimeSetting
     status.usingDefaults = true;
 
     if (!DataLoggerIsInitialized()) {
+        // Flight can still use flashed defaults without SD.  The false return only
+        // tells callers that the mirror file could not be updated.
         return false;
     }
 
@@ -105,6 +126,8 @@ bool RuntimeSettingsUseFlashedDefaults(RuntimeSettings &settings, RuntimeSetting
         return false;
     }
 
+    // Mirror the flashed defaults to the card every boot.  This makes the file a
+    // record of what is active, not a source that overrides firmware at startup.
     status.lastSaveSucceeded = DataLoggerWriteTextFile(kRuntimeSettingsPath, buffer);
     status.createdDefaultFile = !filePresent && status.lastSaveSucceeded;
     status.filePresent = filePresent || status.lastSaveSucceeded;
@@ -128,6 +151,8 @@ bool RuntimeSettingsSave(const RuntimeSettings &settings, RuntimeSettingsStorage
         return false;
     }
 
+    // Ground-station commands can update the active settings after validation.
+    // Saving here records those active values for review and telemetry status.
     status.storageAvailable = true;
     status.filePresent = true;
     status.usingDefaults = false;

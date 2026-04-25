@@ -23,6 +23,7 @@ bool g_blinkPhaseOn = false;
 Rgb g_lastApplied{0, 0, 0};
 
 Rgb ColorForFlightStatus(FlightStatus status) {
+    // Normal flight colors are steady and map directly to the phase state machine.
     switch (status) {
         case FlightStatus::Ground:
             return {settings::status_leds::kGroundR,
@@ -47,6 +48,8 @@ Rgb ColorForFlightStatus(FlightStatus status) {
 }
 
 Rgb ComputeTargetColor() {
+    // Status priority is intentional: faults hide all other states, then comms and
+    // manual override alerts, then the steady flight-phase color.
     if (g_faultActive) {
         return g_blinkPhaseOn ? Rgb{settings::status_leds::kFaultR,
                                     settings::status_leds::kFaultG,
@@ -99,6 +102,8 @@ void StatusLedsService(uint32_t nowMs) {
         return;
     }
     g_lastUpdateMs = nowMs;
+    // Blink states are generated here so callers only publish current status; they
+    // do not need their own LED timers.
     g_blinkPhaseOn = !g_blinkPhaseOn;
 
     const Rgb target = ComputeTargetColor();
@@ -106,6 +111,7 @@ void StatusLedsService(uint32_t nowMs) {
         return;
     }
 
+    // Avoid rewriting the AirLift LED when the color has not changed.
     WiFi.setLEDs(target.r, target.g, target.b);
     g_lastApplied = target;
 }

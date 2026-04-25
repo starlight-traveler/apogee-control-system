@@ -14,6 +14,19 @@
 
 namespace {
 
+/*
+ * BNO085 rail overview:
+ *
+ * The BNO085 is a fused-attitude sensor: the chip itself produces quaternion,
+ * accel, gyro, gravity, and mag reports. Those reports are asynchronous, so this
+ * driver treats "the sensor talked" and "this specific signal is fresh" as
+ * separate facts.
+ *
+ * In this firmware the BNO is useful as an independent attitude reference and
+ * diagnostics rail. It should not silently overwrite the selected fast IMU rail
+ * unless freshness and agreement checks say it is actually a good reference.
+ */
+
 constexpr bool kBnoEnabled = settings::sensors::bno::kEnabled;
 constexpr uint8_t kBnoI2cAddress = settings::sensors::bno085::kI2cAddress;
 constexpr uint32_t kBnoI2cClockHz = settings::sensors::bno085::kI2cClockHz;
@@ -25,6 +38,9 @@ constexpr uint32_t kFreshSignalMaxAgeUs = settings::sensors::icm20948::crosschec
 
 BNO08x g_bno;
 
+// The BNO085 emits accel, gyro, mag, and quaternion reports independently.  Keep a
+// timestamp for each signal so the rest of the flight code can reject stale parts
+// of an otherwise recently-read packet.
 volatile bool g_intFlag = false;
 bool g_initialized = false;
 bool g_haveAccel = false;
@@ -49,6 +65,8 @@ float g_lastMagnetometer[3] = {0.0f, 0.0f, 0.0f};
 uint8_t g_invalidQuaternionStreak = 0;
 
 void ImuIntISR() {
+    // The ISR only records that data is waiting.  I2C reads stay in the main loop
+    // where they can run without interrupt-time timing hazards.
     g_intFlag = true;
 }
 
@@ -87,6 +105,8 @@ void ResetCachedState() {
 }
 
 bool SignalFresh(uint32_t nowUs, uint32_t lastUpdateUs) {
+    // Freshness is checked per signal, not per sensor, because a quaternion can be
+    // current while accel or gyro is already too old to trust.
     return lastUpdateUs > 0 && (nowUs - lastUpdateUs) <= kFreshSignalMaxAgeUs;
 }
 
@@ -106,6 +126,9 @@ bool Normalize3(float &x, float &y, float &z) {
     if (magSq <= 1.0e-18f) {
         return false;
     }
+    // Scale the vector to unit length while keeping its direction.  Unit vectors
+    // make the later basis/quaternion math depend on direction only, not sensor
+    // magnitude.
     const float inv = math_utils::FastInvSqrt(magSq);
     x *= inv;
     y *= inv;
@@ -123,6 +146,9 @@ bool QuaternionFromEarthBasisInBody(const float northBody[3],
                                     const float eastBody[3],
                                     const float upBody[3],
                                     float quaternion[4]) {
+    // The columns describe earth north/east/up as seen in body coordinates.  This
+    // is a rotation matrix, so convert it to a normalized quaternion for the rest
+    // of the attitude pipeline.
     const float r00 = northBody[0];
     const float r01 = eastBody[0];
     const float r02 = upBody[0];
@@ -194,6 +220,8 @@ bool QuaternionFromAccelMag(const float accelBody[3], const float magBody[3], fl
     }
 
     float eastBody[3] = {0.0f, 0.0f, 0.0f};
+    // Gravity gives "up"; the magnetometer gives a rough horizontal reference.
+    // Their cross product builds east, and east x up gives north.
     Cross3(upBody[0], upBody[1], upBody[2], magneticBody[0], magneticBody[1], magneticBody[2], eastBody);
     if (!Normalize3(eastBody[0], eastBody[1], eastBody[2])) {
         return false;
@@ -210,6 +238,8 @@ bool QuaternionFromAccelMag(const float accelBody[3], const float magBody[3], fl
 
 void UpdateQuaternion(float real, float i, float j, float k) {
     float adjusted[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+    // Convert the BNO chip frame into the rocket body frame before validating or
+    // publishing the attitude.
     bno085_orientation::AdjustQuaternion(real, i, j, k, adjusted);
     if (math_utils::ValidateQuaternionArray(adjusted)) {
         for (int axis = 0; axis < 4; ++axis) {
@@ -224,6 +254,8 @@ void UpdateQuaternion(float real, float i, float j, float k) {
     if (g_haveQuaternion && g_invalidQuaternionStreak < 0xff) {
         ++g_invalidQuaternionStreak;
     }
+    // Drop attitude only after repeated invalid reports so a single bad packet
+    // does not make the selected attitude source flicker.
     if (!g_haveQuaternion || g_invalidQuaternionStreak >= kQuaternionInvalidDropThreshold) {
         g_haveQuaternion = false;
     }
@@ -232,6 +264,9 @@ void UpdateQuaternion(float real, float i, float j, float k) {
 bool ConfigureReports() {
     bool ok = true;
 
+    // Request all reports used for flight and diagnostics.  The calibrated
+    // rotation vector is preferred; game and gyro-integrated vectors are kept as
+    // fallback attitude reports during startup or calibration gaps.
     ok = g_bno.enableAccelerometer(kReportIntervalMs) && ok;
     if (!ok) {
         LOG_PRINTLN("BNO085: enableAccelerometer failed");
@@ -306,6 +341,8 @@ void PublishCachedState(SensorData &out, uint32_t nowUs) {
         out.quaternionBNO[3] = g_lastQuat[3];
         out.hasBnoQuaternion = true;
     } else {
+        // Identity plus hasBnoQuaternion=false means "no usable BNO attitude"; it
+        // is not meant to be treated as a real level attitude estimate.
         out.quaternionBNO[0] = 1.0f;
         out.quaternionBNO[1] = 0.0f;
         out.quaternionBNO[2] = 0.0f;
@@ -353,6 +390,8 @@ bool ConsumeSensorEvent() {
             g_lastGyroMicros = nowUs;
             return true;
         case SENSOR_REPORTID_UNCALIBRATED_GYRO:
+            // Use uncalibrated gyro only as a startup fallback.  Once calibrated
+            // gyro has appeared, keep it as the source for angular rates.
             if (!g_haveGyro) {
                 TransformIntoBodyFrame(g_bno.getUncalibratedGyroX(),
                                        g_bno.getUncalibratedGyroY(),
@@ -376,9 +415,12 @@ bool ConsumeSensorEvent() {
             g_lastMagnetometerMicros = nowUs;
             return true;
         case SENSOR_REPORTID_ROTATION_VECTOR:
+            // Calibrated rotation vector has the highest priority.
             UpdateQuaternion(g_bno.getQuatReal(), g_bno.getQuatI(), g_bno.getQuatJ(), g_bno.getQuatK());
             return true;
         case SENSOR_REPORTID_GAME_ROTATION_VECTOR:
+            // Game rotation vector can bridge gaps before the calibrated report
+            // becomes valid, but it should not overwrite a good calibrated source.
             if (!g_haveQuaternion) {
                 UpdateQuaternion(g_bno.getGameQuatReal(),
                                  g_bno.getGameQuatI(),
@@ -387,6 +429,8 @@ bool ConsumeSensorEvent() {
             }
             return true;
         case SENSOR_REPORTID_GYRO_INTEGRATED_ROTATION_VECTOR:
+            // Gyro-integrated attitude is the last fallback because it can drift,
+            // but it is still better than no attitude during short startup gaps.
             if (!g_haveQuaternion) {
                 UpdateQuaternion(g_bno.getGyroIntegratedRVReal(),
                                  g_bno.getGyroIntegratedRVI(),
@@ -442,6 +486,8 @@ bool Bno085SensorAcquire(SensorData &out) {
 
     if (g_bno.wasReset()) {
         LOG_PRINTLN("BNO085: sensor reset detected");
+        // A sensor reset clears the chip's report configuration, so the cached
+        // samples and report requests must be rebuilt together.
         ResetCachedState();
         ConfigureReports();
     }
@@ -455,6 +501,8 @@ bool Bno085SensorAcquire(SensorData &out) {
     interrupts();
 
     if (!shouldRead && kBnoInterruptPin >= 0 && !InterruptAsserted()) {
+        // With an interrupt pin configured, skip I2C polling until the chip says
+        // data is ready.  This keeps the loop from treating old cache as new data.
         g_lastAcquireFresh = false;
         return false;
     }
@@ -463,6 +511,7 @@ bool Bno085SensorAcquire(SensorData &out) {
     while (g_bno.getSensorEvent()) {
         consumedAny = ConsumeSensorEvent() || consumedAny;
         if (kBnoInterruptPin >= 0 && !InterruptAsserted()) {
+            // Drain the pending burst, then stop once the interrupt line releases.
             break;
         }
     }
@@ -473,6 +522,8 @@ bool Bno085SensorAcquire(SensorData &out) {
     const bool quatFresh =
         g_haveQuaternion && SignalFresh(nowUs, g_lastQuatMicros) && math_utils::ValidateQuaternionArray(g_lastQuat);
     if (!consumedAny || !(accelFresh || gyroFresh || quatFresh)) {
+        // A successful I2C transaction is not enough; at least one flight-useful
+        // signal must still be fresh after the event burst is processed.
         g_lastAcquireFresh = false;
         return false;
     }
@@ -505,6 +556,9 @@ Bno085Diagnostics Bno085SensorGetDiagnostics() {
     diagnostics.magBody[1] = g_lastMagnetometer[1];
     diagnostics.magBody[2] = g_lastMagnetometer[2];
     if (diagnostics.hasAccel && diagnostics.hasMag) {
+        // Diagnostics expose a simple accel/mag bootstrap attitude so mount and
+        // compass-frame issues can be spotted even before the fused quaternion is
+        // healthy.
         float bootstrapQuat[4] = {1.0f, 0.0f, 0.0f, 0.0f};
         if (QuaternionFromAccelMag(g_lastAccel, g_lastMagnetometer, bootstrapQuat)) {
             float yaw = 0.0f;

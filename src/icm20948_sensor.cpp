@@ -11,6 +11,20 @@
 
 namespace {
 
+/*
+ * ICM rail overview:
+ *
+ * The ICM path is a fast IMU rail. It reads raw accel/gyro/mag, calibrates them,
+ * rotates them into rocket body axes, then maintains a quaternion with gyro
+ * integration plus accel/mag correction when those references are trustworthy.
+ *
+ * Accel is useful for attitude only when it mostly represents gravity. During
+ * boost it includes thrust, so the filter suppresses accel correction. After
+ * burnout, accel can briefly help clean up gyro drift, but only inside gated
+ * trust windows. Magnetometer correction is mostly yaw guidance and is rejected
+ * when field strength or spin rate says it is likely disturbed.
+ */
+
 constexpr uint8_t kChipSelectPin = settings::sensors::icm20948::kChipSelectPin;
 constexpr int8_t kInterruptPin = settings::sensors::icm20948::kInterruptPin;
 constexpr uint32_t kSampleIntervalUs = settings::sensors::icm20948::kSampleIntervalUs;
@@ -33,6 +47,9 @@ enum class DmpReadResult : uint8_t {
 };
 
 ICM_20948_SPI g_icm;
+// Raw sensor reads, DMP quaternion reads, and the software AHRS all share this
+// cache.  The public acquire function can publish cached values between hardware
+// updates, but only fresh reads advance the filter.
 volatile bool g_dataReadyInterrupt = false;
 bool g_initialized = false;
 bool g_hasCachedSample = false;
@@ -105,6 +122,7 @@ uint8_t g_invalidQuaternionStreak = 0;
 float g_lastQuaternionOutput[4] = {1.0f, 0.0f, 0.0f, 0.0f};
 
 void DataReadyISR() {
+    // Keep the ISR minimal; SPI and DMP FIFO work happens from the normal loop.
     g_dataReadyInterrupt = true;
 }
 
@@ -116,6 +134,7 @@ bool QuaternionFromEarthBasisInBody(const float northBody[3],
                                     float quaternion[4]);
 
 void ApplyMountRotation(const float in[3], float out[3]) {
+    // Convert the chip's board frame into the rocket body frame.
     for (int row = 0; row < 3; ++row) {
         out[row] = settings::sensors::icm20948::kMountRotation[row][0] * in[0] +
                    settings::sensors::icm20948::kMountRotation[row][1] * in[1] +
@@ -131,6 +150,8 @@ bool QuaternionFromUpVector(const float upIn[3], float quaternion[4]) {
 
     float northSeed[3] = {1.0f, 0.0f, 0.0f};
     if (fabsf(upBody[0]) > 0.9f) {
+        // If up is nearly parallel to the default seed, choose another seed so
+        // the cross product still creates a stable horizontal basis.
         northSeed[0] = 0.0f;
         northSeed[1] = 1.0f;
     }
@@ -409,6 +430,8 @@ void ApplyQuaternionContinuity() {
     }
 
     if (QuaternionDot(g_q, g_lastContinuousQuaternion) < 0.0f) {
+        // q and -q are the same physical attitude.  Keep the sign continuous so
+        // logs and blending do not see an artificial jump.
         NegateQuaternion(g_q);
     }
     g_lastContinuousQuaternion[0] = g_q[0];
@@ -446,6 +469,8 @@ bool QuaternionFromEarthBasisInBody(const float northBody[3],
                                     const float eastBody[3],
                                     const float upBody[3],
                                     float quaternion[4]) {
+    // Build a quaternion from a rotation matrix whose columns are earth basis
+    // vectors expressed in body coordinates.
     const float r00 = northBody[0];
     const float r01 = eastBody[0];
     const float r02 = upBody[0];
@@ -517,6 +542,8 @@ bool QuaternionFromAccelMag(const float accelNorm[3], const float magNorm[3], fl
     }
 
     float eastBody[3] = {0.0f, 0.0f, 0.0f};
+    // Accel supplies the up direction when near 1g; mag supplies heading.  The two
+    // vectors form a full north/east/up body-frame basis.
     Cross3(upBody[0], upBody[1], upBody[2], magneticBody[0], magneticBody[1], magneticBody[2], eastBody);
     if (!Normalize3(eastBody[0], eastBody[1], eastBody[2])) {
         return false;
@@ -724,7 +751,8 @@ void GetScaledImu(float gyroRadPerSec[3],
     const float rawAy = static_cast<float>(g_icm.agmt.acc.axes.y);
     const float rawAz = static_cast<float>(g_icm.agmt.acc.axes.z);
 
-    // Binary saturation check (legacy behavior).
+    // Binary saturation marks a rail as unusable; soft trust lets the AHRS fade
+    // out corrections as the raw counts approach the rail.
     gyroSaturated = fabsf(rawGx) >= g_gyroSaturationCounts ||
                     fabsf(rawGy) >= g_gyroSaturationCounts ||
                     fabsf(rawGz) >= g_gyroSaturationCounts;
@@ -749,6 +777,8 @@ void GetScaledImu(float gyroRadPerSec[3],
                                                        g_calibrationGyroLsbPerDps);
     temperatureC = g_icm.temp();
     const float temperatureDeltaC = temperatureC - settings::sensors::icm20948::kGyroReferenceTemperatureC;
+    // Convert raw counts to rad/s, remove measured zero-rate offsets, apply the
+    // optional temperature slope, then rotate into body axes.
     gyroRadPerSec[0] = g_activeGyroRadPerSecPerLsb * (rawGx - gyroOffsetX) -
                        settings::sensors::icm20948::kGyroTempBiasSlopeRadPerSecPerC[0] * temperatureDeltaC;
     gyroRadPerSec[1] = g_activeGyroRadPerSecPerLsb * (rawGy - gyroOffsetY) -
@@ -770,6 +800,7 @@ void GetScaledImu(float gyroRadPerSec[3],
                                          g_calibrationAccelLsbPerG),
     };
     float accelCalCounts[3] = {0.0f, 0.0f, 0.0f};
+    // Accel calibration is applied in counts, then converted to g and body frame.
     Apply3x3(settings::sensors::icm20948::kAccelAinv, rawAccel, accelCalCounts);
     accelCalG[0] = accelCalCounts[0] / g_activeAccelLsbPerG;
     accelCalG[1] = accelCalCounts[1] / g_activeAccelLsbPerG;
@@ -795,6 +826,8 @@ void GetScaledImu(float gyroRadPerSec[3],
     g_lastMagPreAxis[2] = magNorm[2];
     ApplyMagAxisTransform(magNorm);
     ApplyMountRotation(magNorm);
+    // Store both magnitude and unit direction: magnitude gates magnetic trust,
+    // direction is used by the attitude correction.
     g_lastMagBody[0] = magNorm[0];
     g_lastMagBody[1] = magNorm[1];
     g_lastMagBody[2] = magNorm[2];
@@ -815,11 +848,13 @@ float ComputeAccelTrust(float accelMagnitudeG, float gyroNorm) {
             phaseTrust = 0.75f;
             break;
         case FlightStatus::Burn:
-            // During burn, accelerometer reads thrust, not gravity - no trust
+            // During burn, accelerometer reads thrust plus gravity, so it is not a
+            // clean gravity reference for tilt correction.
             return 0.0f;
         case FlightStatus::Coast:
         case FlightStatus::Overshoot:
-            // Burnout correction burst: aggressive correction right after burnout
+            // Right after burnout the accel magnitude often returns near 1g, so a
+            // short correction burst can remove gyro drift accumulated in boost.
             if (settings::ahrs::kEnableBurnoutCorrectionBurst && g_burnoutTimestampSeconds > 0.0f) {
                 const float timeSinceBurnout = g_currentTimestampSeconds - g_burnoutTimestampSeconds;
                 if (timeSinceBurnout >= 0.0f && timeSinceBurnout < settings::ahrs::kBurnoutCorrectionWindowSeconds) {
@@ -828,7 +863,8 @@ float ComputeAccelTrust(float accelMagnitudeG, float gyroNorm) {
                     break;
                 }
             }
-            // After burnout window, maintain moderate trust for ongoing correction
+            // After the burst, only trust accel when the rocket is calm enough that
+            // it still looks like gravity rather than aerodynamic motion.
             phaseTrust = settings::ahrs::kCoastAccelTrust;
             flightSuppression =
                 DescendingTrust(fabsf(accelMagnitudeG - 1.0f),
@@ -877,6 +913,8 @@ float ComputeMagTrust(float magMagnitude, float gyroNorm) {
     }
 
     if (!g_hasMagReference) {
+        // Before a local magnetic baseline exists, trust mostly depends on phase
+        // and angular rate.
         return phaseTrust * DescendingTrust(gyroNorm,
                                             settings::sensors::icm20948::kMagTrustGyroFadeStartRadPerSec,
                                             settings::sensors::icm20948::kMagTrustGyroFadeEndRadPerSec);
@@ -888,6 +926,8 @@ float ComputeMagTrust(float magMagnitude, float gyroNorm) {
 
     const float relativeError = fabsf(magMagnitude - g_magReferenceNorm) / g_magReferenceNorm;
     if (relativeError >= settings::sensors::icm20948::kMagCorrectionMaxRelativeError) {
+        // A large magnitude change usually means motor current, wiring, or nearby
+        // metal is disturbing the magnetometer.
         return 0.0f;
     }
 
@@ -949,6 +989,8 @@ void UpdateGroundAlignment(const float accelNorm[3], float accelTrust, const flo
     if (accelTrust < settings::sensors::icm20948::kGroundAlignmentAccelTrustMin ||
         magTrust < settings::sensors::icm20948::kGroundAlignmentMagTrustMin ||
         gyroNorm > settings::sensors::icm20948::kStationaryGyroMaxRadPerSec) {
+        // Restart the average if the rocket moves or the references become weak.
+        // Ground alignment should represent the still pad orientation only.
         g_groundAlignmentSampleCount = 0;
         g_groundAlignmentAccelSum[0] = 0.0f;
         g_groundAlignmentAccelSum[1] = 0.0f;
@@ -1060,6 +1102,8 @@ void LearnGyroBias(const float gyroRadPerSec[3], float accelTrust, float gyroNor
 void UpdateRailConstraintState(uint32_t nowUs) {
     if (g_flightStatus != g_lastAppliedFlightStatus) {
         if (g_flightStatus == FlightStatus::Burn && g_lastAppliedFlightStatus == FlightStatus::Ground) {
+            // During the first moments of boost the rail physically constrains
+            // attitude, so briefly bias the observer back toward pad attitude.
             g_burnStartUs = nowUs;
             g_railConstraintActive = g_hasRailReferenceQuaternion;
         } else if (g_flightStatus == FlightStatus::Ground) {
@@ -1135,7 +1179,8 @@ void AdaptiveQuaternionUpdate(const float accelNorm[3],
         const float wy = qw * qw - qx * qx + qy * qy - qz * qz;
         const float wz = 2.0f * (qy * qz + qw * qx);
 
-        // Compute errors using cross products.
+        // Cross products point along the small rotation that would move the
+        // predicted direction toward the measured direction.
         float accelError[3] = {
             accelNorm[1] * uz - accelNorm[2] * uy,
             accelNorm[2] * ux - accelNorm[0] * uz,
@@ -1163,6 +1208,8 @@ void AdaptiveQuaternionUpdate(const float accelNorm[3],
     }
 
     if (g_railConstraintActive && g_hasRailReferenceQuaternion) {
+        // Convert the difference between the current attitude and rail attitude
+        // into an angular-rate style correction.
         float conjugate[4] = {1.0f, 0.0f, 0.0f, 0.0f};
         float errorQuat[4] = {1.0f, 0.0f, 0.0f, 0.0f};
         QuaternionConjugate(g_q, conjugate);
@@ -1286,6 +1333,9 @@ bool ExtractDmpQuaternion(const icm_20948_DMP_data_t &data, float quaternion[4])
     if (q0Squared < -1.0e-3f) {
         return false;
     }
+    // The DMP packet stores x/y/z.  Recover w from unit length, then convert the
+    // DMP "up" direction through the mount rotation into the same body-frame
+    // quaternion convention used by the software AHRS.
     const float q0 = sqrtf(q0Squared > 0.0f ? q0Squared : 0.0f);
     const math_utils::Quaternion sensorQuat =
         math_utils::Normalize(math_utils::MakeQuaternion(q0, q1, q2, q3));
@@ -1440,6 +1490,8 @@ bool ConfigureDmpQuaternion() {
     }
 
     bool success = true;
+    // DMP attitude is optional.  If setup fails, the driver keeps raw accel/gyro
+    // reads alive and falls back to software fusion.
     success &= (g_icm.initializeDMP() == ICM_20948_Stat_Ok);
     if (settings::sensors::icm20948::kUseDmpQuat9) {
         success &= (g_icm.enableDMPSensor(INV_ICM20948_SENSOR_ORIENTATION) == ICM_20948_Stat_Ok);
@@ -1570,6 +1622,7 @@ bool HandleAcquireFailure(SensorData &out, uint32_t nowUs, const char *reason, b
     if (dmpFailure &&
         g_dmpQuaternionActive &&
         g_consecutiveDmpFailures >= kMaxConsecutiveDmpFailures) {
+        // DMP FIFO errors are often recoverable without a full sensor reset.
         if (ResetDmpFifoState()) {
             LOG_PRINT("ICM-20948: reset FIFO after ");
             LOG_PRINTLN(reason);
@@ -1581,6 +1634,8 @@ bool HandleAcquireFailure(SensorData &out, uint32_t nowUs, const char *reason, b
     }
 
     if (g_consecutiveReadFailures >= kMaxConsecutiveReadFailures) {
+        // Reinitialize after repeated failures, then publish cache if available so
+        // the estimator sees continuity instead of a sudden zeroed IMU sample.
         LOG_PRINT("ICM-20948: reinitializing after ");
         LOG_PRINTLN(reason);
         if (ReconfigureSensorTransport()) {

@@ -12,6 +12,16 @@
 
 namespace {
 
+/*
+ * Telemetry is intentionally "subscriber aware." A heartbeat from the ground
+ * station establishes where replies and command authorization should go. If the
+ * heartbeat expires, manual override is cleared and the system returns to the
+ * configured default telemetry target.
+ *
+ * Commands are binary packets with magic/version/size checks because UDP can
+ * deliver stale, partial, or unrelated datagrams.
+ */
+
 WiFiUDP g_udp;
 uint32_t g_lastSendMs = 0;
 uint32_t g_sequence = 0;
@@ -35,6 +45,8 @@ uint32_t g_lastSettingsSendMs = 0;
 constexpr uint32_t kSettingsIntervalMs = 1000;
 
 void UpdateSubscriberEndpoint(uint32_t nowMs, const IPAddress &remoteIp, uint16_t remotePort) {
+    // A heartbeat pins telemetry replies and command authorization to the ground
+    // station that is actively listening.
     g_hasSubscriber = true;
     g_lastSubscriberMs = nowMs;
     g_subscriberIp = remoteIp;
@@ -56,6 +68,8 @@ bool StartUdp() {
     if (g_udpStarted) {
         return true;
     }
+    // Bind once and reuse the socket for telemetry packets, command packets, and
+    // runtime-setting snapshots.
     if (!g_udp.begin(settings::network::kTelemetryUdpLocalPort)) {
         return false;
     }
@@ -103,6 +117,8 @@ bool InitWiFi() {
 
 bool WiFiConnected(uint32_t nowMs) {
     if ((nowMs - g_lastWifiStatusCheckMs) >= settings::network::kWiFiStatusCheckIntervalMs) {
+        // WiFi.status() can be relatively slow, so cache it and refresh at a fixed
+        // interval instead of querying on every flight loop pass.
         const int wifiStatus = WiFi.status();
         g_wifiConnectedCached =
             (wifiStatus == WL_CONNECTED) || (wifiStatus == WL_AP_LISTENING) || (wifiStatus == WL_AP_CONNECTED);
@@ -117,7 +133,8 @@ bool SubscriberActive(uint32_t nowMs) {
     }
     const bool active = (nowMs - g_lastSubscriberMs) <= settings::network::kSubscriberHeartbeatTimeoutMs;
     if (!active) {
-        // Force a fresh heartbeat before telemetry resumes.
+        // Force a fresh heartbeat before telemetry resumes and clear any manual
+        // override that was owned by the expired subscriber.
         g_hasSubscriber = false;
         g_subscriberIp = IPAddress();
         g_subscriberPort = settings::network::kTelemetryUdpRemotePort;
@@ -129,6 +146,8 @@ bool SubscriberActive(uint32_t nowMs) {
 
 bool CommandAuthorized(uint32_t nowMs, const IPAddress &remoteIp, uint16_t remotePort) {
     if (!settings::network::kRequireSubscriberHeartbeat) {
+        // In bench/debug mode, a valid command packet can establish the endpoint
+        // without a separate heartbeat.
         UpdateSubscriberEndpoint(nowMs, remoteIp, remotePort);
         return true;
     }
@@ -136,6 +155,8 @@ bool CommandAuthorized(uint32_t nowMs, const IPAddress &remoteIp, uint16_t remot
 }
 
 void FillPacket(const TelemetrySnapshot &snapshot, telemetry::PacketV1 &packet) {
+    // Telemetry is a compact binary snapshot.  Keep every field copy explicit so
+    // packet layout changes are easy to audit against telemetry_packet.h.
     packet.sequence = g_sequence++;
     packet.uptimeMs = millis();
     packet.flightStatus = static_cast<uint8_t>(snapshot.status);
@@ -217,6 +238,8 @@ void PollSubscriberPackets(uint32_t nowMs) {
     while (packetBytes > 0) {
         const IPAddress remoteIp = g_udp.remoteIP();
         const uint16_t remotePort = g_udp.remotePort();
+        // Packet type is identified by exact size plus magic/version fields.  That
+        // avoids accepting partial or stale UDP payloads as valid commands.
         if (packetBytes == static_cast<int>(sizeof(telemetry::HeartbeatV1))) {
             telemetry::HeartbeatV1 heartbeat{};
             const int n = g_udp.read(reinterpret_cast<uint8_t *>(&heartbeat), sizeof(heartbeat));
@@ -272,6 +295,8 @@ void PollSubscriberPackets(uint32_t nowMs) {
                 g_settingsSnapshotDirty = true;
             }
         } else {
+            // Drain unknown packets so a malformed datagram cannot block later
+            // valid control packets from being parsed.
             while (packetBytes-- > 0) {
                 g_udp.read();
             }
@@ -340,6 +365,8 @@ void NetworkTelemetryService(const TelemetrySnapshot &snapshot) {
     const IPAddress targetIp = subscriberActive ? g_subscriberIp : ConfiguredRemoteIp();
     const uint16_t targetPort = subscriberActive ? g_subscriberPort : settings::network::kTelemetryUdpRemotePort;
 
+    // Prefer the live subscriber endpoint; otherwise continue broadcasting to the
+    // configured recovery/debug address.
     if (!g_udp.beginPacket(targetIp, targetPort)) {
         return;
     }
@@ -348,6 +375,8 @@ void NetworkTelemetryService(const TelemetrySnapshot &snapshot) {
 
     if (subscriberActive &&
         (g_settingsSnapshotDirty || (now - g_lastSettingsSendMs) >= kSettingsIntervalMs)) {
+        // Runtime settings are sent less often than flight telemetry, but dirty
+        // updates go out immediately so the ground station sees command results.
         if (g_udp.beginPacket(targetIp, targetPort)) {
             g_udp.write(reinterpret_cast<const uint8_t *>(&g_settingsSnapshot), sizeof(g_settingsSnapshot));
             g_udp.endPacket();
@@ -379,6 +408,8 @@ void NetworkTelemetrySetRuntimeSettingsSnapshot(const RuntimeSettings &settings,
                                                 uint32_t settingsRevision,
                                                 uint32_t appliedRequestId,
                                                 uint8_t lastCommandResult) {
+    // Build the full settings/status packet here, then the service loop can send
+    // it without touching the runtime settings object again.
     telemetry::SettingsSnapshotV1 snapshot{};
     snapshot.settingsRevision = settingsRevision;
     snapshot.appliedRequestId = appliedRequestId;

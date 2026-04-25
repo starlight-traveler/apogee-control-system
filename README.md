@@ -122,6 +122,7 @@ Start here when changing flight behavior:
 
 Supporting docs:
 
+- [`docs/index.html`](docs/index.html): polished multi-page documentation site entry point
 - [`src/README.md`](src/README.md): pad settings and runtime configuration
 - [`include/README.md`](include/README.md): shared header policy
 - [`lib/README.md`](lib/README.md): vendored library and table policy

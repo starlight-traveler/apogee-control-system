@@ -14,6 +14,15 @@
 
 namespace {
 
+/*
+ * Logger design:
+ *
+ * Flight logging must not become the thing that breaks the flight loop. Samples
+ * are staged in RAM, flushed in chunks, and synced less frequently than writes.
+ * High-priority events can request an earlier flush, but normal telemetry logging
+ * is buffered so SD-card latency spikes do not stall sensor acquisition/control.
+ */
+
 SdFs g_sd;
 FsFile g_logFile;
 
@@ -37,6 +46,7 @@ constexpr const char *kLogPrefix = "SENS";
 constexpr const char *kLogExtension = "BIN";
 constexpr uint16_t kLogFileFormatVersion = 1;
 constexpr uint16_t kLogSchemaVersion = 12;
+// Magic bytes make it cheap for offline tooling to reject the wrong file type.
 constexpr uint8_t kLogMagic[8] = {'A', 'C', 'S', 'N', 'D', 'R', 'T', '1'};
 
 #if defined(ACS_FIRMWARE_GIT_HASH)
@@ -63,6 +73,8 @@ static_assert(std::is_trivially_copyable<EventLogRecord>::value,
 constexpr float kRadToDeg = 57.295779513082320876f;
 
 void CopyVec3(const float src[3], float dst[3]) {
+    // Keep these tiny copy helpers explicit so record-building code reads like
+    // a schema map instead of pointer arithmetic.
     dst[0] = src[0];
     dst[1] = src[1];
     dst[2] = src[2];
@@ -82,6 +94,10 @@ LoggedTelemetrySample BuildLoggedTelemetrySample(const SensorData &sensor,
     const BnoDiagnostics bnoDiagnostics = BnoSensorGetDiagnostics();
     const Wt901Diagnostics wt901Diagnostics = Wt901SensorGetDiagnostics();
     LoggedTelemetrySample sample{};
+    // Keep raw sensor rails and filtered state in the same binary record so
+    // replay can reconstruct both estimator input and estimator output.
+    // The order here intentionally mirrors LoggedTelemetrySample enough that a
+    // new field is hard to forget when the schema changes.
     sample.timestamp = sensor.timestamp;
     sample.altitudeFeet = sensor.altitudeFeet;
     CopyVec3(sensor.accelICM, sample.accelIcm);
@@ -93,6 +109,8 @@ LoggedTelemetrySample BuildLoggedTelemetrySample(const SensorData &sensor,
     CopyQuat(sensor.quaternionLSM, sample.quaternionLsm);
     sample.flapCommandDeg = flapCommandDeg;
     sample.flapEffectiveDeg = flapEffectiveDeg;
+    // Freshness/source bits are as important as the numeric values. A replay can
+    // then separate "bad number" from "old number reused for continuity."
     sample.mainQuaternionSource = sensor.mainQuaternionSource;
     sample.hasQuaternion = sensor.hasQuaternion ? 1u : 0u;
     sample.hasIcmQuaternion = sensor.hasIcmQuaternion ? 1u : 0u;
@@ -108,6 +126,8 @@ LoggedTelemetrySample BuildLoggedTelemetrySample(const SensorData &sensor,
     CopyVec3(wt901Diagnostics.yprDeg, sample.wt901YprDeg);
     CopyVec3(wt901Diagnostics.gyroBodyRadPerSec, sample.gyroWt901);
     CopyQuat(wt901Diagnostics.quaternion, sample.quaternionWt901);
+    // Optional rails stay in the log even when they are not selected for flight.
+    // That makes post-flight frame and trust analysis possible.
     sample.hasBnoQuaternion = sensor.hasBnoQuaternion ? 1u : 0u;
     sample.hasBnoYpr = bnoDiagnostics.hasQuaternion ? 1u : 0u;
     sample.hasWt901Accel = wt901Diagnostics.hasAccel ? 1u : 0u;
@@ -116,6 +136,8 @@ LoggedTelemetrySample BuildLoggedTelemetrySample(const SensorData &sensor,
     sample.hasWt901Quaternion = wt901Diagnostics.hasQuaternion ? 1u : 0u;
 
     if (state != nullptr) {
+        // State-derived values are stored in flight-friendly units for quick
+        // review, while raw sensors above remain close to driver units.
         sample.altitudeAglFeet = state->position[2] * constants::kMetersToFeet;
         sample.verticalVelocityFps = state->velocity[2] * constants::kMetersToFeet;
         sample.zenithDeg = state->zenith * kRadToDeg;
@@ -160,6 +182,8 @@ bool SyncFile() {
     if (!g_loggerInitialized || !g_syncPending) {
         return true;
     }
+    // sync() is the expensive durability step. It is measured separately from
+    // write() so SD timing issues can be diagnosed after flight.
     const uint32_t startMicros = micros();
     if (!g_logFile.sync()) {
         FailLogger();
@@ -179,9 +203,10 @@ bool SyncFile() {
 /// Telemetry writes are buffered to reduce loop latency; high-priority event
 /// records request a later sync so flight-critical control work can continue.
 bool FlushBuffer(bool requestSync) {
-    
     if (!g_loggerInitialized || g_bufferPosition == 0) {
         if (requestSync) {
+            // No bytes need writing, but caller still wants the file metadata
+            // synced once the normal sync interval allows it.
             g_syncPending = true;
             g_diagnostics.syncPending = true;
         }
@@ -189,6 +214,8 @@ bool FlushBuffer(bool requestSync) {
     }
 
     const uint32_t startMicros = micros();
+    // One contiguous write is preferred over many small writes because SD cards
+    // can have large per-write latency variance.
     const size_t bytesWritten = g_logFile.write(g_buffer, g_bufferPosition);
     if (bytesWritten != g_bufferPosition) {
         FailLogger();
@@ -217,15 +244,19 @@ bool AppendRecord(const void *record, size_t size, bool highPriority) {
     }
 
     if (size > kBufferSize) {
+        // A single record bigger than the buffer would make the buffering model
+        // invalid. Treat that as a hard append failure.
         return false;
     }
 
     if (g_bufferPosition + size > kBufferSize) {
         if (!highPriority) {
+            // Telemetry can be dropped under SD backpressure; event records below cannot.
             ++g_diagnostics.droppedTelemetryRecords;
             return true;
         }
         if (!FlushBuffer(false)) {
+            // High-priority records get one attempt to clear space immediately.
             ++g_diagnostics.appendFailures;
             return false;
         }
@@ -239,6 +270,8 @@ bool AppendRecord(const void *record, size_t size, bool highPriority) {
 
 /// Finds the next sequential `SENSxxx.BIN` filename on the SD card.
 bool NextLogFilename(char *buffer, size_t length) {
+    // Use monotonically increasing filenames so a reboot never overwrites the
+    // previous flight attempt on the same card.
     for (uint16_t index = 0; index < 1000; ++index) {
         const int written = snprintf(buffer, length, "%s%03u.%s", kLogPrefix, index, kLogExtension);
         if (written <= 0 || static_cast<size_t>(written) >= length) {
@@ -255,6 +288,7 @@ bool NextLogFilename(char *buffer, size_t length) {
 /// Writes the log preamble that the native decoder validates before parsing.
 bool WriteLogPreamble() {
     LogFilePreamble preamble{};
+    // The decoder checks magic, format, and schema before trusting record sizes.
     memcpy(preamble.magic, kLogMagic, sizeof(kLogMagic));
     preamble.formatVersion = kLogFileFormatVersion;
     preamble.schemaVersion = kLogSchemaVersion;
@@ -279,6 +313,7 @@ bool DataLoggerBegin() {
     }
 
     if (!g_sd.begin(SdioConfig(FIFO_SDIO))) {
+        // Without SD, flight can still run, but replay/logging will be absent.
         LOG_PRINTLN("SD card initialization failed.");
         return false;
     }
@@ -296,6 +331,7 @@ bool DataLoggerBegin() {
     }
 
     if (kPreallocateBytes > 0 && !g_logFile.preAllocate(kPreallocateBytes)) {
+        // Preallocation is a latency optimization. Failure should not prevent logging.
         LOG_PRINTLN("SD preallocation skipped.");
     }
 
@@ -312,6 +348,8 @@ bool DataLoggerBegin() {
     g_highPriorityFlushPending = false;
     g_diagnostics = DataLoggerDiagnostics{};
 
+    // Mark initialized only after the preamble is durable and internal state has
+    // been reset. Callers can then treat this as ready-to-append.
     g_loggerInitialized = true;
     g_diagnostics.initialized = true;
     LOG_PRINT("Logging sensor data to ");
@@ -330,6 +368,8 @@ void DataLoggerLogTelemetry(const SensorData &sensor,
     }
 
     TelemetryLogRecord record{};
+    // Status is stored in subtype for dense telemetry so event and telemetry
+    // records can share the same compact header.
     record.header.recordType = static_cast<uint8_t>(LogRecordType::Telemetry);
     record.header.subtype = static_cast<uint8_t>(status);
     record.header.flags = state != nullptr ? 1 : 0;
@@ -354,6 +394,8 @@ void DataLoggerLogEvent(FlightEventType type,
     }
 
     EventLogRecord record{};
+    // Events are sparse timeline markers. The status is packed into flags so
+    // subtype remains the event kind.
     record.header.recordType = static_cast<uint8_t>(LogRecordType::Event);
     record.header.subtype = static_cast<uint8_t>(type);
     record.header.flags = static_cast<uint8_t>(status);
@@ -368,6 +410,7 @@ void DataLoggerLogEvent(FlightEventType type,
         LOG_PRINTLN("Failed to append event record to log.");
         return;
     }
+    // Events mark important timeline edges, so request a flush/sync soon after.
     g_highPriorityFlushPending = true;
     g_syncPending = true;
     g_diagnostics.syncPending = true;
@@ -379,6 +422,8 @@ void DataLoggerForceSync() {
         return;
     }
     if (g_bufferPosition > 0 && !FlushBuffer(true)) {
+        // Force sync is normally used before shutdown/recovery operations, so
+        // report failures loudly on serial.
         LOG_PRINTLN("Failed to flush sensor log buffer before sync.");
         return;
     }
@@ -403,6 +448,8 @@ void DataLoggerService() {
     const bool preferredBatchReady = g_bufferPosition >= kMinFlushBytes;
     const bool flushIntervalExpired = sinceLastFlush >= kFlushIntervalMicros;
     const bool hardFlushExpired = sinceLastFlush >= kHardFlushIntervalMicros;
+    // Flush on full buffer, high-priority event, long delay, or a preferred
+    // batch size. This keeps normal loop latency lower than syncing every row.
     if (g_bufferPosition > 0 &&
         (bufferFull || g_highPriorityFlushPending || hardFlushExpired ||
          (flushIntervalExpired && preferredBatchReady))) {
@@ -452,11 +499,14 @@ bool DataLoggerReadTextFile(const char *path, bool (*lineCallback)(const char *l
         }
         const char ch = static_cast<char>(value);
         if (ch == '\r') {
+            // Accept CRLF files created on Windows machines.
             continue;
         }
         if (ch == '\n') {
             if (length > 0) {
                 line[length] = '\0';
+                // Lines longer than the fixed buffer are truncated by design;
+                // CFD/settings files should stay simple one-row text records.
                 lineCallback(line, context);
                 length = 0;
             }
@@ -488,6 +538,8 @@ bool DataLoggerWriteTextFile(const char *path, const char *contents) {
     }
 
     const size_t length = strlen(contents);
+    // Text settings/CFD helper files are written whole-file to avoid partial
+    // line updates.
     const size_t bytesWritten = file.write(contents, length);
     if (bytesWritten != length) {
         file.close();
@@ -531,6 +583,8 @@ bool DataLoggerReadLine(FsFile &file, char *line, size_t lineSize) {
             if (sawData) {
                 break;
             }
+            // Skip leading blank lines so simple text parsers do not need to
+            // handle empty rows themselves.
             continue;
         }
         sawData = true;

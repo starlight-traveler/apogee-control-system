@@ -4,7 +4,20 @@
 
 namespace imu_orientation {
 
-// Shared sensor-to-body orientation parameters for all IMU rails.
+/*
+ * Shared sensor-to-body orientation parameters for all IMU rails.
+ *
+ * Every sensor has its own chip coordinate frame and board mounting. The flight
+ * code wants one rocket body frame:
+ *
+ *   +X: rocket-forward / along the airframe reference axis used by the estimator
+ *   +Y: lateral body axis
+ *   +Z: body-up axis for the mounted avionics stack
+ *
+ * Keeping these transforms centralized makes it easier to compare rails. If two
+ * sensors disagree after these matrices, the disagreement is more likely sensor
+ * quality/calibration than a hidden axis convention mismatch.
+ */
 
 // BNO055/BNO085 mounting:
 // body +X = sensor -X

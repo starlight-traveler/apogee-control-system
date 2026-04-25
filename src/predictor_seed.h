@@ -6,6 +6,13 @@
 #include "math_utils.h"
 #include "settings.h"
 
+/*
+ * Predictor seed helpers are intentionally conservative. The full estimator may
+ * know more than the predictor should use. For example, horizontal velocity has
+ * no direct measurement, so it is bounded and decayed rather than allowed to run
+ * as a free inertial navigation solution.
+ */
+
 /// Predictor-only horizontal velocity state.
 ///
 /// The estimator intentionally does not publish integrated XY state because it
@@ -36,12 +43,15 @@ enum PredictorSeedConfidenceFlag : uint32_t {
 };
 
 inline bool PredictorFlagsHasCfdClamp(uint32_t flags) {
+    // CFD clamp flags mean the predictor had to use table-edge aero data.
     return (flags & (kPredictorSeedFlagCfdAcsClamped |
                      kPredictorSeedFlagCfdAtkClamped |
                      kPredictorSeedFlagCfdMachClamped)) != 0u;
 }
 
 inline bool PredictorFlagsHasModelInvalidity(uint32_t flags) {
+    // These flags do not necessarily make telemetry useless, but they should
+    // prevent actuation from trusting the prediction as a control-quality result.
     return PredictorFlagsHasCfdClamp(flags) || (flags & kPredictorSeedFlagPredictionStepLimit) != 0u;
 }
 
@@ -134,6 +144,11 @@ inline double ComputePredictorAngularRate(double currentZenithRadians,
 /// This prevents a noisy tilt estimate from exploding the horizontal seed speed
 /// and causing excessive drag prediction.
 inline double PredictorHorizontalSpeedCap(double verticalVelocityMps, double zenithRadians) {
+    /*
+     * A tilt-derived horizontal speed can explode when attitude is noisy. This cap
+     * says horizontal speed should be broadly compatible with vertical speed and
+     * bounded tilt, plus a small margin for real non-vertical motion.
+     */
     const double effectiveZenith =
         std::min(std::fabs(zenithRadians),
                  static_cast<double>(settings::flight::kPredictorMaxSeedZenithDeg) * 0.017453292519943295);
@@ -185,6 +200,8 @@ inline double UpdatePredictorHorizontalSpeed(PredictorHorizontalVelocityTracker 
     const double decay = (decayTau > 0.0) ? std::exp(-clampedDt / decayTau) : 0.0;
 
     if (allowIntegration && verticalVelocityMps > 0.0) {
+        // Only integrate horizontal acceleration while ascending and while the
+        // caller says accel/attitude are fresh enough to matter.
         tracker.vx = (tracker.vx + ax * clampedDt) * decay;
         tracker.vy = (tracker.vy + ay * clampedDt) * decay;
     } else {

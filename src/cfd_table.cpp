@@ -13,6 +13,17 @@
 
 namespace {
 
+/*
+ * The CFD CSV is stored as sparse rows:
+ *
+ *   ACS angle, angle of attack, Mach, axial force, normal force
+ *
+ * The predictor wants dense 3D arrays for fast trilinear interpolation. Loading
+ * therefore happens in two passes: collect sorted axes first, then fill every
+ * cell. Missing cells are rejected because one NaN in the table can poison the
+ * apogee integration.
+ */
+
 struct AxisAccumulator {
     std::vector<double> acs;
     std::vector<double> atk;
@@ -34,6 +45,7 @@ bool ParseRow(const char *line, double *out, int count) {
     }
     const char *ptr = line;
     for (int i = 0; i < count; ++i) {
+        // strtod advances `end`; if it does not move, this column is not numeric.
         char *end = nullptr;
         const double value = strtod(ptr, &end);
         if (end == ptr) {
@@ -54,6 +66,8 @@ bool CollectAxisLine(const char *line, void *context) {
     if (!ParseRow(line, values, 5)) {
         return true;
     }
+    // First pass only collects axis values. The dense table cannot be sized
+    // until we know every unique ACS, AoA, and Mach coordinate in the file.
     acc->acs.push_back(values[0]);
     acc->atk.push_back(values[1]);
     acc->mach.push_back(values[2]);
@@ -63,6 +77,8 @@ bool CollectAxisLine(const char *line, void *context) {
 
 void SortUnique(std::vector<double> &values) {
     std::sort(values.begin(), values.end());
+    // CFD rows may arrive in any order; sorted unique axes are what the
+    // predictor interpolation code expects.
     values.erase(std::unique(values.begin(), values.end()), values.end());
 }
 
@@ -92,9 +108,12 @@ bool FillTableLine(const char *line, void *context) {
     const int j = FindIndex(ctx->storage->atk, values[1]);
     const int k = FindIndex(ctx->storage->mach, values[2]);
     if (i < 0 || j < 0 || k < 0) {
+        // This should not happen after the axis pass; count it so the table is
+        // rejected instead of silently leaving a hole.
         ctx->missing++;
         return true;
     }
+    // Flatten (acs, atk, mach) into one contiguous vector used by the predictor.
     const int index = (i * ctx->atkCount + j) * ctx->machCount + k;
     ctx->storage->axial[index] = values[3];
     ctx->storage->normal[index] = values[4];
@@ -140,6 +159,8 @@ bool CfdTableLoadFromSd(const char *path, CfdTableStorage *storage) {
     tableStorage.axial.assign(total, NAN);
     tableStorage.normal.assign(total, NAN);
 
+    // Second pass fills the dense force grid. Starting with NaN makes missing
+    // cells easy to detect after loading.
     FillContext fill;
     fill.storage = &tableStorage;
     fill.acsCount = acsCount;
@@ -160,12 +181,16 @@ bool CfdTableLoadFromSd(const char *path, CfdTableStorage *storage) {
         }
     }
     if (invalidCells > 0) {
+        // A single NaN can poison interpolation and produce a bad apogee
+        // estimate, so the whole table is refused if any cell is incomplete.
         LOG_PRINT("CFD table missing/invalid entries: ");
         LOG_PRINTLN(invalidCells);
         storage->loaded = false;
         return false;
     }
 
+    // The vectors are static so the predictor can safely hold raw pointers
+    // after this loader returns.
     storage->table.acsAnglesDeg = tableStorage.acs.data();
     storage->table.atkAnglesDeg = tableStorage.atk.data();
     storage->table.machNumbers = tableStorage.mach.data();

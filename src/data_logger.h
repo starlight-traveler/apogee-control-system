@@ -6,6 +6,14 @@
 
 #include "flight_computer.h"
 
+/*
+ * Binary log schema notes:
+ *
+ * These structs are written directly to the SD card, so field order, size, and
+ * default meaning are part of the replay contract. Add new fields only at the
+ * end of a record, bump the schema version when the decoder needs to know, and
+ * keep comments close to fields that are easy to misinterpret during analysis.
+ */
 /// Binary log record type stored in the SD-card sensor log.
 enum class LogRecordType : uint8_t { Telemetry = 0, Event = 1 };
 
@@ -18,8 +26,11 @@ enum class FlightEventType : uint8_t {
 
 /// Common 4-byte header that prefixes every binary log record.
 struct LogRecordHeader {
+    // Lets the decoder choose between dense telemetry and sparse event payloads.
     uint8_t recordType = 0;
+    // Event records use this for FlightEventType; telemetry records leave it zero.
     uint8_t subtype = 0;
+    // Reserved for per-record validity bits without changing the record shape.
     uint8_t flags = 0;
     uint8_t reserved = 0;
 };
@@ -31,24 +42,31 @@ struct LogRecordHeader {
 /// replay and post-flight diagnosis.
 struct LoggedTelemetrySample {
     float timestamp = 0.0f;
+    // Barometer altitude in feet, matching the onboard pressure conversion.
     float altitudeFeet = 0.0f;
+    // Raw rail-specific IMU data are kept so replay can test alternate selectors.
     float accelIcm[3] = {0.0f, 0.0f, 0.0f};
     float gyroIcm[3] = {0.0f, 0.0f, 0.0f};
+    // Main quaternion is the selected/blended attitude that actually drove flight code.
     float quaternionMain[4] = {1.0f, 0.0f, 0.0f, 0.0f};
     float quaternionIcm[4] = {1.0f, 0.0f, 0.0f, 0.0f};
     float accelLsm[3] = {0.0f, 0.0f, 0.0f};
     float gyroLsm[3] = {0.0f, 0.0f, 0.0f};
     float quaternionLsm[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+    // Store both commanded and effective flap positions to separate guidance from actuator lag.
     float flapCommandDeg = 0.0f;
     float flapEffectiveDeg = 0.0f;
+    // Derived estimator channels used to reconstruct why the predictor behaved as it did.
     float altitudeAglFeet = 0.0f;
     float verticalVelocityFps = 0.0f;
     float zenithDeg = 0.0f;
     float apogeeEstimateFeet = 0.0f;
+    // Baro vertical velocity diagnostics explain when altitude corrections were trusted.
     float baroVerticalVelocityFps = 0.0f;
     float baroVerticalVelocitySigmaFps = 0.0f;
     float baroVerticalVelocityResidualFps = 0.0f;
     float zAccelSigmaScale = 1.0f;
+    // Optional auxiliary IMUs are logged even when they are not the selected attitude source.
     float accelBno[3] = {0.0f, 0.0f, 0.0f};
     float gyroBno[3] = {0.0f, 0.0f, 0.0f};
     float quaternionBno[4] = {1.0f, 0.0f, 0.0f, 0.0f};
@@ -60,6 +78,7 @@ struct LoggedTelemetrySample {
     float bnoQuaternionAgeMs = 0.0f;
     float bnoReferenceTiltErrorDeg = 0.0f;
     float bnoReferenceCorrectionApplied = 0.0f;
+    // Source/freshness bits make replay robust to stale or missing sensor channels.
     uint8_t mainQuaternionSource = 0;
     uint8_t hasQuaternion = 0;
     uint8_t hasIcmQuaternion = 0;
@@ -73,12 +92,13 @@ struct LoggedTelemetrySample {
     uint8_t hasWt901Ypr = 0;
     uint8_t hasWt901Gyro = 0;
     uint8_t hasWt901Quaternion = 0;
+    // Estimator update flags show which measurement updates actually affected the state.
     uint8_t baroVerticalVelocityUpdateUsed = 0;
     uint8_t baroVerticalVelocityGuardActive = 0;
     uint8_t zAccelUpdateUsed = 0;
 };
 
-/// Telemetry payload written for each main-loop sample.
+/// Complete dense telemetry record written for each main-loop sample.
 struct TelemetryLogRecord {
     LogRecordHeader header;
     LoggedTelemetrySample sample;

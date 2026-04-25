@@ -6,6 +6,12 @@
 
 namespace {
 
+/*
+ * Thin model-selection wrapper. The rest of the flight stack talks to "BNO" as a
+ * rail, while this file chooses the concrete BNO055 or BNO085 implementation
+ * from compile-time settings.
+ */
+
 const char *ModelName(settings::sensors::bno::Model model) {
     switch (model) {
         case settings::sensors::bno::Model::Bno055:
@@ -46,6 +52,8 @@ bool BnoSensorBegin() {
     if (!settings::sensors::bno::kEnabled) {
         return false;
     }
+    // This wrapper keeps the rest of the firmware independent of whether the
+    // configured absolute-orientation source is a BNO055 or BNO085.
     switch (settings::sensors::bno::kModel) {
         case settings::sensors::bno::Model::Bno055:
             return Bno055SensorBegin();
@@ -91,6 +99,8 @@ BnoDiagnostics BnoSensorGetDiagnostics() {
         case settings::sensors::bno::Model::Bno085: {
             const Bno085Diagnostics source = Bno085SensorGetDiagnostics();
             BnoDiagnostics diagnostics;
+            // Normalize BNO085 diagnostics into the shared BNO shape used by
+            // cross-checking, telemetry, and setup logs.
             diagnostics.transportReady = source.transportReady;
             diagnostics.hasAccel = source.hasAccel;
             diagnostics.hasGyro = source.hasGyro;
@@ -120,6 +130,7 @@ BnoSample BnoSensorGetSample() {
         case settings::sensors::bno::Model::Bno085: {
             const Bno085Sample source = Bno085SensorGetSample();
             BnoSample sample;
+            // Copy the common fields so caller code does not need model-specific branches.
             sample.hasAccel = source.hasAccel;
             sample.hasGyro = source.hasGyro;
             sample.hasQuaternion = source.hasQuaternion;

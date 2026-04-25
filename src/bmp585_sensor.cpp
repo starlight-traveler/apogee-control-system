@@ -16,8 +16,18 @@
 
 namespace {
 
+/*
+ * Barometer design rule:
+ *
+ * A pressure altitude sample is either fresh or it is not. Cached altitude is
+ * useful for diagnostics/log continuity, but phase detection and actuation safety
+ * should only respond to loops where the driver actually read pressure hardware.
+ */
+
 Adafruit_BMP5xx g_pressureSensor;
 
+// The BMP585 is the primary barometer path. It is paced explicitly because the
+// estimator treats a returned sample as fresh pressure altitude.
 constexpr uint8_t kChipSelectPin = 35;
 constexpr uint32_t kSampleIntervalUs = 10000UL;
 constexpr float kMaxAltitudeRateFeetPerSecond = settings::sensors::bmp585::kMaxAltitudeRateFeetPerSecond;
@@ -61,9 +71,13 @@ bool ConfigureSensor() {
 
 /// Converts pressure to altitude in feet using the configured sea-level reference.
 float ComputeAltitudeFeet(float pressureHpa) {
+    // Barometric altitude from pressure ratio. The exponent is the standard
+    // atmosphere pressure-to-height relationship for the troposphere.
     const float32_t ratio = std::max(pressureHpa * g_seaLevelPressureInv, 1.0e-6f);
     const float32_t powTerm = static_cast<float32_t>(std::pow(static_cast<double>(ratio), 0.190294957));
 
+    // The CMSIS calls below are simple arithmetic in vector form. They are kept
+    // here because this path runs often and the Teensy has optimized ARM math.
     float32_t buffer[1] = {powTerm};
     arm_offset_f32(buffer, -1.0f, buffer, 1);
     arm_negate_f32(buffer, buffer, 1);
@@ -109,6 +123,8 @@ bool IsAltitudeSpike(float candidateAltitudeFeet, float timestampSeconds) {
     }
     const float allowedJumpFeet = std::max(kMinSpikeJumpFeet, kMaxAltitudeRateFeetPerSecond * dt);
     const float jumpFeet = std::fabs(candidateAltitudeFeet - g_lastAltitudeFeet);
+    // Allow bigger jumps as time since the last accepted sample grows, but
+    // reject single pressure glitches that would imply impossible vertical speed.
     return jumpFeet > allowedJumpFeet;
 }
 
@@ -160,6 +176,8 @@ bool Bmp585SensorAcquire(SensorData &out) {
 
     const uint32_t nowMicros = micros();
     if (g_lastReadMicros != 0 && static_cast<uint32_t>(nowMicros - g_lastReadMicros) < kSampleIntervalUs) {
+        // Return false rather than reusing the cache so callers can tell this
+        // loop did not have a fresh barometer measurement.
         return false;
     }
     g_lastReadMicros = nowMicros;
@@ -178,6 +196,8 @@ bool Bmp585SensorAcquire(SensorData &out) {
     const float timestampSeconds = static_cast<float>(micros()) * 1.0e-6f;
     const float altitudeFeet = ComputeAltitudeFeet(pressureHpa);
     if (IsAltitudeSpike(altitudeFeet, timestampSeconds)) {
+        // Keep the previous cached altitude available for logging, but do not
+        // mark this acquisition fresh.
         out.altitudeFeet = g_lastAltitudeFeet;
         if (out.timestamp == 0.0f && g_lastTimestamp > 0.0f) {
             out.timestamp = g_lastTimestamp;
@@ -216,12 +236,19 @@ BarometerDiagnostics Bmp585SensorGetDiagnostics() {
 }
 
 void Bmp585SensorSetSeaLevelPressureHpa(float pressureHpa) {
+    /*
+     * Changing sea-level pressure changes the altitude frame but not the measured
+     * pressure. Reprojecting the cached pressure keeps telemetry consistent with
+     * the currently active runtime setting.
+     */
     if (!(pressureHpa > 0.0f) || !isfinite(pressureHpa)) {
         return;
     }
     g_seaLevelPressureHpa = pressureHpa;
     g_seaLevelPressureInv = 1.0f / pressureHpa;
     if (g_lastPressureHpa > 0.0f) {
+        // Recompute cached altitude so telemetry does not keep the old pressure
+        // reference after runtime settings change.
         g_lastAltitudeFeet = ComputeAltitudeFeet(g_lastPressureHpa);
     }
 }

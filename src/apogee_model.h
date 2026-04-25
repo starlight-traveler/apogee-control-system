@@ -9,6 +9,20 @@
 #include "predictor_seed.h"
 #include "settings.h"
 
+/*
+ * Apogee predictor mental model:
+ *
+ * The flight computer estimates "where the rocket is right now."  This class
+ * answers "if the rocket coasted from that state with this flap command, where
+ * would vertical velocity reach zero?"
+ *
+ * The model is intentionally coast-only. It integrates gravity, wind-relative
+ * aerodynamic force, simple pitch dynamics, and servo lag. It does not model
+ * motor thrust or changing mass during burn, so predictions during Burn are
+ * useful mainly for telemetry and should not be treated as final coast truth
+ * until burnout/holdoff gates have passed.
+ */
+
 /// Vehicle properties consumed by the runtime apogee predictor.
 ///
 /// These values are treated as constant over a single flight and are cached
@@ -16,8 +30,12 @@
 /// repeated divisions inside the hot path.
 
 struct ApogeeVehicleParameters {
+    // Distance from center of gravity to center of pressure. This turns normal
+    // aerodynamic force into pitch moment.
     double centerOfPressureOffsetMeters = 0.0;  // cp_cg in Python (m)
+    // Longitudinal pitch inertia used by the one-axis attitude model.
     double momentOfInertia = 1.0;               // kg*m^2
+    // Coast mass. The predictor assumes burn is over and mass is constant.
     double dryMass = 1.0;                       // kg
 };
 
@@ -48,7 +66,8 @@ struct MachDependentDragScale {
         if (binCount <= 1 || !std::isfinite(mach)) {
             return scales[0];
         }
-        // Find bracketing bins
+        // Find the two Mach bins around the current speed, then blend between
+        // their learned drag scales instead of jumping at a bin edge.
         int lowerIdx = 0;
         for (int i = 0; i < binCount - 1; ++i) {
             if (mach >= settings::predictor::kMachBinEdges[i]) {
@@ -59,7 +78,7 @@ struct MachDependentDragScale {
         if (lowerIdx == upperIdx) {
             return scales[lowerIdx];
         }
-        // Linear interpolation between bins
+        // Linear interpolation makes the scale change smoothly as Mach changes.
         const float lowerMach = settings::predictor::kMachBinEdges[lowerIdx];
         const float upperMach = settings::predictor::kMachBinEdges[upperIdx];
         const float denom = upperMach - lowerMach;
@@ -71,8 +90,9 @@ struct MachDependentDragScale {
     }
 
     /// Updates neighboring bins with distance-weighted contributions.
-    /// This ensures smooth learning across Mach transitions by updating both
-    /// bracketing bins proportionally to their interpolation weights.
+    ///
+    /// The residual belongs mostly to the closest Mach bin, but the adjacent
+    /// bin is updated a little too. That keeps the learned drag curve smooth.
     void AdaptScale(float mach, float targetScale, float alpha) {
         if (!std::isfinite(targetScale)) {
             return;
@@ -93,7 +113,8 @@ struct MachDependentDragScale {
             return;
         }
 
-        // Find bracketing bins (same logic as InterpolateScale)
+        // Use the same bracket as interpolation so learning and prediction see
+        // the same local drag curve.
         int lowerIdx = 0;
         for (int i = 0; i < binCount - 1; ++i) {
             if (mach >= settings::predictor::kMachBinEdges[i]) {
@@ -102,13 +123,13 @@ struct MachDependentDragScale {
         }
         int upperIdx = std::min(lowerIdx + 1, binCount - 1);
 
-        // Compute interpolation weight
+        // Compute how far this sample is between the lower and upper bins.
         const float lowerMach = settings::predictor::kMachBinEdges[lowerIdx];
         const float upperMach = settings::predictor::kMachBinEdges[upperIdx];
         const float denom = upperMach - lowerMach;
 
         if (lowerIdx == upperIdx || denom <= 0.0f) {
-            // Edge case: at or beyond bin boundaries, update single bin
+            // At or beyond the useful bin range, update only the edge bin.
             scales[lowerIdx] = std::clamp(scales[lowerIdx] + safeAlpha * (targetScale - scales[lowerIdx]),
                                           settings::predictor::kMachDragScaleMin,
                                           settings::predictor::kMachDragScaleMax);
@@ -119,7 +140,7 @@ struct MachDependentDragScale {
         const float wLower = 1.0f - t;  // Weight for lower bin
         const float wUpper = t;          // Weight for upper bin
 
-        // Update both bins proportionally to their interpolation weights
+        // Move both bins toward the target scale, weighted by proximity.
         scales[lowerIdx] = std::clamp(scales[lowerIdx] + safeAlpha * wLower * (targetScale - scales[lowerIdx]),
                                       settings::predictor::kMachDragScaleMin,
                                       settings::predictor::kMachDragScaleMax);
@@ -138,7 +159,9 @@ struct MachDependentDragScale {
 
 /// Basic result of a single apogee prediction.
 struct PredictResult {
+    // AGL altitude where modeled vertical velocity reaches zero.
     double altitude = 0.0;       // Predicted apogee altitude (meters)
+    // Integrated time from seed state until vertical velocity crosses zero.
     double timeToApogee = 0.0;   // Time to reach apogee (seconds)
 };
 
@@ -177,20 +200,30 @@ struct ApogeeForceTable {
 /// The state intentionally stays compact so the actuation optimizer can run
 /// multiple candidate predictions per control interval.
 struct ApogeeState {
+    // Vertical AGL state. This is the main quantity the controller cares about.
     double altitudeMeters = 0.0;
+    // Horizontal distance is propagated for completeness but not used by control output.
     double horizontalDistanceMeters = 0.0;
+    // Vertical velocity in the predictor's up-positive axis.
     double verticalVelocity = 0.0;
+    // Horizontal speed magnitude in the simplified 2D flight plane.
     double horizontalVelocity = 0.0;
+    // Rocket body tilt away from vertical in radians.
     double zenith = 0.0;
+    // Pitch angular rate in radians per second.
     double angularVelocity = 0.0;
+    // Modeled physical flap angle after servo lag.
     double acsAngleDeg = 0.0;
+    // Requested flap command that the physical angle is chasing.
     double acsCommandDeg = 0.0;
 };
 
 struct AirRelativeState {
+    // Air-relative velocity components in predictor axes.
     double relX = 0.0;
     double relY = 0.0;
     double relZ = 0.0;
+    // Atmosphere values at the current altitude.
     double temperatureK = 288.15;
     double densityRatio = 1.0;
     double mach = 0.0;
@@ -270,7 +303,9 @@ class ApogeePredictor {
         if (timeToApogee <= tEnd) {
             return tauLate;   // Conservative near apogee
         }
-        // Linear interpolation between early and late tau
+        // Linear interpolation between early and late tau. As apogee gets
+        // closer, adaptation slows down so late noise does not rewrite the drag
+        // model right before the decision matters most.
         const double t = (timeToApogee - tEnd) / (tStart - tEnd);
         return tauLate + t * (tauEarly - tauLate);
     }
@@ -286,11 +321,13 @@ class ApogeePredictor {
         if (std::fabs(modelAxialAccel) < minAxialAccel) {
             return;
         }
-        // Compute target scale adjustment from residual
+        // residual/model is the fractional drag miss. Positive residual means
+        // measured acceleration was larger than modeled in this axis, so the
+        // drag scale is nudged in that direction through the filtered target.
         const float currentScale = machDragScale_.InterpolateScale(static_cast<float>(mach));
         const double targetScale =
             currentScale + currentScale * (residualAccel / modelAxialAccel);
-        // Compute blend alpha from adaptive time constant
+        // Convert the time constant into a per-loop smoothing factor.
         const double tauSeconds = ComputeAdaptiveTau(timeToApogee);
         const double alpha = (dtSeconds > 0.0 && tauSeconds > 0.0)
                                  ? (1.0 - std::exp(-dtSeconds / tauSeconds))
@@ -334,6 +371,13 @@ class ApogeePredictor {
     /// configured step limit is reached. Zero-crossing refinement is used to
     /// avoid returning the overshot altitude from the final integration step.
     PredictResult PredictApogeeWithTime(const ApogeeState &initialState, IntegrationMethod method) {
+        /*
+         * The integration stops when vertical velocity crosses zero. That crossing
+         * is apogee in this reduced model because altitude is the integral of
+         * vertical velocity. The final step almost always overshoots the crossing,
+         * so the code refines inside that step instead of returning the first
+         * descending state.
+         */
         lastPredictionFlags_ = 0;
         PredictResult result;
         if (initialState.verticalVelocity <= minVerticalVelocityForPrediction_) {
@@ -361,6 +405,12 @@ class ApogeePredictor {
         if (state.verticalVelocity > 0.0 && steps >= maxIntegrationSteps_) {
             lastPredictionFlags_ |= kPredictorSeedFlagPredictionStepLimit |
                                     kPredictorSeedFlagPredictionUncertain;
+            // The integrator ran out of allowed steps while still climbing.
+            // Return a no-drag gravity continuation as a telemetry bound, but
+            // mark it uncertain so actuation code does not treat it as trusted.
+            //
+            // This value can be high because it ignores drag. That is acceptable
+            // as a conservative bound, not as a flap-control truth source.
             result.altitude = state.altitudeMeters +
                               (state.verticalVelocity * state.verticalVelocity) /
                                   (2.0 * constants::kGravity);
@@ -375,10 +425,17 @@ class ApogeePredictor {
     /// Predicts apogee with uncertainty bounds by perturbing drag only.
     /// Returns nominal prediction plus lower/upper confidence bounds.
     ApogeePredictionResult PredictApogeeWithBounds(const ApogeeState &initialState) {
+        /*
+         * Bounds are not a formal probability interval. They are a practical
+         * sensitivity test: if a small drag perturbation changes apogee a lot,
+         * then the optimizer should avoid making a high-consequence command from
+         * the nominal number alone.
+         */
         ApogeePredictionResult result;
         uint32_t aggregateFlags = 0;
 
-        // Get nominal prediction and time-to-apogee in a single integration pass
+        // Run the normal model once, then run two nearby drag cases so control
+        // can see whether the answer is tight or model-sensitive.
         const PredictResult nominalResult = PredictApogeeWithTime(initialState);
         aggregateFlags |= lastPredictionFlags_;
         result.nominal = nominalResult.altitude;
@@ -437,6 +494,8 @@ class ApogeePredictor {
         lastPredictionFlags_ = aggregateFlags;
         if ((result.upper - result.lower) >
             (2.0 * static_cast<double>(settings::actuation::kApogeeErrorDeadbandMeters))) {
+            // A wide high-drag/low-drag bracket means the flap command should
+            // be conservative even if the nominal number looks reasonable.
             lastPredictionFlags_ |= kPredictorSeedFlagPredictionUncertain;
         }
 
@@ -467,6 +526,11 @@ class ApogeePredictor {
   private:
     /// Precomputes constant factors used in aerodynamic acceleration updates.
     void UpdateCachedVehicleConstants() {
+        /*
+         * Cache reciprocals because ComputeAcceleration is called many times per
+         * control interval: every flap candidate, every RK substage, and every
+         * uncertainty bound. Avoiding repeated divisions matters on the MCU.
+         */
         invDryMass_ = (vehicle_.dryMass > 0.0) ? (1.0 / vehicle_.dryMass) : 0.0;
         invMomentOfInertia_ = (vehicle_.momentOfInertia > 0.0) ? (1.0 / vehicle_.momentOfInertia) : 0.0;
         aeroMomentScale_ = -0.2 * vehicle_.centerOfPressureOffsetMeters;
@@ -478,6 +542,9 @@ class ApogeePredictor {
         const double angleDeg = std::clamp(state.acsAngleDeg, 0.0, maxAngle);
         const double tauSeconds =
             std::max(static_cast<double>(settings::actuation::kServoLatencySeconds), 1.0e-6);
+        // Model the servo as a first-order lag toward the requested angle. This
+        // matches the actuator logger's command/effective split and keeps the
+        // predictor from assuming instant drag changes.
         return (commandDeg - angleDeg) / tauSeconds;
     }
 
@@ -515,6 +582,9 @@ class ApogeePredictor {
         if (std::isfinite(v0) && std::isfinite(v1) &&
             std::isfinite(dt) && dt > 0.0 &&
             std::fabs(denom) > 1.0e-9) {
+            // Linear interpolation in velocity gives the local time where
+            // velocity crosses zero. Then constant acceleration gives altitude
+            // at that local time.
             const double alpha = std::clamp(v0 / denom, 0.0, 1.0);
             const double localTime = alpha * dt;
             const double acceleration = (v1 - v0) / dt;
@@ -532,15 +602,19 @@ class ApogeePredictor {
         }
 
         result.altitude = std::max(ascendingState.altitudeMeters, descendingState.altitudeMeters);
+        // If the bracket is unusable, return the safer of the two altitudes and
+        // keep time at the bracket start rather than inventing a precise root.
         result.timeToApogee = bracketStartTime;
         return result;
     }
 
     /// Bracketing result for one interpolation axis in the CFD table.
     struct AxisInterp {
+        // lower/upper are neighboring grid indices; t is the [0,1] blend between them.
         int lower;
         int upper;
         double t;
+        // True when the requested value was outside the table and edge-clamped.
         bool clamped;
     };
 
@@ -556,19 +630,23 @@ class ApogeePredictor {
     /// avoid reloading the same 2x2x2 cell when a substep stays in the same
     /// CFD cell.
     struct InterpHintSet {
+        // Axis hints remember where the last lookup landed.
         AxisHint acs;
         AxisHint atk;
         AxisHint mach;
+        // Cached lower corner indices for the currently loaded CFD cell.
         int cachedAcsLower = -1;
         int cachedAtkLower = -1;
         int cachedMachLower = -1;
         bool cachedCellValid = false;
+        // Flattened 2x2x2 corner values for axial and normal force.
         double cachedAxialCorners[8] = {};
         double cachedNormalCorners[8] = {};
     };
 
     /// State derivative returned by `Evaluate`.
     struct Derivative {
+        // Time derivatives of ApogeeState in the same field order as the state.
         double altitudeRate;
         double horizontalRate;
         double verticalAcceleration;
@@ -580,8 +658,10 @@ class ApogeePredictor {
 
     /// Aerodynamic force pair returned after CFD interpolation.
     struct InterpolatedForces {
+        // Body-axis force magnitudes from the CFD table before density/drag scaling.
         double axial;
         double normal;
+        // CFD clamp flags propagated into predictor confidence flags.
         uint32_t flags = 0;
     };
 
@@ -601,8 +681,8 @@ class ApogeePredictor {
             const Derivative k1 = Evaluate(state, hints);
             const Derivative k2 = Evaluate(Apply(state, k1, halfDt), hints);
 
-            // Midpoint/RK2 keeps the candidate sweep cheap while preserving the
-            // same state model as the RK4 validation path.
+            // Midpoint/RK2 samples the derivative halfway through the step.
+            // It is cheaper than RK4 and good enough for ranking flap angles.
             ApogeeState result = state;
             result.altitudeMeters += dt * k2.altitudeRate;
             result.horizontalDistanceMeters += dt * k2.horizontalRate;
@@ -624,11 +704,16 @@ class ApogeePredictor {
 
         const double halfDt = dt * 0.5;
         const double sixthDt = dt * (1.0 / 6.0);
+        // RK4 evaluates the dynamics at the start, two midpoint estimates, and
+        // the end of the interval. The weighted average gives much better
+        // behavior when drag changes quickly with Mach/AoA.
         const Derivative k1 = Evaluate(state, hints);
         const Derivative k2 = Evaluate(Apply(state, k1, halfDt), hints);
         const Derivative k3 = Evaluate(Apply(state, k2, halfDt), hints);
         const Derivative k4 = Evaluate(Apply(state, k3, dt), hints);
 
+        // RK4 averages four slope estimates across the step. This reduces the
+        // error from rapidly changing drag and attitude without shrinking dt.
         ApogeeState result = state;
         result.altitudeMeters += sixthDt * (k1.altitudeRate + 2.0 * k2.altitudeRate + 2.0 * k3.altitudeRate + k4.altitudeRate);
         result.horizontalDistanceMeters += sixthDt * (k1.horizontalRate + 2.0 * k2.horizontalRate + 2.0 * k3.horizontalRate + k4.horizontalRate);
@@ -671,6 +756,9 @@ class ApogeePredictor {
         double low = 0.0;
         double high = dt;
         constexpr int kBisectionIterations = 10;
+        // Ten bisection iterations localize the root to about dt/1024, which is
+        // far below the model uncertainty and cheap compared with another full
+        // control sweep.
         for (int i = 0; i < kBisectionIterations; ++i) {
             const double mid = 0.5 * (low + high);
             InterpHintSet localHints;
@@ -682,8 +770,10 @@ class ApogeePredictor {
                                                            dt);
             }
             if (midState.verticalVelocity > 0.0) {
+                // Still climbing at mid-step, so apogee is later in the bracket.
                 low = mid;
             } else {
+                // Already descending at mid-step, so apogee is earlier.
                 high = mid;
             }
         }
@@ -706,6 +796,8 @@ class ApogeePredictor {
 
     /// Applies a derivative to a state for an explicit integrator substage.
     ApogeeState Apply(const ApogeeState &state, const Derivative &derivative, double dt) const {
+        // This helper constructs RK substates. It deliberately clamps flap angle
+        // after every substage because the actuator cannot move outside travel.
         ApogeeState result = state;
         result.altitudeMeters += derivative.altitudeRate * dt;
         result.horizontalDistanceMeters += derivative.horizontalRate * dt;
@@ -729,12 +821,16 @@ class ApogeePredictor {
     Derivative Evaluate(const ApogeeState &state, InterpHintSet &hints) {
         const AccelResult accel = ComputeAcceleration(state, hints);
         Derivative derivative;
+        // Kinematics: altitude derivative is vertical velocity, and velocity
+        // derivative is acceleration from gravity/aero.
         derivative.altitudeRate = state.verticalVelocity;
         derivative.horizontalRate = state.horizontalVelocity;
         derivative.verticalAcceleration = accel.linearX;
         derivative.horizontalAcceleration = accel.linearY;
         derivative.zenithRate = state.angularVelocity;
         derivative.angularAcceleration = accel.angular;
+        // The flap angle is part of the predicted state so a command change is
+        // rolled forward with servo latency instead of appearing instantly.
         derivative.flapAngleRate = ComputeActuationRate(state);
         return derivative;
     }
@@ -749,6 +845,8 @@ class ApogeePredictor {
             return result;
         }
         if (hint != nullptr && hint->valid && hint->lower >= 0 && hint->lower + 1 < count) {
+            // Consecutive RK substages usually stay in the same CFD cell or a
+            // neighboring one, so check the previous bracket before binary search.
             int low = hint->lower;
             if (value < grid[low]) {
                 while (low > 0 && value < grid[low]) {
@@ -772,10 +870,14 @@ class ApogeePredictor {
             }
         }
         if (value <= grid[0]) {
+            // Clamp below the table; caller will mark the prediction as using
+            // edge data so actuation can treat it with less confidence.
             result.lower = 0;
             result.upper = 1;
             result.clamped = value < grid[0];
         } else if (value >= grid[count - 1]) {
+            // Clamp above the table for the same reason. Extrapolating CFD force
+            // beyond sampled AoA/Mach is usually worse than an explicit clamp flag.
             result.lower = count - 2;
             result.upper = count - 1;
             result.clamped = value > grid[count - 1];
@@ -806,6 +908,7 @@ class ApogeePredictor {
 
     /// Reads a single scalar from the flattened 3D CFD table storage.
     static double SampleTable(const double *table, int atkCount, int machCount, int i, int j, int k) {
+        // Flattening order matches cfd_table.cpp: ACS major, then AoA, then Mach.
         const int index = (i * atkCount + j) * machCount + k;
         return table[index];
     }
@@ -841,6 +944,9 @@ class ApogeePredictor {
 
     /// Performs trilinear interpolation over a cached 2x2x2 cell.
     static double TrilinearFromCorners(const double *corners, double acsT, double atkT, double machT) {
+        // First interpolate along ACS at each AoA/Mach corner, then AoA, then
+        // Mach. The order is arbitrary for linear interpolation but mirrors the
+        // table layout for readability.
         const double v00 = corners[0] + (corners[1] - corners[0]) * acsT;
         const double v10 = corners[2] + (corners[3] - corners[2]) * acsT;
         const double v01 = corners[4] + (corners[5] - corners[4]) * acsT;
@@ -883,6 +989,8 @@ class ApogeePredictor {
                                   hints->cachedAtkLower == atk.lower &&
                                   hints->cachedMachLower == mch.lower;
             if (!sameCell) {
+                // Cache the eight cell corners because axial and normal force
+                // interpolation reuse the same 2x2x2 CFD cube.
                 PopulateCachedCorners(table,
                                       acs.lower,
                                       atk.lower,
@@ -912,6 +1020,17 @@ class ApogeePredictor {
 
     /// Computes linear and angular acceleration from gravity and aerodynamic loads.
     AccelResult ComputeAcceleration(const ApogeeState &state, InterpHintSet &hints) {
+        /*
+         * Coordinate convention inside the predictor:
+         *
+         *   x = vertical/up flight direction
+         *   y = horizontal cross-range direction
+         *   zenith = body tilt away from vertical in the x/y plane
+         *
+         * The CFD table gives axial and normal force magnitudes in body-related
+         * coordinates. This function rotates those forces into the predictor x/y
+         * axes, adds gravity, and converts force to acceleration with dry mass.
+         */
         const AirRelativeState air = BuildAirRelativeState(state);
         const double relX = air.relX;
         const double relY = air.relY;
@@ -946,14 +1065,22 @@ class ApogeePredictor {
 
             const InterpolatedForces forces = InterpolateForces(*table, acsDeg, atkDeg, mach, &hints);
             lastPredictionFlags_ |= forces.flags;
+            /*
+             * CFD clamping is allowed so the simulation remains finite, but the
+             * flags must follow the result. Clamped AoA/Mach/ACS means the model
+             * is using the edge of the known table, not measured force data at
+             * the actual condition.
+             */
 
-            // Apply Mach-dependent drag scale if enabled, otherwise use legacy single scale
+            // Apply Mach-dependent drag scale if enabled, otherwise use the
+            // legacy single scalar learned from coast residuals.
             double effectiveDragScale = axialDragScale_;
             if (settings::predictor::kEnableMachDependentDrag) {
                 effectiveDragScale *= machDragScale_.InterpolateScale(static_cast<float>(mach));
             }
 
-            // Apply density scaling: forces scale with density ratio
+            // CFD forces are referenced to the nominal density, so scale them
+            // by current density ratio before turning them into accelerations.
             const double axialForceMag = forces.axial * effectiveDragScale * densityRatio;
             const double normalForceMag = forces.normal * densityRatio;
 
@@ -967,11 +1094,22 @@ class ApogeePredictor {
             double axialForceY = -axialForceMag * sinZ;
             double normalForceX = -normalForceMag * sinZ;
             double normalForceY = normalForceMag * cosZ;
+            /*
+             * Force projection:
+             *
+             * Axial drag points opposite the rocket body axis. Normal force is
+             * perpendicular to the body axis and changes sign with AoA. Both are
+             * rotated into predictor vertical/horizontal axes before dividing
+             * by mass.
+             */
 
+            // Normal force creates a pitching moment through CP-CG offset.
             const double aeroMoment = normalForceMag * aeroMomentScale_;
             angularAccel = aeroMoment * invMomentOfInertia_;
 
             if (!liftState) {
+                // The table stores force magnitude; the AoA sign decides which
+                // side of the rocket the normal force and moment point toward.
                 normalForceX = -normalForceX;
                 normalForceY = -normalForceY;
                 angularAccel = -angularAccel;
@@ -988,12 +1126,15 @@ class ApogeePredictor {
         return AccelResult{linearAccelX, linearAccelY, linearAccelZ, angularAccel, 0.0};
     }
 
+    /// Builds velocity relative to the air and derives Mach/density inputs.
     AirRelativeState BuildAirRelativeState(const ApogeeState &state) const {
         AirRelativeState air;
         air.relX = state.verticalVelocity;
         air.relY = state.horizontalVelocity;
         air.relZ = 0.0;
         if (environment_ != nullptr) {
+            // Aero depends on airspeed, not ground speed, so subtract the wind
+            // before computing Mach and angle of attack.
             const math_utils::Vec3 wind = environment_->EffectiveWind();
             air.relX -= static_cast<double>(wind.x);
             air.relY -= static_cast<double>(wind.y);
@@ -1003,6 +1144,8 @@ class ApogeePredictor {
         }
 
         if (air.temperatureK > 0.0) {
+            // Speed of sound rises with temperature. Mach is the air-relative
+            // speed divided by that local speed of sound.
             const float tempK = static_cast<float>(air.temperatureK);
             const float gamma = static_cast<float>(constants::kGamma);
             const float gasConstant = static_cast<float>(constants::kGasConstant);
@@ -1015,6 +1158,8 @@ class ApogeePredictor {
             }
         }
 
+        // If atmosphere data is invalid, mach stays at zero and aero will be
+        // skipped by ComputeAcceleration's minimum-Mach/finite checks.
         return air;
     }
 

@@ -9,6 +9,21 @@
 
 namespace {
 
+/*
+ * FlightComputer owns the state estimate and phase machine.  It deliberately
+ * separates three ideas that are easy to mix up:
+ *
+ *   - measurement freshness: did a sensor produce a real new sample this loop?
+ *   - estimator state: what do the Kalman filters currently believe?
+ *   - predictor seed: what subset of that state is safe to use for apogee?
+ *
+ * Fresh measurements can update filters. Cached measurements can preserve output
+ * continuity, but should not create new phase transitions or control authority.
+ * The predictor seed is even stricter: if attitude, acceleration, CFD coverage,
+ * or baro-derived velocity look questionable, it sets flags so actuation can
+ * retract instead of adding drag from a fragile estimate.
+ */
+
 /// Rotates body-frame acceleration into the filter frame using the main quaternion.
 ///
 /// The filter publishes vertical acceleration in `.z`; keep that vertical
@@ -37,6 +52,9 @@ math_utils::Vec3 RotateBodyToInertial(const math_utils::Vec3 &bodyAccel,
     math_utils::Vec3 result;
     result.x = earthX;
     result.y = earthY;
+    // Accelerometers measure specific force, so a stationary upright rocket
+    // reads about +1 g. Subtract gravity after rotating into inertial axes to
+    // get translational acceleration for the Kalman filter.
     result.z = earthZ - constants::kGravity;
     return result;
 }
@@ -55,10 +73,15 @@ bool GravityBodyVectorFromQuaternion(const math_utils::Quaternion &input,
     const float y = orientation.y;
     const float z = orientation.z;
 
+    // This is the gravity direction the quaternion implies in body axes. It is
+    // used for tilt agreement, so only direction matters and the vector is normalized below.
     gravityBodyOut->x = -2.0f * (x * z - w * y);
     gravityBodyOut->y = -2.0f * (y * z + w * x);
     gravityBodyOut->z = -(1.0f - 2.0f * (x * x + y * y));
     if (gravityBodyOut->z < 0.0f) {
+        // For tilt comparison we only care about the "up-ish" body direction.
+        // Flip the vector if needed so equivalent inverted sign conventions do
+        // not create a fake 180 degree disagreement.
         gravityBodyOut->x = -gravityBodyOut->x;
         gravityBodyOut->y = -gravityBodyOut->y;
         gravityBodyOut->z = -gravityBodyOut->z;
@@ -89,6 +112,8 @@ bool QuaternionTiltDifferenceDeg(const math_utils::Quaternion &a,
         !GravityBodyVectorFromQuaternion(b, &gravityB)) {
         return false;
     }
+    // The dot product of two unit gravity vectors gives cos(angle) between
+    // their tilt estimates. Clamp protects acos from tiny floating-point drift.
     const float dot = math_utils::Clamp(math_utils::Dot(gravityA, gravityB), -1.0f, 1.0f);
     *differenceDegOut = acosf(dot) * (180.0f / 3.14159265358979323846f);
     return std::isfinite(*differenceDegOut);
@@ -100,6 +125,8 @@ double ComputeSmoothingAlpha(double dt, double tauSeconds) {
         return 1.0;
     }
     const double alpha = dt / (tauSeconds + dt);
+    // This discrete alpha is stable for variable dt and behaves like a first
+    // order low-pass without requiring exp() in presentation smoothing paths.
     if (alpha < 0.0) {
         return 0.0;
     }
@@ -132,6 +159,8 @@ struct FilterPhaseTuning {
 };
 
 FilterPhaseTuning ComputeFilterPhaseTuning(FlightStatus status) {
+    // Each phase trusts sensors differently: boost has violent acceleration,
+    // coast is where apogee prediction matters, and ground/descent should be quiet.
     switch (status) {
         case FlightStatus::Ground:
             return {settings::flight::kGroundAccelSigmaScale,
@@ -202,11 +231,15 @@ void FlightComputer::ReconfigurePredictor(const EnvironmentModel::Config &enviro
     apogeePredictor_.SetVehicleParameters(vehicleParameters);
     apogeePredictor_.SetForceTable(forceTable);
     if (!preserveAdaptiveState) {
+        // Changing vehicle/environment assumptions invalidates learned drag
+        // unless the caller explicitly wants continuity.
         apogeePredictor_.ResetAxialDragScale();
     }
 }
 
 void FlightComputer::ResetGroundReference() {
+    // Reset only pad-relative state. This is called when the operator wants a
+    // new zero reference without rebuilding all configured predictor settings.
     altitudeReferenceInitialized_ = false;
     altitudeReferenceMeters_ = 0.0;
     lastGroundRelativeAltitudeMeters_ = 0.0;
@@ -229,6 +262,19 @@ void FlightComputer::ResetGroundReference() {
 
 /// Processes one sensor sample and updates the filtered flight state.
 bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
+    /*
+     * The update order is intentional:
+     *
+     *   1. establish timing and pad-relative altitude,
+     *   2. choose a fresh accel/gyro rail that matches the selected attitude,
+     *   3. propagate/correct attitude,
+     *   4. predict/update Kalman filters,
+     *   5. run phase detection,
+     *   6. build a guarded predictor seed.
+     *
+     * Phase detection uses raw filter values. Published telemetry may be smoothed
+     * later, but state-machine timing should not be delayed by display filtering.
+     */
     const bool hasIcmAccel =
         !(data.accelICM[0] == 0.0f && data.accelICM[1] == 0.0f && data.accelICM[2] == 0.0f);
     const bool hasLsmAccel =
@@ -253,12 +299,15 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
         dt = static_cast<double>(data.timestamp) - lastTimestamp_;
     }
     if (dt <= 0.0 || dt > 1.0) {
+        // Bad timestamps happen in replay/boot edges. Use a bounded nominal dt
+        // instead of letting filters integrate a negative or huge step.
         dt = static_cast<double>(settings::flight::kDefaultDtSeconds);
     }
     lastTimestamp_ = static_cast<double>(data.timestamp);
     const double altitudeMeters = static_cast<double>(data.altitudeFeet) * constants::kFeetToMeters;
     if (data.baroSampleFresh && std::isfinite(altitudeMeters)) {
         if (!altitudeReferenceInitialized_) {
+            // First valid baro sample defines pad altitude for AGL calculations.
             altitudeReferenceMeters_ = altitudeMeters;
             altitudeReferenceInitialized_ = true;
             lastGroundRelativeAltitudeMeters_ = 0.0;
@@ -267,6 +316,13 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
             groundReferenceStableSince_ = static_cast<double>(data.timestamp);
             groundReferenceSettled_ = false;
         } else if (status_ == FlightStatus::Ground && burnDetectTimestamp_ <= 0.0) {
+            // While still idle on the pad, slowly chase barometer drift so AGL
+            // stays near zero. Stop doing this once launch is suspected.
+            //
+            // Conceptually, this is a moving "zero altitude" while the rocket is
+            // still sitting still. The moment launch is suspected, the reference
+            // freezes so upward motion becomes real AGL instead of being averaged
+            // back into the pad altitude.
             const double previousReferenceMeters = altitudeReferenceMeters_;
             const double referenceAlpha = ComputeSmoothingAlpha(
                 dt,
@@ -283,6 +339,8 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
             const bool driftIsStable =
                 std::fabs(groundReferenceDriftRateMps_) <= settings::flight::kPadReadyMaxDriftMps;
             if (driftIsStable) {
+                // Pad reference is considered ready only after the drift has
+                // stayed small for the configured hold time.
                 if (groundReferenceStableSince_ <= 0.0) {
                     groundReferenceStableSince_ = static_cast<double>(data.timestamp);
                 }
@@ -303,6 +361,8 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
     const double zAccelSigmaScale =
         phaseTuning.accelSigmaScale *
         (baroVzGuardActiveBeforeUpdate ? settings::flight::kBaroVzGuardAccelSigmaScale : 1.0);
+    // When baro-derived velocity keeps disagreeing with inertial velocity,
+    // downweight vertical accel so the filter can be pulled back by pressure altitude.
     kalmanX_.SetMeasurementSigma(accelSigmaXY_ * phaseTuning.accelSigmaScale);
     kalmanY_.SetMeasurementSigma(accelSigmaXY_ * phaseTuning.accelSigmaScale);
     kalmanZ_.SetMeasurementSigmas(accelSigmaZ_ * zAccelSigmaScale,
@@ -312,6 +372,13 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
     float gyroBody[3] = {0.0f, 0.0f, 0.0f};
     const MainQuaternionSource selectedQuaternionSource =
         static_cast<MainQuaternionSource>(data.mainQuaternionSource);
+    /*
+     * The selected quaternion source matters for acceleration too. If the main
+     * attitude is ICM, the best acceleration measurement is fresh ICM accel; if
+     * it is LSM, use fresh LSM accel. Mixing attitude from one rail with accel
+     * from another rail can rotate thrust/gravity through slightly different
+     * frame errors and create a vertical acceleration bias.
+     */
     if (status_ != FlightStatus::Coast && status_ != FlightStatus::Overshoot) {
         bnoFreshPostBurnoutQuaternionCount_ = 0;
         lastBnoReferenceCorrectionSampleMicros_ = 0;
@@ -327,10 +394,13 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
     const bool hasFreshAltitudeMeasurement =
         data.baroSampleFresh && altitudeReferenceInitialized_ && std::isfinite(relativeAltitudeMeters);
     if (hasFreshAltitudeMeasurement) {
+        // Keep a small pressure-altitude history for the coast velocity guard.
         RecordBaroAltitudeSample(static_cast<double>(data.timestamp), relativeAltitudeMeters);
     }
 
     auto loadIcmGyro = [&]() {
+        // Prefer gyro from the same rail as selected attitude, but allow a fresh
+        // secondary gyro before falling all the way back to cached data.
         if (hasFreshIcmGyro) {
             gyroBody[0] = data.gyro[0];
             gyroBody[1] = data.gyro[1];
@@ -350,6 +420,7 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
         }
     };
     auto loadLsmGyro = [&]() {
+        // Same policy as ICM, mirrored for LSM-selected attitude.
         if (hasFreshLsmGyro) {
             gyroBody[0] = data.gyroLSM[0];
             gyroBody[1] = data.gyroLSM[1];
@@ -369,6 +440,8 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
         }
     };
     auto loadPulseGyro = [&]() {
+        // Pulse is slower/sidecar, so if Pulse gyro is not fresh, prefer fresh
+        // onboard fast rails before cached Pulse data.
         if (hasFreshPulseGyro) {
             gyroBody[0] = data.gyroPulse[0];
             gyroBody[1] = data.gyroPulse[1];
@@ -442,6 +515,7 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
     if (!quaternionValid_ && data.hasQuaternion) {
         math_utils::Quaternion inputQuaternion = math_utils::MakeQuaternion(1.0f, 0.0f, 0.0f, 0.0f);
         if (ArrayToQuaternion(data.quaternion, inputQuaternion)) {
+            // First valid main quaternion seeds the propagation state.
             previousQuaternion_ = inputQuaternion;
             quaternionValid_ = true;
             orientation = previousQuaternion_;
@@ -480,6 +554,9 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
                                                 referenceQuat,
                                                 &bnoReferenceTiltErrorDeg) &&
                     bnoReferenceTiltErrorDeg <= settings::ahrs::kBnoCoastCorrectionMaxTiltAgreementDeg) {
+                    // Require several fresh BNO samples after burnout before it
+                    // can trim the propagated attitude. That prevents one stale
+                    // or late BNO packet from moving the coast predictor.
                     if (bnoFreshPostBurnoutQuaternionCount_ <
                         settings::ahrs::kBnoCoastCorrectionMinFreshSamples) {
                         ++bnoFreshPostBurnoutQuaternionCount_;
@@ -494,6 +571,9 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
                             const double rampDurationSeconds =
                                 static_cast<double>(settings::ahrs::kBnoCoastCorrectionRampSeconds);
                             if (rampDurationSeconds > 0.0 && burnoutTimestamp_ > 0.0) {
+                                // BNO correction authority ramps in after
+                                // burnout so the predictor does not see a step
+                                // change in zenith exactly at coast entry.
                                 const double timeSinceBurnout =
                                     std::max(0.0, static_cast<double>(data.timestamp) - burnoutTimestamp_);
                                 const double rampFraction =
@@ -506,6 +586,8 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
                             }
                         }
                         if (blendFactor > 0.0f) {
+                            // Slerp gives a small quaternion trim while
+                            // preserving unit length and avoiding Euler angles.
                             orientation = math_utils::Slerp(orientation, referenceQuat, blendFactor);
                             quaternionValid_ = math_utils::ValidateQuaternion(orientation);
                             if (quaternionValid_) {
@@ -550,6 +632,8 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
                : RotateBodyToInertial(bodyAccel, previousQuaternion_))
         : math_utils::MakeVec3(0.0f, 0.0f, 0.0f);
 
+    // Predict every filter axis first, then apply whichever fresh measurements
+    // are available this loop. Missing samples should grow uncertainty, not reuse stale values.
     kalmanX_.Predict(dt, processNoiseXY_ * phaseTuning.processNoiseXYScale);
     kalmanY_.Predict(dt, processNoiseXY_ * phaseTuning.processNoiseXYScale);
     kalmanZ_.Predict(dt, processNoiseZ_ * phaseTuning.processNoiseZScale);
@@ -560,6 +644,8 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
         kalmanY_.Update(inertialAcceleration.y);
     }
     if (hasFreshAccelMeasurement && hasFreshAltitudeMeasurement) {
+        // When both channels are fresh, update accel and altitude separately so
+        // either one can be gated without discarding the other.
         zAccelUpdateUsed =
             kalmanZ_.UpdateAccelOnly(static_cast<double>(inertialAcceleration.z),
                                      static_cast<double>(settings::flight::kAccelInnovationGateSigma));
@@ -598,12 +684,17 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
             ComputeBaroVelocityEstimate(static_cast<double>(data.altimeterSigmaScale),
                                         &baroVerticalVelocityMps,
                                         &baroVerticalVelocitySigmaMps)) {
+            // Compare the inertial vertical velocity against a local slope of
+            // pressure altitude. Persistent disagreement means the accel path is suspect.
             baroVerticalVelocityResidualMps = rawVelZ - baroVerticalVelocityMps;
             const double residualThresholdMps = std::max(
                 static_cast<double>(settings::flight::kBaroVzResidualGuardFloorMps),
                 static_cast<double>(settings::flight::kBaroVzResidualGuardSigmaMultiplier) *
                     baroVerticalVelocitySigmaMps);
             if (std::fabs(baroVerticalVelocityResidualMps) > residualThresholdMps) {
+                // This is a consistency check, not a replacement estimator. If
+                // inertial vertical velocity and a local baro slope disagree for
+                // several samples, reduce trust in accel-derived vertical motion.
                 if (baroVzGuardPersistenceCount_ < 255) {
                     ++baroVzGuardPersistenceCount_;
                 }
@@ -616,6 +707,8 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
                                             baroVerticalVelocitySigmaMps,
                                             static_cast<double>(settings::flight::kBaroVzInnovationGateSigma));
             if (baroVerticalVelocityUpdateUsed) {
+                // Pull the raw state after the pseudo-measurement so phase
+                // checks and predictor seed see the corrected vertical velocity.
                 rawPosZ = kalmanZ_.Position();
                 rawVelZ = kalmanZ_.Velocity();
                 accZ = kalmanZ_.Acceleration();
@@ -628,7 +721,20 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
     }
 
     if (status_ == FlightStatus::Ground) {
+        /*
+         * Liftoff detection has two paths:
+         *
+         *   - accel path: primary, fast, but can fail if the chosen rail saturates
+         *     or goes stale,
+         *   - baro path: backup, slower, and requires positive AGL plus positive
+         *     baro-derived velocity over confirmation samples.
+         *
+         * The baro path exists to avoid staying in Ground after a real launch. It
+         * is intentionally not a single-sample trigger.
+         */
         if (hasFreshAltitudeMeasurement) {
+            // Baro-only liftoff uses fresh pressure samples only. This avoids a
+            // stale/default altitude pretending the rocket has left the pad.
             const double altitudeSampleTimestamp = static_cast<double>(data.timestamp);
             const double altitudeSampleDt =
                 altitudeSampleTimestamp - lastGroundRelativeAltitudeTimestamp_;
@@ -658,6 +764,8 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
         const bool baroSuggestsLiftoff = altitudeSuggestsLiftoff && velocitySuggestsLiftoff;
 
         if (hasFreshLiftoffAcceleration) {
+            // Accel is the primary launch detector, but it still needs repeated
+            // samples so one spike does not leave Ground.
             if (accelerationSuggestsLiftoff) {
                 if (liftoffCandidateCount_ < 255) {
                     ++liftoffCandidateCount_;
@@ -668,6 +776,8 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
             }
         }
         if (baroSuggestsLiftoff) {
+            // Baro backup is intentionally strict: positive AGL, positive
+            // pressure-derived velocity, and confirmation samples.
             if (baroLiftoffCandidateCount_ < 255) {
                 ++baroLiftoffCandidateCount_;
             }
@@ -677,6 +787,9 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
 
         if (burnDetectTimestamp_ <= 0.0 &&
             liftoffCandidateCount_ >= settings::flight::kLiftoffConfirmSamples) {
+            // Latch the first confirmed launch time. The actual state
+            // transition below still asks for altitude/velocity evidence so a
+            // pure accel spike cannot immediately enter Burn.
             burnDetectTimestamp_ = static_cast<double>(data.timestamp);
         }
         const bool baroLiftoffConfirmed =
@@ -687,6 +800,8 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
 
         if (burnDetectTimestamp_ > 0.0 &&
             ((velocitySuggestsLiftoff || altitudeSuggestsLiftoff) || baroLiftoffConfirmed)) {
+            // Enter Burn only after the launch timestamp is latched and there
+            // is still independent altitude or velocity evidence of liftoff.
             status_ = FlightStatus::Burn;
             burnTimestamp_ = burnDetectTimestamp_;
             liftoffCandidateCount_ = 0;
@@ -717,12 +832,20 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
     }
 
     if (status_ == FlightStatus::Burn) {
+        /*
+         * Burnout detection is the handoff from "motor is still adding energy" to
+         * "the coast predictor physics are meaningful." The predictor does not
+         * model motor thrust, so declaring Coast too early is more dangerous than
+         * declaring it a little late.
+         */
         const double timeSinceBurn = static_cast<double>(data.timestamp) - burnTimestamp_;
         const bool afterMinimumBurn = timeSinceBurn >= settings::flight::kBurnoutMinDurationSeconds;
         const bool accelerationSuggestsBurnout = accZ < settings::flight::kBurnoutAccelerationThresholdMps2;
         const bool stillAscending = rawVelZ > settings::flight::kBurnoutVelocityThresholdMps;
 
         if (afterMinimumBurn && accelerationSuggestsBurnout && stillAscending) {
+            // Burnout requires time, low acceleration, and upward motion. This
+            // avoids declaring coast from early thrust noise or pad handling.
             if (burnoutCandidateCount_ < 255) {
                 ++burnoutCandidateCount_;
             }
@@ -743,6 +866,8 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
 
     if (status_ == FlightStatus::Coast) {
         if (accZ < settings::flight::kBurnoutAccelerationThresholdMps2 && rawPosZ >= apogeeTargetMeters_) {
+            // Overshoot here means the measured state has already exceeded the
+            // target altitude; it is not the predictor saying apogee is high.
             status_ = FlightStatus::Overshoot;
             ReportEvent(false, data.timestamp, "Overshoot");
         }
@@ -751,6 +876,8 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
     if (status_ == FlightStatus::Overshoot || status_ == FlightStatus::Coast) {
         if (accZ < settings::flight::kDescentAccelerationThresholdMps2 &&
             rawVelZ <= settings::flight::kDescentVelocityThresholdMps) {
+            // Record the maximum altitude seen so a late descent transition
+            // does not lose the actual peak.
             status_ = FlightStatus::Descent;
             apogeeAltitude_ = maxObservedAltitude_;
             apogeeTimestamp_ = static_cast<double>(data.timestamp);
@@ -772,6 +899,12 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
     double predictorTimeToApogee = 0.0;
     uint32_t predictorFlags = 0;
     if (shouldPredictApogee) {
+        /*
+         * The predictor seed is not a full navigation solution. It uses the
+         * vertical Kalman state, a bounded attitude-derived horizontal speed, and
+         * bounded angular rate. If those terms are not fresh and sane, the seed
+         * falls back toward a simpler vertical-only rollout and raises flags.
+         */
         predictorFlags |= kPredictorSeedFlagControlActive;
         predictorFlags |= kPredictorSeedFlagPositiveVerticalVelocity;
         // Deliberately degrade to a simpler predictor seed whenever attitude
@@ -792,6 +925,8 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
             const double blendRampSeconds =
                 static_cast<double>(settings::flight::kPredictorCoastEntryZenithRampSeconds);
             coastEntryBlendActive = timeSinceBurnout < blendRampSeconds;
+            // Right after burnout, attitude can still be settling from boost.
+            // Blend the predictor seed toward vertical before trusting full tilt.
             seedZenith = ApplyPredictorCoastEntryZenithBlend(seedZenith, timeSinceBurnout);
             previousSeedZenith =
                 ApplyPredictorCoastEntryZenithBlend(previousSeedZenith, previousTimeSinceBurnout);
@@ -803,6 +938,8 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
             PredictorSeedHasFreshAccelSample(dt, hasFreshAccelMeasurement);
         const bool canUseHorizontalSeed = quaternionValid_ && freshAccelSeedSample;
         if (!canUseHorizontalSeed) {
+            // Without fresh attitude/accel, horizontal speed is more dangerous
+            // than useful because it can turn stale tilt into a false drag path.
             ResetPredictorHorizontalVelocityTracker(predictorHorizontalVelocity_);
         }
         const double trackedHorizontalVelocity =
@@ -815,6 +952,9 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
                                                  rawVelZ,
                                                  seedZenith)
                 : 0.0;
+        // The tracker integrates lateral acceleration, then Resolve caps it
+        // against a physically plausible value implied by vertical speed and
+        // tilt. That keeps unobservable XY state from dominating apogee.
         predictorHorizontalVelocity =
             canUseHorizontalSeed
                 ? ResolvePredictorHorizontalSpeed(trackedHorizontalVelocity, rawVelZ, seedZenith)
@@ -833,6 +973,8 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
         }
         const double rawPredictorAngularRate =
             ComputePredictorAngularRate(seedZenith, previousSeedZenith, dt);
+        // Angular rate is derived from the clamped zenith change. Clamp it too
+        // so a single quaternion jump does not dominate the aero rollout.
         predictorClampedAngularRate =
             canUseHorizontalSeed
                 ? ClampPredictorAngularRate(rawPredictorAngularRate)
@@ -849,6 +991,8 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
         }
 
         ApogeeState predictorState;
+        // Seed the apogee model with the live vertical state, optional
+        // horizontal/attitude terms, and the physical flap position/command.
         predictorState.altitudeMeters = rawPosZ;
         predictorState.horizontalDistanceMeters = 0.0;
         predictorState.verticalVelocity = rawVelZ;
@@ -863,7 +1007,7 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
             std::clamp(static_cast<double>(data.flapCommandDeg),
                        0.0,
                        static_cast<double>(settings::actuation::kServoMaxActuationDeg));
-        // Single integration pass returns both altitude and time-to-apogee
+        // Single integration pass returns both altitude and time-to-apogee.
         const PredictResult prediction = apogeePredictor_.PredictApogeeWithTime(predictorState);
         predictorFlags |= apogeePredictor_.LastPredictionFlags();
         predictorTimeToApogee = prediction.timeToApogee;
@@ -878,6 +1022,9 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
             if (std::isfinite(ballisticBound) &&
                 std::isfinite(reportedApogeePrediction) &&
                 ballisticBound > reportedApogeePrediction) {
+                // If AoA is outside the CFD table, the clamped table value can
+                // be too drag-heavy. Blend toward a gravity-only upper bound
+                // for telemetry, and flag the prediction as uncertain.
                 const double timeSinceBurnout =
                     (burnoutTimestamp_ > 0.0)
                         ? std::max(0.0, static_cast<double>(data.timestamp) - burnoutTimestamp_)
@@ -895,10 +1042,14 @@ bool FlightComputer::Update(const SensorData &data, FilteredState &output) {
                              static_cast<double>(settings::predictor::kHighAoAFallbackExitTimeSeconds));
                 double requestedBlend = entryBlend;
                 if (timeSinceBurnout <= peakTime) {
+                    // Early high-AoA fallback is strongest while the table clamp
+                    // is most likely to overstate drag from a bad AoA seed.
                     const double fraction =
                         (peakTime > 1.0e-6) ? std::clamp(timeSinceBurnout / peakTime, 0.0, 1.0) : 1.0;
                     requestedBlend = entryBlend + fraction * (peakBlend - entryBlend);
                 } else {
+                    // Fade fallback out later so the predictor returns toward
+                    // the actual CFD table as attitude settles.
                     const double fraction =
                         std::clamp((timeSinceBurnout - peakTime) / (exitTime - peakTime), 0.0, 1.0);
                     requestedBlend = peakBlend + fraction * (exitBlend - peakBlend);
@@ -1018,6 +1169,9 @@ void FlightComputer::UpdateAdaptiveDragScale(const ApogeeState &predictorState,
         !std::isfinite(predictorState.zenith) ||
         (predictorFlags & kPredictorSeedFlagCoastEntryBlendActive) != 0u ||
         PredictorFlagsHasModelInvalidity(predictorFlags)) {
+        // Only learn drag in clean coast. If the predictor seed is already
+        // flagged uncertain, adapting on that residual would teach the model
+        // from bad input.
         return;
     }
 
@@ -1035,6 +1189,8 @@ void FlightComputer::UpdateAdaptiveDragScale(const ApogeeState &predictorState,
     if (actuationIsSettling ||
         !std::isfinite(flapTrackingErrorDeg) ||
         flapTrackingErrorDeg > static_cast<double>(settings::actuation::kServoSettlingAngleEpsilonDeg)) {
+        // Do not adapt aero while the flaps are moving; model residual then
+        // mixes true aero error with actuator transient error.
         return;
     }
 
@@ -1050,6 +1206,8 @@ void FlightComputer::UpdateAdaptiveDragScale(const ApogeeState &predictorState,
     const double minAxialAccel =
         static_cast<double>(settings::flight::kAdaptiveAxialAccelMinAbsMps2);
     if (std::fabs(axialModelAcceleration) < minAxialAccel) {
+        // If axial drag contribution is tiny, residual/model is too noisy to
+        // produce a meaningful scale update.
         return;
     }
 
@@ -1060,7 +1218,8 @@ void FlightComputer::UpdateAdaptiveDragScale(const ApogeeState &predictorState,
                    -residualClamp,
                    residualClamp);
 
-    // Compute Mach number for Mach-dependent adaptation.
+    // The drag learner compares measured vertical acceleration with model
+    // vertical acceleration, then nudges drag scale in the Mach bin being flown.
     const double mach = apogeePredictor_.ComputeAirRelativeMach(predictorState);
 
     // Update Mach-dependent drag scale if enabled.
@@ -1118,6 +1277,8 @@ void FlightComputer::UpdateAdaptiveDragScale(const ApogeeState &predictorState,
 }
 
 void FlightComputer::ResetBaroVelocityGuardState() {
+    // Clear pressure-slope history and guard persistence together so a reset
+    // cannot keep an old "accel is suspect" state alive.
     baroVelocityHistoryTimeSeconds_.fill(0.0);
     baroVelocityHistoryAltitudeMeters_.fill(0.0);
     baroVelocityHistoryCount_ = 0;
@@ -1131,6 +1292,7 @@ void FlightComputer::RecordBaroAltitudeSample(double timeSeconds, double relativ
     }
     baroVelocityHistoryTimeSeconds_[baroVelocityHistoryNextIndex_] = timeSeconds;
     baroVelocityHistoryAltitudeMeters_[baroVelocityHistoryNextIndex_] = relativeAltitudeMeters;
+    // Ring buffer keeps the latest samples without moving arrays in the flight loop.
     baroVelocityHistoryNextIndex_ =
         (baroVelocityHistoryNextIndex_ + 1u) % kBaroVelocityHistoryCapacity;
     if (baroVelocityHistoryCount_ < kBaroVelocityHistoryCapacity) {
@@ -1156,6 +1318,8 @@ bool FlightComputer::ComputeBaroVelocityEstimate(double altitudeSigmaScale,
     std::array<double, kMaxSamples> altitudes{};
     std::size_t sampleCount = 0;
     double oldestTime = newestTime;
+    // Walk backward through recent pressure samples and keep only a short,
+    // contiguous window. The slope of this window is baro vertical velocity.
     for (std::size_t offset = 0; offset < baroVelocityHistoryCount_; ++offset) {
         const std::size_t index =
             (baroVelocityHistoryNextIndex_ + kBaroVelocityHistoryCapacity - 1u - offset) %
@@ -1194,6 +1358,8 @@ bool FlightComputer::ComputeBaroVelocityEstimate(double altitudeSigmaScale,
 
     double sumCenteredTimeSq = 0.0;
     double sumCenteredTimeAltitude = 0.0;
+    // Centering the line fit improves numerical stability because flight times
+    // are large absolute values while the window is only a few tenths of a second.
     for (std::size_t i = 0; i < sampleCount; ++i) {
         const double centeredTime = times[i] - meanTime;
         sumCenteredTimeSq += centeredTime * centeredTime;
@@ -1203,11 +1369,14 @@ bool FlightComputer::ComputeBaroVelocityEstimate(double altitudeSigmaScale,
         return false;
     }
 
+    // Least-squares line slope: altitude change per second over the pressure window.
     const double velocityMps = sumCenteredTimeAltitude / sumCenteredTimeSq;
     if (!std::isfinite(velocityMps)) {
         return false;
     }
 
+    // More spread in sample times reduces velocity uncertainty; noisier baro
+    // samples increase it. Clamp the result so the guard cannot become overconfident.
     const double effectiveAltitudeSigma =
         altitudeSigma_ * std::max(1.0, altitudeSigmaScale);
     double sigmaMps = effectiveAltitudeSigma / std::sqrt(sumCenteredTimeSq);

@@ -40,12 +40,18 @@ constexpr SbgEComOutputMode kImuOutputMode =
     static_cast<SbgEComOutputMode>(settings::sensors::ellipse20::kImuOutputMode);
 constexpr SbgEComOutputMode kMagOutputMode =
     static_cast<SbgEComOutputMode>(settings::sensors::ellipse20::kMagOutputMode);
+// SBG/Pulse publishes accel in m/s^2 and gyro in rad/s, so only gravity-based
+// normalization and display conversion need explicit unit constants here.
 constexpr float kGToMps2 = 9.80665f;
 constexpr float kRadToDeg = 57.295779513082320876f;
+// Fallback AHRS dt used only when the sensor timestamp delta is unavailable.
 constexpr float kDefaultDtSeconds = 0.005f;
+// Drop the published quaternion after repeated invalid updates instead of one
+// bad math step. This avoids flapping availability from a single transient.
 constexpr uint8_t kQuaternionInvalidDropThreshold = 2;
 
 struct SerialInterfaceContext {
+    // This object is passed through the C SBG interface callbacks as the serial handle.
     HardwareSerial *serial = nullptr;
     uint32_t baudRate = 0;
 };
@@ -55,6 +61,9 @@ SbgInterface g_interface;
 SbgEComHandle g_comHandle;
 uint8_t g_serialRxExtraBuffer[kRxExtraBufferBytes] = {};
 
+// Pulse/Ellipse data arrives through callbacks from the SBG protocol handler.
+// The flight loop drains a bounded amount of serial work, then consumes the most
+// recent raw IMU/mag sample from this cache.
 bool g_initialized = false;
 bool g_comHandleInitialized = false;
 bool g_haveImu = false;
@@ -70,8 +79,12 @@ bool g_lastAcquireFresh = false;
 bool g_lastAcquireUsedCache = false;
 
 FlightStatus g_flightStatus = FlightStatus::Ground;
+// Cross-check trust is supplied by the main selector. It lets other IMU rails
+// reduce Pulse correction authority without disabling the serial rail entirely.
 float g_crossCheckTrust = 1.0f;
 
+// Sensor timestamps are used to decide whether an IMU packet is truly new.
+// Host timestamps are used to decide whether the latest cached packet is recent.
 uint32_t g_lastSampleMicros = 0;
 uint32_t g_lastImuHostMicros = 0;
 uint32_t g_lastMagHostMicros = 0;
@@ -89,6 +102,8 @@ float g_lastQuaternion[4] = {1.0f, 0.0f, 0.0f, 0.0f};
 float g_lastYprDeg[3] = {0.0f, 0.0f, 0.0f};
 float g_lastTemperatureC = 0.0f;
 float g_lastAhrsDt = 0.0f;
+// Last trust values are kept for diagnostics so logs can explain why the Pulse
+// observer corrected or ignored accel/mag on a given sample.
 float g_lastAccelTrust = 0.0f;
 float g_lastMagTrust = 0.0f;
 float g_gyroBiasLearned[3] = {0.0f, 0.0f, 0.0f};
@@ -155,6 +170,8 @@ void Apply3x3(const float matrix[3][3], const float in[3], float out[3]) {
 }
 
 void ApplyMountRotation(float vector[3]) {
+    // Put the Pulse sensor axes into the same rocket body frame used by the other
+    // IMU rails.
     float rotated[3] = {0.0f, 0.0f, 0.0f};
     Apply3x3(settings::sensors::ellipse20::kMountRotation, vector, rotated);
     vector[0] = rotated[0];
@@ -171,6 +188,8 @@ bool Normalize3(float &x, float &y, float &z) {
     if (norm <= 1.0e-9f) {
         return false;
     }
+    // Most attitude correction math uses only direction. Normalize in-place so
+    // accel magnitude can gate trust separately from accel direction.
     const float invNorm = 1.0f / norm;
     x *= invNorm;
     y *= invNorm;
@@ -195,6 +214,8 @@ void LimitVector(float vector[3], float maxNorm) {
     if (norm <= maxNorm || norm <= 1.0e-9f) {
         return;
     }
+    // Preserve correction direction while capping magnitude. This prevents one
+    // rejected-looking sensor sample from creating an enormous attitude kick.
     const float scale = maxNorm / norm;
     vector[0] *= scale;
     vector[1] *= scale;
@@ -207,6 +228,8 @@ float WindowTrust(float value, float minValue, float maxValue) {
     }
     const float center = 0.5f * (minValue + maxValue);
     const float halfWidth = 0.5f * (maxValue - minValue);
+    // Trust is highest at the center of the accepted window and fades to zero
+    // at both edges. For accel, that means "near 1 g is best."
     return Clamp01(1.0f - fabsf(value - center) / halfWidth);
 }
 
@@ -240,6 +263,8 @@ void ApplyQuaternionContinuity() {
         return;
     }
     if (QuaternionDot(g_q, g_lastContinuousQuaternion) < 0.0f) {
+        // q and -q mean the same attitude; keep the sign continuous for smoother
+        // logs and downstream blending.
         NegateQuaternion(g_q);
     }
     for (int i = 0; i < 4; ++i) {
@@ -248,6 +273,8 @@ void ApplyQuaternionContinuity() {
 }
 
 void QuaternionConjugate(const float q[4], float out[4]) {
+    // Unit-quaternion inverse. This is useful for relative attitude math even
+    // though the current Pulse path mainly uses direct rotation matrices.
     out[0] = q[0];
     out[1] = -q[1];
     out[2] = -q[2];
@@ -255,6 +282,7 @@ void QuaternionConjugate(const float q[4], float out[4]) {
 }
 
 void QuaternionMultiply(const float a[4], const float b[4], float out[4]) {
+    // Hamilton product using wxyz ordering, matching math_utils::Quaternion.
     out[0] = a[0] * b[0] - a[1] * b[1] - a[2] * b[2] - a[3] * b[3];
     out[1] = a[0] * b[1] + a[1] * b[0] + a[2] * b[3] - a[3] * b[2];
     out[2] = a[0] * b[2] - a[1] * b[3] + a[2] * b[0] + a[3] * b[1];
@@ -262,6 +290,9 @@ void QuaternionMultiply(const float a[4], const float b[4], float out[4]) {
 }
 
 void RotateEarthToBody(const float q[4], const float earth[3], float body[3]) {
+    // This uses the earth-to-body rotation matrix implied by the current
+    // quaternion. It predicts what an earth-frame reference vector should look
+    // like in the sensor body frame.
     const float w = q[0];
     const float x = q[1];
     const float y = q[2];
@@ -281,6 +312,8 @@ void RotateEarthToBody(const float q[4], const float earth[3], float body[3]) {
 }
 
 void RotateBodyToEarth(const float q[4], const float body[3], float earth[3]) {
+    // Transpose of RotateEarthToBody for unit quaternions. Used to learn an
+    // earth-frame magnetic reference from quiet body-frame samples.
     const float w = q[0];
     const float x = q[1];
     const float y = q[2];
@@ -303,6 +336,14 @@ bool QuaternionFromEarthBasisInBody(const float northBody[3],
                                     const float eastBody[3],
                                     const float upBody[3],
                                     float quaternion[4]) {
+    /*
+     * Convert a north/east/up basis measured in body axes into the quaternion
+     * used by the estimator.
+     *
+     * The three input vectors form the columns of the earth-to-body rotation
+     * matrix. The branchy conversion below chooses the numerically stable
+     * quaternion formula based on which diagonal term is largest.
+     */
     const float r00 = northBody[0];
     const float r01 = eastBody[0];
     const float r02 = upBody[0];
@@ -366,6 +407,14 @@ bool QuaternionFromEarthBasisInBody(const float northBody[3],
 }
 
 bool InitializeQuaternionFromAccelMag(const float accelNorm[3], const float magNorm[3]) {
+    /*
+     * Pad bootstrapping:
+     *
+     * - accel gives body-frame "up" when the rocket is stationary,
+     * - mag gives a horizontal heading reference,
+     * - cross products build an orthonormal north/east/up basis,
+     * - that basis becomes the initial quaternion for gyro propagation.
+     */
     float upBody[3] = {accelNorm[0], accelNorm[1], accelNorm[2]};
     float magneticBody[3] = {magNorm[0], magNorm[1], magNorm[2]};
     if (!Normalize3(upBody[0], upBody[1], upBody[2]) ||
@@ -374,6 +423,8 @@ bool InitializeQuaternionFromAccelMag(const float accelNorm[3], const float magN
     }
 
     float eastBody[3] = {0.0f, 0.0f, 0.0f};
+    // Use accel for up and magnetometer for heading to create an initial attitude
+    // before gyro integration starts.
     Cross3(upBody[0], upBody[1], upBody[2], magneticBody[0], magneticBody[1], magneticBody[2], eastBody);
     if (!Normalize3(eastBody[0], eastBody[1], eastBody[2])) {
         return false;
@@ -396,6 +447,8 @@ bool InitializeQuaternionFromAccelMag(const float accelNorm[3], const float magN
 }
 
 void ResetGroundAlignment() {
+    // A failed trust check restarts the whole averaging window. Partial pad
+    // averages are not kept because they may include bumped or moving samples.
     g_groundAlignmentReady = false;
     g_groundAlignmentSampleCount = 0;
     g_groundAlignmentAccelSum[0] = 0.0f;
@@ -407,6 +460,9 @@ void ResetGroundAlignment() {
 }
 
 float AccelCorrectionGain() {
+    // Pulse accel is only a gravity reference in quiet phases. During burn/coast
+    // the measured acceleration is vehicle dynamics plus gravity, so it is not
+    // allowed to pull tilt.
     switch (g_flightStatus) {
         case FlightStatus::Ground:
             return settings::sensors::ellipse20::kAccelCorrectionGainGround;
@@ -421,6 +477,9 @@ float AccelCorrectionGain() {
 }
 
 float MagCorrectionGain() {
+    // Magnetometer correction is allowed in coast, but phase trust below keeps
+    // it guarded. Gain says "how hard to correct"; trust says "whether this
+    // sample deserves correction."
     switch (g_flightStatus) {
         case FlightStatus::Ground:
             return settings::sensors::ellipse20::kMagCorrectionGainGround;
@@ -462,6 +521,8 @@ float ComputeAccelTrust(float accelMagnitudeG, float gyroNorm) {
         case FlightStatus::Burn:
         case FlightStatus::Coast:
         case FlightStatus::Overshoot:
+            // This rail does not currently use accel correction in flight; it is
+            // only used for pad/descent alignment where accel is closer to gravity.
             return 0.0f;
     }
 
@@ -489,11 +550,14 @@ float ComputeMagTrust(float magMagnitude, float gyroNorm) {
                                             settings::sensors::ellipse20::kMagTrustGyroFadeEndRadPerSec);
 
     if (!g_hasMagReference) {
+        // Until a local field-strength baseline exists, rate/phase are the only
+        // magnetic sanity checks.
         return g_crossCheckTrust * phaseTrust * rateTrust;
     }
 
     const float relativeError = fabsf(magMagnitude - g_magReferenceNorm) / g_magReferenceNorm;
     if (relativeError >= settings::sensors::ellipse20::kMagCorrectionMaxRelativeError) {
+        // Reject samples that no longer look like the local magnetic field.
         return 0.0f;
     }
 
@@ -503,6 +567,8 @@ float ComputeMagTrust(float magMagnitude, float gyroNorm) {
 }
 
 bool ShouldLearnGyroBias(float accelTrust, float gyroNorm) {
+    // Bias learning is deliberately narrow. Learning gyro bias while the rocket
+    // is rotating would bake real motion into the zero-rate estimate.
     if (g_flightStatus == FlightStatus::Ground) {
         return accelTrust > 0.35f && gyroNorm <= settings::sensors::ellipse20::kStationaryGyroMaxRadPerSec;
     }
@@ -518,6 +584,7 @@ void UpdateMagMagnitudeReference(float magMagnitude, float trust) {
         return;
     }
     if (!g_hasMagReference) {
+        // First trusted sample defines the local magnetic field magnitude.
         g_magReferenceNorm = magMagnitude;
         g_hasMagReference = true;
         return;
@@ -533,6 +600,8 @@ void UpdateEarthMagReference(const float magBody[3], float accelTrust, float mag
     }
 
     float earthMag[3] = {0.0f, 0.0f, 0.0f};
+    // Learn the magnetic direction in earth coordinates so later heading
+    // correction is not tied to the current body attitude.
     RotateBodyToEarth(g_q, magBody, earthMag);
     if (!Normalize3(earthMag[0], earthMag[1], earthMag[2])) {
         return;
@@ -554,6 +623,9 @@ void UpdateEarthMagReference(const float magBody[3], float accelTrust, float mag
 }
 
 bool ComputeBootstrapMagError(const float accelNorm[3], const float magNorm[3], float error[3]) {
+    // Compare measured horizontal magnetic direction against the direction implied
+    // by the current quaternion.  This provides a heading correction during quiet
+    // alignment.
     float hx = accelNorm[1] * magNorm[2] - accelNorm[2] * magNorm[1];
     float hy = accelNorm[2] * magNorm[0] - accelNorm[0] * magNorm[2];
     float hz = accelNorm[0] * magNorm[1] - accelNorm[1] * magNorm[0];
@@ -586,6 +658,7 @@ void UpdateGroundAlignment(const float accelNorm[3],
     if (accelTrust < settings::sensors::ellipse20::kGroundAlignmentAccelTrustMin ||
         magTrust < settings::sensors::ellipse20::kGroundAlignmentMagTrustMin ||
         gyroNorm > settings::sensors::ellipse20::kStationaryGyroMaxRadPerSec) {
+        // Average only stable pad samples; movement restarts the alignment window.
         ResetGroundAlignment();
         return;
     }
@@ -599,6 +672,8 @@ void UpdateGroundAlignment(const float accelNorm[3],
         return;
     }
 
+    // Average quiet samples before building the initial attitude. Averaging
+    // reduces sensor noise without adding a runtime filter to the hot path.
     float avgAccel[3] = {
         g_groundAlignmentAccelSum[0] / static_cast<float>(g_groundAlignmentSampleCount),
         g_groundAlignmentAccelSum[1] / static_cast<float>(g_groundAlignmentSampleCount),
@@ -616,6 +691,8 @@ void UpdateGroundAlignment(const float accelNorm[3],
 }
 
 void QuaternionToYprDeg(const float q[4], float yprDeg[3]) {
+    // YPR is for human diagnostics only. The estimator/control path keeps using
+    // quaternions to avoid Euler singularities and axis-order ambiguity.
     const float q0 = q[0];
     const float q1 = q[1];
     const float q2 = q[2];
@@ -629,6 +706,7 @@ void QuaternionToYprDeg(const float q[4], float yprDeg[3]) {
     pitch *= kRadToDeg;
     roll *= kRadToDeg;
 
+    // Convert magnetic heading to local true-ish heading using configured declination.
     yaw = -(yaw + settings::sensors::ellipse20::kMagDeclinationDeg);
     while (yaw < 0.0f) {
         yaw += 360.0f;
@@ -652,6 +730,14 @@ void AdaptiveQuaternionUpdate(const float accelNorm[3],
         return;
     }
 
+    /*
+     * Complementary-observer structure:
+     *
+     * Gyro integration carries attitude between samples. Accel/mag feedback add
+     * small angular-rate corrections when their trust gates say the references
+     * are physically meaningful. This keeps the rail responsive without letting
+     * high-g flight acceleration masquerade as gravity.
+     */
     float learningError[3] = {0.0f, 0.0f, 0.0f};
     float feedback[3] = {0.0f, 0.0f, 0.0f};
 
@@ -662,6 +748,8 @@ void AdaptiveQuaternionUpdate(const float accelNorm[3],
 
         float accelError[3] = {0.0f, 0.0f, 0.0f};
         float accelFeedback[3] = {0.0f, 0.0f, 0.0f};
+        // Cross product gives the small rotation that would line measured up with
+        // predicted up.
         Cross3(accelNorm[0], accelNorm[1], accelNorm[2],
                predictedGravity[0], predictedGravity[1], predictedGravity[2],
                accelError);
@@ -682,6 +770,8 @@ void AdaptiveQuaternionUpdate(const float accelNorm[3],
         if (accelTrust > 0.0f) {
             haveMagError = ComputeBootstrapMagError(accelNorm, magNorm, magError);
         } else if (g_hasEarthMagReference) {
+            // Once an earth-frame magnetic reference is learned, it can provide
+            // heading correction even if accel correction is currently disabled.
             float predictedMag[3] = {0.0f, 0.0f, 0.0f};
             RotateEarthToBody(g_q, g_magReferenceEarth, predictedMag);
             Cross3(magNorm[0], magNorm[1], magNorm[2],
@@ -705,6 +795,9 @@ void AdaptiveQuaternionUpdate(const float accelNorm[3],
     const float gyroNorm = Magnitude3(gyroRadPerSec[0], gyroRadPerSec[1], gyroRadPerSec[2]);
     if (ShouldLearnGyroBias(accelTrust, gyroNorm)) {
         for (int i = 0; i < 3; ++i) {
+            // Bias learns from low-frequency correction error. If the observer
+            // repeatedly needs the same correction while stationary, that looks
+            // like gyro zero-rate bias.
             g_gyroBiasLearned[i] += settings::sensors::ellipse20::kGyroBiasLearningRate * learningError[i] * dt;
             g_gyroBiasLearned[i] =
                 fmaxf(-settings::sensors::ellipse20::kGyroBiasMaxRadPerSec,
@@ -715,12 +808,16 @@ void AdaptiveQuaternionUpdate(const float accelNorm[3],
     LimitVector(feedback, settings::sensors::ellipse20::kTotalCorrectionMaxRateRadPerSec);
 
     float correctedGyro[3] = {
+        // Remove learned zero-rate bias and add bounded accel/mag feedback before
+        // integrating attitude forward.
         gyroRadPerSec[0] - g_gyroBiasLearned[0] + feedback[0],
         gyroRadPerSec[1] - g_gyroBiasLearned[1] + feedback[1],
         gyroRadPerSec[2] - g_gyroBiasLearned[2] + feedback[2],
     };
 
     if (settings::ahrs::kEnableExponentialMap) {
+        // Exponential-map integration keeps large angular increments better
+        // behaved than the first-order quaternion update.
         const math_utils::Quaternion qCurrent = math_utils::MakeQuaternion(g_q[0], g_q[1], g_q[2], g_q[3]);
         const math_utils::Quaternion qUpdated = math_utils::ExponentialMapUpdate(
             qCurrent, correctedGyro[0], correctedGyro[1], correctedGyro[2], dt);
@@ -729,6 +826,7 @@ void AdaptiveQuaternionUpdate(const float accelNorm[3],
         g_q[2] = qUpdated.y;
         g_q[3] = qUpdated.z;
     } else {
+        // First-order fallback: integrate q_dot = 0.5*q*omega and renormalize.
         const float halfDt = 0.5f * dt;
         const float gx = correctedGyro[0] * halfDt;
         const float gy = correctedGyro[1] * halfDt;
@@ -755,6 +853,8 @@ void AdaptiveQuaternionUpdate(const float accelNorm[3],
 }
 
 void ResetCachedState() {
+    // Reset all derived products and trust references, but leave compile-time
+    // settings and serial configuration untouched.
     g_haveImu = false;
     g_haveMag = false;
     g_haveQuaternion = false;
@@ -808,6 +908,7 @@ void ConfigureSerial(uint32_t baudRate) {
     if (kRxPin >= 0 || kTxPin >= 0) {
         switch (kSerialPortIndex) {
             case 1:
+                // Pin remaps must happen before begin() on Teensy serial ports.
                 if (kRxPin >= 0) Serial1.setRX(kRxPin);
                 if (kTxPin >= 0) Serial1.setTX(kTxPin);
                 break;
@@ -844,6 +945,8 @@ void ConfigureSerial(uint32_t baudRate) {
         }
     }
     g_serialContext.serial->begin(baudRate);
+    // The SBG stream can burst; give the Teensy serial driver extra RX storage so
+    // the service loop can drain packets without losing bytes.
     ResolveImxrtSerialPort(g_serialContext.serial)
         ->addMemoryForRead(g_serialRxExtraBuffer, sizeof(g_serialRxExtraBuffer));
     g_serialContext.baudRate = baudRate;
@@ -853,12 +956,16 @@ void FlushInput() {
     if (g_serialContext.serial == nullptr) {
         return;
     }
+    // Drop old bytes before starting a command/probe session. Mixed old/new SBG
+    // frames make command ACK probing much harder to interpret.
     while (g_serialContext.serial->available() > 0) {
         g_serialContext.serial->read();
     }
 }
 
 void PublishFromState(SensorData &out, uint32_t nowUs) {
+    // Pulse has dedicated output fields so it can be compared against the selected
+    // main attitude rail without overwriting ICM/LSM data.
     out.timestamp = static_cast<float>(nowUs) * 1.0e-6f;
     for (int i = 0; i < 3; ++i) {
         out.accelPulse[i] = g_lastAccel[i];
@@ -883,6 +990,7 @@ SbgErrorCode SerialWrite(SbgInterface *pInterface, const void *pBuffer, size_t b
         return SBG_NO_ERROR;
     }
     const size_t written = g_serialContext.serial->write(static_cast<const uint8_t *>(pBuffer), bytesToWrite);
+    // The SBG library expects a transport-style status code, not a partial byte count.
     return written == bytesToWrite ? SBG_NO_ERROR : SBG_WRITE_ERROR;
 }
 
@@ -896,6 +1004,8 @@ SbgErrorCode SerialRead(SbgInterface *pInterface, void *pBuffer, size_t *pReadBy
         return SBG_NO_ERROR;
     }
     uint8_t *dst = static_cast<uint8_t *>(pBuffer);
+    // Non-blocking read: return whatever bytes are currently available and let
+    // sbgEComHandleOneLog call again later if a frame is incomplete.
     while ((*pReadBytes < bytesToRead) && (g_serialContext.serial->available() > 0)) {
         const int value = g_serialContext.serial->read();
         if (value < 0) {
@@ -937,6 +1047,7 @@ uint32_t SerialGetDelay(const SbgInterface *pInterface, size_t numBytes) {
     if (g_serialContext.baudRate == 0u) {
         return 0u;
     }
+    // Approximate serial transfer time with 10 bits/byte (start + 8 data + stop).
     return static_cast<uint32_t>((numBytes * 10000000ull) / g_serialContext.baudRate);
 }
 
@@ -948,6 +1059,8 @@ SbgErrorCode OnLogReceived(SbgEComHandle *pHandle,
 
 void ResetEComSession() {
     if (g_comHandleInitialized) {
+        // Close before changing baud/session settings so the SBG library drops
+        // any partially decoded frame state.
         sbgEComClose(&g_comHandle);
         g_comHandleInitialized = false;
     }
@@ -964,6 +1077,8 @@ bool SetupInterface(uint32_t baudRate) {
     FlushInput();
 
     sbgInterfaceZeroInit(&g_interface);
+    // Build an SBG interface around Arduino HardwareSerial callbacks. The C
+    // library never talks to Serial7 directly; it only sees this function table.
     g_interface.type = SBG_IF_TYPE_SERIAL;
     g_interface.handle = &g_serialContext;
     g_interface.pDestroyFunc = &SerialDestroy;
@@ -987,6 +1102,8 @@ bool OpenComSession(uint32_t baudRate) {
         return false;
     }
     g_comHandleInitialized = true;
+    // Keep command retries bounded so startup cannot hang forever on a missing
+    // or incorrectly configured Pulse unit.
     sbgEComSetCmdTrialsAndTimeOut(&g_comHandle, kCmdTrials, kCmdTimeoutMs);
     sbgEComSetReceiveLogCallback(&g_comHandle, &OnLogReceived, nullptr);
     return true;
@@ -998,6 +1115,8 @@ bool ProbeDeviceInfo() {
     }
     sbgEComPurgeIncoming(&g_comHandle);
     SbgEComDeviceInfo deviceInfo = {};
+    // Device-info command is the simplest proof that both baud and protocol
+    // framing are correct.
     return sbgEComCmdGetInfo(&g_comHandle, &deviceInfo) == SBG_NO_ERROR;
 }
 
@@ -1011,6 +1130,8 @@ void LogProtocolError(const char *prefix, SbgErrorCode errorCode) {
 }
 
 bool SaveSettingsAndReboot() {
+    // SBG settings are staged until explicitly saved. Save+reboot makes a baud
+    // migration survive power cycles.
     const SbgErrorCode errorCode = sbgEComCmdSettingsAction(&g_comHandle, SBG_ECOM_SAVE_SETTINGS);
     if (errorCode != SBG_NO_ERROR) {
         LogProtocolError("Pulse20: save+reboot failed", errorCode);
@@ -1023,6 +1144,14 @@ bool SaveSettingsAndReboot() {
 }
 
 bool MigrateComABaud(uint32_t fromBaud, uint32_t toBaud) {
+    /*
+     * Baud migration handles units that were left at the field-service baud.
+     * The sequence is:
+     *   1. open fallback baud,
+     *   2. command COM_A to preferred baud,
+     *   3. verify which baud is alive,
+     *   4. save settings and confirm after reboot.
+     */
     if (!OpenComSession(fromBaud)) {
         return false;
     }
@@ -1034,6 +1163,8 @@ bool MigrateComABaud(uint32_t fromBaud, uint32_t toBaud) {
     SbgEComInterfaceConf uartConf = {};
     uartConf.baudRate = toBaud;
     uartConf.mode = kPortMode;
+    // Some units ship at a fallback baud.  Move COM_A to the preferred rate and
+    // save it so the next boot can start directly there.
     const SbgErrorCode errorCode =
         sbgEComCmdInterfaceSetUartConf(&g_comHandle, SBG_ECOM_IF_COM_A, &uartConf);
     if (errorCode == SBG_NO_ERROR) {
@@ -1074,6 +1205,8 @@ bool MigrateComABaud(uint32_t fromBaud, uint32_t toBaud) {
 }
 
 bool StartAtPreferredBaud() {
+    // Normal launch path is preferred baud. Fallback migration is only a repair
+    // path for units that were previously configured differently.
     if (OpenComSession(kBaudRate) && ProbeDeviceInfo()) {
         return true;
     }
@@ -1101,6 +1234,8 @@ SbgErrorCode OnLogReceived(SbgEComHandle *pHandle,
     const uint32_t nowUs = micros();
     switch (msg) {
         case SBG_ECOM_LOG_IMU_DATA:
+            // IMU log is the clock for fresh acquisition because it carries the
+            // high-rate accel/gyro data used by the observer.
             for (int i = 0; i < 3; ++i) {
                 g_rawAccel[i] = pLogData->imuData.accelerometers[i];
                 g_rawGyro[i] = pLogData->imuData.gyroscopes[i];
@@ -1112,6 +1247,8 @@ SbgErrorCode OnLogReceived(SbgEComHandle *pHandle,
             break;
 
         case SBG_ECOM_LOG_MAG:
+            // Mag arrives at a lower rate. The latest recent mag sample can be
+            // paired with a fresh IMU sample for guarded heading correction.
             for (int i = 0; i < 3; ++i) {
                 g_rawMag[i] = pLogData->magData.magnetometers[i];
             }
@@ -1127,6 +1264,8 @@ SbgErrorCode OnLogReceived(SbgEComHandle *pHandle,
 }
 
 bool ConfigureOutputs() {
+    // Configure only the raw logs this wrapper consumes. Navigation-position
+    // products are intentionally unused so Pulse stays a comparison IMU rail.
     const struct {
         SbgEComMsgId msgId;
         SbgEComOutputMode mode;
@@ -1158,6 +1297,8 @@ uint8_t DrainIncomingLogs(uint32_t budgetUs) {
     uint8_t handledFrames = 0u;
     const uint32_t startUs = micros();
     do {
+        // Keep serial parsing time-bounded so telemetry cannot starve the flight
+        // loop.
         const SbgErrorCode errorCode = sbgEComHandleOneLog(&g_comHandle);
         if (errorCode == SBG_NOT_READY) {
             break;
@@ -1167,6 +1308,8 @@ uint8_t DrainIncomingLogs(uint32_t budgetUs) {
         }
     } while (static_cast<uint32_t>(micros() - startUs) < budgetUs);
 
+    // Return count is useful for future diagnostics, even though callers mostly
+    // care that the cache has been refreshed opportunistically.
     return handledFrames;
 }
 
@@ -1181,6 +1324,8 @@ bool Ellipse20SensorBegin() {
     }
 
     ResetCachedState();
+    // Startup is all-or-nothing. If the Pulse rail cannot be configured, leave
+    // it disabled rather than publishing partially initialized diagnostics.
     if (!StartAtPreferredBaud()) {
         ResetEComSession();
         return false;
@@ -1201,6 +1346,8 @@ void Ellipse20SensorService() {
         return;
     }
 
+    // Service can be called outside Acquire to keep the serial FIFO short. The
+    // actual publish decision still happens in Acquire.
     DrainIncomingLogs(kServiceBudgetUs);
 }
 
@@ -1234,6 +1381,8 @@ bool Ellipse20SensorAcquire(SensorData &out) {
             g_lastAcquireUsedCache = false;
             return false;
         }
+        // No new IMU timestamp, but the last sample is still fresh enough to
+        // publish as cache.
         g_lastAcquireUsedCache = true;
         PublishFromState(out, nowUs);
         return true;
@@ -1243,10 +1392,14 @@ bool Ellipse20SensorAcquire(SensorData &out) {
     if (g_lastProcessedImuSensorTimestampUs != 0u) {
         const uint32_t deltaUs = g_lastImuSensorTimestampUs - g_lastProcessedImuSensorTimestampUs;
         if (deltaUs > 0u && deltaUs <= 100000u) {
+            // Use sensor time for AHRS integration so host-loop jitter does not
+            // appear as artificial angular-rate error.
             dt = static_cast<float>(deltaUs) * 1.0e-6f;
         }
     }
 
+    // SBG gyro is already rad/s.  Remove configured bias, apply optional
+    // temperature slope, then rotate into body axes.
     float gyroRadPerSec[3] = {
         g_rawGyro[0] - settings::sensors::ellipse20::kGyroOffset[0] -
             settings::sensors::ellipse20::kGyroTempBiasSlopeRadPerSecPerC[0] *
@@ -1265,9 +1418,13 @@ bool Ellipse20SensorAcquire(SensorData &out) {
         g_rawAccel[1] - settings::sensors::ellipse20::kAccelBias[1],
         g_rawAccel[2] - settings::sensors::ellipse20::kAccelBias[2],
     };
+    // Apply calibration before mount rotation. Calibration matrices are fit in
+    // the sensor's native engineering frame.
     Apply3x3(settings::sensors::ellipse20::kAccelAinv, accelBody, accelBody);
     ApplyMountRotation(accelBody);
     const float accelMagnitudeG = Magnitude3(accelBody[0], accelBody[1], accelBody[2]) / kGToMps2;
+    // Direction and magnitude are separated because direction corrects attitude,
+    // while magnitude decides whether accel should be trusted.
     float accelNorm[3] = {accelBody[0], accelBody[1], accelBody[2]};
     Normalize3(accelNorm[0], accelNorm[1], accelNorm[2]);
 
@@ -1276,9 +1433,11 @@ bool Ellipse20SensorAcquire(SensorData &out) {
         g_rawMag[1] - settings::sensors::ellipse20::kMagBias[1],
         g_rawMag[2] - settings::sensors::ellipse20::kMagBias[2],
     };
+    // Same calibration-before-mount pattern for magnetometer soft/hard iron.
     Apply3x3(settings::sensors::ellipse20::kMagAinv, magBody, magBody);
     ApplyMountRotation(magBody);
     const float magMagnitude = Magnitude3(magBody[0], magBody[1], magBody[2]);
+    // Magnetic magnitude gates trust; normalized direction is used for yaw.
     float magNorm[3] = {magBody[0], magBody[1], magBody[2]};
     Normalize3(magNorm[0], magNorm[1], magNorm[2]);
 
@@ -1296,6 +1455,8 @@ bool Ellipse20SensorAcquire(SensorData &out) {
 
     if (g_groundAlignmentReady) {
         if (magRecent) {
+            // References update only when fresh mag is available; gyro-only IMU
+            // updates still propagate attitude but do not teach magnetic baseline.
             UpdateMagMagnitudeReference(magMagnitude, magTrust);
             UpdateEarthMagReference(magNorm, accelTrust, magTrust);
         }
@@ -1315,6 +1476,8 @@ bool Ellipse20SensorAcquire(SensorData &out) {
                 ++g_invalidQuaternionStreak;
             }
             if (!g_haveQuaternion || g_invalidQuaternionStreak >= kQuaternionInvalidDropThreshold) {
+                // After repeated invalid math, stop publishing Pulse attitude
+                // rather than logging a stale quaternion as if it were live.
                 g_haveQuaternion = false;
                 g_haveYpr = false;
             }

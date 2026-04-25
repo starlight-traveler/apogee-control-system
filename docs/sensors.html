@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Sensors | ACS Docs</title>
+    <meta name="description" content="Sensor rail and frame documentation for the apogee control system.">
+    <meta name="color-scheme" content="light dark">
+    <link rel="stylesheet" href="assets/acs-docs.css">
+    <script src="assets/acs-docs.js" defer></script>
+</head>
+<body>
+<div class="page">
+    <nav class="top-nav" aria-label="Primary">
+        <a class="site-name" href="index.html"><strong>ACS</strong> Docs</a>
+        <ul class="top-links">
+            <li><a href="index.html">Overview</a></li>
+            <li><a href="flight-loop.html">Loop</a></li>
+            <li><a href="predictor.html">Predictor</a></li>
+            <li><a href="sensors.html" aria-current="page">Sensors</a></li>
+            <li><a href="replay.html">Replay</a></li>
+        </ul>
+    </nav>
+
+    <main>
+        <section class="hero-full reveal">
+            <div class="section-label">Sensor rails</div>
+            <h1>Fresh, framed, and matched.</h1>
+            <p class="desc">
+                The sensor code has one recurring theme: a number is not useful until the firmware knows when it was measured, which frame it is in, and whether it belongs with the selected attitude source.
+            </p>
+        </section>
+
+        <section class="reveal">
+            <div class="section-head">
+                <h2>Rail explorer</h2>
+                <div class="section-label">Click a rail</div>
+            </div>
+            <div class="controls" role="tablist" aria-label="Sensor rails">
+                <button class="control-btn active" data-rail-toggle="baro" aria-selected="true">Baro</button>
+                <button class="control-btn" data-rail-toggle="icm" aria-selected="false">ICM</button>
+                <button class="control-btn" data-rail-toggle="lsm" aria-selected="false">LSM</button>
+                <button class="control-btn" data-rail-toggle="bno" aria-selected="false">BNO</button>
+                <button class="control-btn" data-rail-toggle="pulse" aria-selected="false">Pulse</button>
+                <button class="control-btn" data-rail-toggle="wt901" aria-selected="false">WT901</button>
+            </div>
+            <div class="interactive-panel">
+                <div data-rail-detail="baro">
+                    <h3>BMP585 and MS5611</h3>
+                    <p class="muted">BMP585 is the primary altitude source. Fresh finite altitude is required for pad reference, AGL use, baro liftoff backup, and baro/state agreement gates. MS5611 is a secondary pressure rail for comparison and diagnostics.</p>
+                </div>
+                <div data-rail-detail="icm" hidden>
+                    <h3>ICM20948</h3>
+                    <p class="muted">Fast accel/gyro rail with optional DMP quaternion. If ICM attitude is selected, fresh ICM accel is preferred so attitude and acceleration share the same frame errors.</p>
+                </div>
+                <div data-rail-detail="lsm" hidden>
+                    <h3>LSM9DS1</h3>
+                    <p class="muted">Independent fast rail with accel, gyro, mag, and a phase-aware observer. If LSM attitude is selected, fresh LSM accel is preferred. Mag and accel correction are gated by phase and trust.</p>
+                </div>
+                <div data-rail-detail="bno" hidden>
+                    <h3>BNO055 / BNO085</h3>
+                    <p class="muted">Reference attitude rail. BNO can trim coast attitude only after fresh post-burnout samples, tilt agreement, minimum sample count, and a ramped blend. It should not override the fast rails abruptly.</p>
+                </div>
+                <div data-rail-detail="pulse" hidden>
+                    <h3>Ellipse / Pulse20</h3>
+                    <p class="muted">Optional high-quality sidecar IMU parsed through the SBG serial protocol. It publishes raw IMU and mag into ACS body frame, with bounded serial service so it cannot starve the flight loop.</p>
+                </div>
+                <div data-rail-detail="wt901" hidden>
+                    <h3>WT901</h3>
+                    <p class="muted">Comparison rail. Its values are converted into body-frame m/s^2, rad/s, YPR, and quaternion diagnostics so frame mistakes and rail disagreement can be seen in replay plots.</p>
+                </div>
+            </div>
+        </section>
+
+        <section class="reveal">
+            <div class="section-head">
+                <h2>Frame contract</h2>
+                <div class="section-label">Body axes</div>
+            </div>
+            <div class="grid-three">
+                <div class="card">
+                    <h3>Body +Z</h3>
+                    <p>Rocket vertical/up axis when on the pad. Static gravity checks should show dominant +Z after mount rotation.</p>
+                </div>
+                <div class="card">
+                    <h3>Body +X / +Y</h3>
+                    <p>Lateral axes used for tilt, horizontal speed seed, and frame comparison. Sign mistakes here become false zenith and bad AoA.</p>
+                </div>
+                <div class="card">
+                    <h3>Quaternion wxyz</h3>
+                    <p>All quaternion math uses w, x, y, z order. The code normalizes and validates quaternions before using them as attitude truth.</p>
+                </div>
+            </div>
+        </section>
+
+        <section class="reveal">
+            <div class="section-head">
+                <h2>Freshness rules</h2>
+                <div class="section-label">Why it matters</div>
+            </div>
+            <ul class="checklist">
+                <li><span class="mark">01</span><span>Cached sensor values may be logged for continuity, but phase transitions should use fresh evidence.</span></li>
+                <li><span class="mark">02</span><span>Baro AGL is valid only when pad reference exists and the current baro sample is fresh and finite.</span></li>
+                <li><span class="mark">03</span><span>Quaternion freshness and accel freshness are checked independently because they can update at different rates.</span></li>
+                <li><span class="mark">04</span><span>Cross-check trust lets one rail reduce another rail's correction authority without deleting the data from logs.</span></li>
+            </ul>
+        </section>
+    </main>
+
+    <footer>
+        <span>Sensor notes</span>
+        <ul class="footer-links">
+            <li><a href="../src/imu_orientation.h">Frame source</a></li>
+            <li><a href="../src/settings.h">Settings</a></li>
+            <li><a href="replay.html">Next: replay</a></li>
+        </ul>
+    </footer>
+</div>
+</body>
+</html>

@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Flight Loop | ACS Docs</title>
+    <meta name="description" content="Detailed flight-loop walkthrough for the apogee control system.">
+    <meta name="color-scheme" content="light dark">
+    <link rel="stylesheet" href="assets/acs-docs.css">
+    <script src="assets/acs-docs.js" defer></script>
+</head>
+<body>
+<div class="page">
+    <nav class="top-nav" aria-label="Primary">
+        <a class="site-name" href="index.html"><strong>ACS</strong> Docs</a>
+        <ul class="top-links">
+            <li><a href="index.html">Overview</a></li>
+            <li><a href="flight-loop.html" aria-current="page">Loop</a></li>
+            <li><a href="predictor.html">Predictor</a></li>
+            <li><a href="sensors.html">Sensors</a></li>
+            <li><a href="replay.html">Replay</a></li>
+        </ul>
+    </nav>
+
+    <main>
+        <section class="hero-full reveal">
+            <div class="section-label">Runtime pipeline</div>
+            <h1>The loop is a set of gates.</h1>
+            <p class="desc">
+                The firmware loop is written to keep control authority behind evidence. Measurements must be fresh, frames must be known, phases must be confirmed, and the predictor must stay inside trusted coverage before the flaps are allowed to add drag.
+            </p>
+        </section>
+
+        <section class="reveal">
+            <div class="section-head">
+                <h2>Signal path</h2>
+                <div class="section-label">Animated map</div>
+            </div>
+            <div class="signal-flow" aria-label="Animated signal flow">
+                <div class="signal-node">
+                    <div class="label">Acquire</div>
+                    <div class="value">sensors</div>
+                </div>
+                <div class="signal-node">
+                    <div class="label">Normalize</div>
+                    <div class="value">frames</div>
+                </div>
+                <div class="signal-node">
+                    <div class="label">Estimate</div>
+                    <div class="value">state</div>
+                </div>
+                <div class="signal-node">
+                    <div class="label">Predict</div>
+                    <div class="value">apogee</div>
+                </div>
+                <div class="signal-node">
+                    <div class="label">Command</div>
+                    <div class="value">flaps</div>
+                </div>
+            </div>
+        </section>
+
+        <section class="reveal">
+            <div class="section-head">
+                <h2>Phase explorer</h2>
+                <div class="section-label">Click a phase</div>
+            </div>
+            <div class="controls" role="tablist" aria-label="Flight phases">
+                <button class="control-btn active" data-phase-target="ground" aria-selected="true">Ground</button>
+                <button class="control-btn" data-phase-target="burn" aria-selected="false">Burn</button>
+                <button class="control-btn" data-phase-target="coast" aria-selected="false">Coast</button>
+                <button class="control-btn" data-phase-target="overshoot" aria-selected="false">Overshoot</button>
+                <button class="control-btn" data-phase-target="descent" aria-selected="false">Descent</button>
+            </div>
+            <div class="phase-strip">
+                <div class="phase" data-phase="ground" data-active="true">
+                    <div class="name">Ground</div>
+                    <div class="text">Pad reference and filter covariance settle before launch.</div>
+                </div>
+                <div class="phase" data-phase="burn">
+                    <div class="name">Burn</div>
+                    <div class="text">Motor thrust is active; predictor is not coast truth yet.</div>
+                </div>
+                <div class="phase" data-phase="coast">
+                    <div class="name">Coast</div>
+                    <div class="text">Apogee control becomes meaningful after burnout holdoff.</div>
+                </div>
+                <div class="phase" data-phase="overshoot">
+                    <div class="name">Overshoot</div>
+                    <div class="text">Altitude has exceeded target, but the rocket may still climb.</div>
+                </div>
+                <div class="phase" data-phase="descent">
+                    <div class="name">Descent</div>
+                    <div class="text">Vertical velocity crossed downward; maximum altitude is retained.</div>
+                </div>
+            </div>
+            <div class="interactive-panel" style="margin-top: 18px;">
+                <div data-phase-copy="ground">
+                    <h3>Ground gates</h3>
+                    <p class="muted">Fresh baro defines pad-relative altitude. Ground constraints keep z and vz near zero. Liftoff requires confirmed acceleration or a strict baro backup: initialized reference, positive altitude, positive baro-derived velocity, and repeated samples.</p>
+                </div>
+                <div data-phase-copy="burn" hidden>
+                    <h3>Burn gates</h3>
+                    <p class="muted">Burn detection is latched from confirmed liftoff evidence. The predictor can run for telemetry, but it does not model thrust or mass burn, so automatic flap control stays disabled.</p>
+                </div>
+                <div data-phase-copy="coast" hidden>
+                    <h3>Coast gates</h3>
+                    <p class="muted">Burnout requires minimum burn time, sustained low acceleration, upward velocity, and confirmation samples. After coast starts, a holdoff gives the estimator and attitude path time to settle before first flap motion.</p>
+                </div>
+                <div data-phase-copy="overshoot" hidden>
+                    <h3>Overshoot gates</h3>
+                    <p class="muted">Overshoot means measured altitude has passed target. Attitude propagation, BNO coast trim, prediction, and descent detection still continue because the vehicle may be ascending.</p>
+                </div>
+                <div data-phase-copy="descent" hidden>
+                    <h3>Descent gates</h3>
+                    <p class="muted">Descent is declared when vertical velocity and acceleration gates indicate apogee has passed. The recorded apogee uses max observed altitude so a slightly late transition does not lose the peak.</p>
+                </div>
+            </div>
+        </section>
+
+        <section class="reveal">
+            <div class="section-head">
+                <h2>Critical invariants</h2>
+                <div class="section-label">Do not break</div>
+            </div>
+            <ul class="checklist">
+                <li><span class="mark">01</span><span>Freshness is separate from initialization. A sensor can be online and still stale this loop.</span></li>
+                <li><span class="mark">02</span><span>Selected single-rail attitude should prefer matching fresh accel from the same rail.</span></li>
+                <li><span class="mark">03</span><span>Baro AGL must require fresh finite altitude, not only an initialized pad reference.</span></li>
+                <li><span class="mark">04</span><span>Overshoot still behaves like coast for attitude propagation while ascent continues.</span></li>
+                <li><span class="mark">05</span><span>Presentation smoothing must not delay phase detection or predictor seed logic.</span></li>
+            </ul>
+        </section>
+    </main>
+
+    <footer>
+        <span>Flight loop notes</span>
+        <ul class="footer-links">
+            <li><a href="index.html">Overview</a></li>
+            <li><a href="predictor.html">Next: predictor</a></li>
+            <li><a href="../src/flight_computer.cpp">Source</a></li>
+        </ul>
+    </footer>
+</div>
+</body>
+</html>

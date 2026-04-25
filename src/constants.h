@@ -1,6 +1,12 @@
 #pragma once
 
-// Lightweight equivalents to constants.py for use on the Teensy flight computer.
+/*
+ * Shared physical constants for firmware-side math.
+ *
+ * The replay tooling has Python equivalents; keeping these values together
+ * makes it easier to spot unit mismatches between onboard prediction and
+ * offline validation.
+ */
 namespace constants {
 
 constexpr double kGravity = 9.8067;            // [m/s^2]

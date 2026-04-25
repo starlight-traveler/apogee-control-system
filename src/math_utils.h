@@ -13,8 +13,22 @@
 #define MATHUTILS_HAVE_ARM_MATH 0
 #endif
 
-// Minimal vector and quaternion helpers mirroring math_lib.py functionality.
+/// Minimal vector and quaternion helpers mirrored from the Python analysis tools.
+///
+/// These functions stay header-only because they are used heavily in estimator,
+/// replay, and predictor paths where small math helpers should inline cleanly.
 namespace math_utils {
+
+/*
+ * Quaternion convention in this codebase:
+ *
+ *   q = [w, x, y, z]
+ *
+ * Quaternions represent attitude without the singularity problems of Euler
+ * angles. They still need care: they should stay unit length, q and -q mean the
+ * same physical orientation, and interpolation should follow the shortest arc.
+ * Most helpers below either preserve those properties or repair small drift.
+ */
 
 struct Vec3 {
     float x;
@@ -47,6 +61,8 @@ inline Vec3d MakeVec3d(double x, double y, double z) { return Vec3d{x, y, z}; }
 
 inline void FastSinCos(float angleRadians, float &sineOut, float &cosineOut) {
 #if MATHUTILS_HAVE_ARM_MATH
+    // CMSIS expects degrees for arm_sin_cos_f32, while the rest of the code
+    // stores attitude in radians.
     constexpr float kRadToDeg = 57.295779513082320876f;
     arm_sin_cos_f32(angleRadians * kRadToDeg, &sineOut, &cosineOut);
 #else
@@ -131,6 +147,8 @@ inline Vec3 Normalize(const Vec3 &v) {
     if (mag <= 0.0f) {
         return Vec3{0.0f, 0.0f, 0.0f};
     }
+    // Unit vectors are used for directions such as gravity or magnetic heading.
+    // Scaling removes sensor magnitude while preserving direction.
     const float inv = 1.0f / mag;
     return Scale(v, inv);
 }
@@ -153,6 +171,8 @@ inline Quaterniond MakeQuaternion(double w, double x, double y, double z) {
 }
 
 inline Quaternion Multiply(const Quaternion &a, const Quaternion &b) {
+    // Quaternion multiplication composes rotations. Order matters: a*b means
+    // apply b, then a in the usual active-rotation convention.
     return Quaternion{
         a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z,
         a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
@@ -175,6 +195,8 @@ inline Quaternion Normalize(const Quaternion &q) {
     if (norm <= 0.0f) {
         return Quaternion{1.0f, 0.0f, 0.0f, 0.0f};
     }
+    // A rotation quaternion must be unit length. Normalizing after integration or
+    // blending prevents scale drift from becoming a fake rotation.
     const float inv = 1.0f / norm;
     return Quaternion{q.w * inv, q.x * inv, q.y * inv, q.z * inv};
 }
@@ -210,6 +232,9 @@ inline double Clamp(double value, double minValue, double maxValue) {
 
 inline void QuaternionToEuler(const Quaternion &q, float &yaw, float &pitch, float &roll) {
     // Match python/convert.py (psi, theta, phi) convention exactly.
+    //
+    // Euler angles are only for diagnostics/logging here. The filters keep using
+    // quaternions internally so they do not hit gimbal-lock style singularities.
     const float w = q.w;
     const float x = q.x;
     const float y = q.y;
@@ -221,6 +246,7 @@ inline void QuaternionToEuler(const Quaternion &q, float &yaw, float &pitch, flo
     const float r32 = 2.0f * (y * z - w * x);
     const float r33 = 2.0f * w * w - 1.0f + 2.0f * z * z;
 
+    // These are rotation-matrix terms expanded directly from the quaternion.
     roll = FastAtan2(r32, r33);
 
     const float r31Clamped = Clamp(r31, -1.0f, 1.0f);
@@ -251,6 +277,8 @@ inline void QuaternionToEuler(const Quaterniond &q, double &yaw, double &pitch, 
 }
 
 inline float EulerToZenith(float pitch, float roll) {
+    // Zenith is tilt away from vertical. It ignores yaw because yaw does not
+    // change how much frontal area the rocket presents to the airflow.
     float sinPitch;
     float cosPitch;
     float sinRoll;
@@ -259,8 +287,8 @@ inline float EulerToZenith(float pitch, float roll) {
     FastSinCos(roll, sinRoll, cosRoll);
     (void)sinPitch;
     (void)sinRoll;
-    // Folded zenith: use |cosZenith| to get tilt from vertical (0-90°)
-    // regardless of sensor mounting convention (whether +Z points to nose or tail)
+    // Folded zenith uses |cosZenith| to get tilt from vertical even if the IMU
+    // mounting makes +Z point opposite the expected direction.
     const float value = Clamp(cosPitch * cosRoll, -1.0f, 1.0f);
     return acosf(fabsf(value));
 }
@@ -271,15 +299,14 @@ inline double EulerToZenith(double pitch, double roll) {
     return acos(fabs(value));
 }
 
-// ---------------------------------------------------------------------------
-// Direct Quaternion to Zenith (Folded)
-// Computes zenith angle (tilt from vertical) directly from quaternion without
-// intermediate Euler conversion. Uses |cosZenith| to return folded zenith
-// in range [0, π/2] (0-90°), giving actual tilt from vertical regardless of
-// sensor mounting convention (whether +Z points to nose or tail).
-// zenith = acos(|R[2][2]|) where R[2][2] = 1 - 2*(x² + y²)
-// ---------------------------------------------------------------------------
+/// Computes folded zenith angle directly from a quaternion.
+///
+/// `R[2][2]` is the vertical component of the body Z axis. Taking `abs` gives
+/// tilt from vertical in [0, pi/2] even if the sensor is mounted nose-up or
+/// tail-up relative to the body frame.
 inline float QuaternionToZenith(const Quaternion &q) {
+    // This is the quaternion version of pitch/roll zenith. It is cheaper and
+    // avoids converting through Euler angles.
     const float cosZenith = 1.0f - 2.0f * (q.x * q.x + q.y * q.y);
     return acosf(fabsf(Clamp(cosZenith, -1.0f, 1.0f)));
 }
@@ -294,12 +321,9 @@ inline float QuaternionToZenithArray(const float q[4]) {
     return acosf(fabsf(Clamp(cosZenith, -1.0f, 1.0f)));
 }
 
-// ---------------------------------------------------------------------------
-// Quaternion Non-Identity Check
-// Returns true if quaternion represents a rotation of at least minAngleRad.
-// Useful for detecting uninitialized or stuck-at-identity quaternions.
-// For a quaternion q, the rotation angle is 2*acos(|w|).
-// ---------------------------------------------------------------------------
+/// Returns true if a quaternion represents at least `minAngleRad` of rotation.
+///
+/// This is useful for spotting sensors stuck at identity after boot.
 inline bool QuaternionHasRotation(const Quaternion &q, float minAngleRad = 0.01f) {
     // Rotation angle = 2 * acos(|w|), so |w| < cos(minAngle/2) means rotation > minAngle
     const float cosHalfMin = cosf(minAngleRad * 0.5f);
@@ -311,10 +335,7 @@ inline bool QuaternionHasRotationArray(const float q[4], float minAngleRad = 0.0
     return fabsf(q[0]) < cosHalfMin;
 }
 
-// ---------------------------------------------------------------------------
-// Fast Inverse Square Root
-// Uses ARM intrinsics when available, otherwise Quake-style approximation.
-// ---------------------------------------------------------------------------
+/// Computes an approximate reciprocal square root for normalization paths.
 inline float FastInvSqrt(float x) {
     if (x <= 0.0f) {
         return 0.0f;
@@ -330,6 +351,8 @@ inline float FastInvSqrt(float x) {
     return 1.0f / estimate;
 #else
     // Quake III fast inverse square root with one Newton-Raphson iteration.
+    // The exact last bit is not important for trust gates or vector directions;
+    // the speed is useful in hot normalization paths.
     union {
         float f;
         uint32_t i;
@@ -348,23 +371,22 @@ inline double FastInvSqrt(double x) {
     return 1.0 / sqrt(x);
 }
 
-// ---------------------------------------------------------------------------
-// Quaternion Magnitude Validation
-// Checks if quaternion norm is within acceptable bounds.
-// Returns true if valid, false if corrupted (and resets to identity).
-// ---------------------------------------------------------------------------
+/// Validates and renormalizes a quaternion in-place.
+///
+/// A badly corrupted quaternion is reset to identity. A slightly non-unit one
+/// is normalized so later rotation math stays bounded.
 inline bool ValidateQuaternion(Quaternion &q) {
     const float normSq = q.w * q.w + q.x * q.x + q.y * q.y + q.z * q.z;
-    // Check for NaN/Inf or magnitude way out of bounds
+    // NaN/Inf or a large norm error means the quaternion is unsafe to use.
     if (!std::isfinite(normSq) || normSq < 0.5f || normSq > 2.0f) {
-        // Severely corrupted - reset to identity
+        // Reset to identity rather than letting bad attitude contaminate filters.
         q.w = 1.0f;
         q.x = 0.0f;
         q.y = 0.0f;
         q.z = 0.0f;
         return false;
     }
-    // Check if slightly out of unit bounds - renormalize
+    // Small drift is expected from numerical integration; renormalize it.
     if (normSq < 0.98f || normSq > 1.02f) {
         const float inv = FastInvSqrt(normSq);
         q.w *= inv;
@@ -443,11 +465,14 @@ inline double Dot(const Quaterniond &a, const Quaterniond &b) {
     return a.w * b.w + a.x * b.x + a.y * b.y + a.z * b.z;
 }
 
-// ---------------------------------------------------------------------------
-// Spherical Linear Interpolation (SLERP)
-// Blends between two quaternions along the shortest arc on the unit sphere.
-// ---------------------------------------------------------------------------
+/// Blends between two quaternions along the shortest arc on the unit sphere.
 inline Quaternion Slerp(const Quaternion &a, const Quaternion &b, float t) {
+    /*
+     * Slerp blends attitudes by moving along the surface of the unit quaternion
+     * sphere. Linear interpolation is fine for nearly equal quaternions, but for
+     * larger differences it can cut through the sphere and imply the wrong angular
+     * speed unless it is normalized.
+     */
     // Clamp t to [0, 1].
     if (t <= 0.0f) {
         return a;
@@ -456,10 +481,10 @@ inline Quaternion Slerp(const Quaternion &a, const Quaternion &b, float t) {
         return b;
     }
 
-    // Compute cosine of angle between quaternions.
+    // Dot product gives the cosine of the half-angle between orientations.
     float cosHalfTheta = Dot(a, b);
 
-    // If negative dot, negate one quaternion to take the shorter path.
+    // q and -q represent the same orientation; flip sign to take the short path.
     Quaternion bAdjusted = b;
     if (cosHalfTheta < 0.0f) {
         bAdjusted.w = -b.w;
@@ -469,7 +494,7 @@ inline Quaternion Slerp(const Quaternion &a, const Quaternion &b, float t) {
         cosHalfTheta = -cosHalfTheta;
     }
 
-    // If quaternions are very close, use linear interpolation to avoid division by zero.
+    // Very close quaternions can be blended linearly without visible error.
     if (cosHalfTheta > 0.9995f) {
         Quaternion result;
         result.w = a.w + t * (bAdjusted.w - a.w);
@@ -479,7 +504,7 @@ inline Quaternion Slerp(const Quaternion &a, const Quaternion &b, float t) {
         return Normalize(result);
     }
 
-    // Standard SLERP formula.
+    // Standard spherical interpolation weights each endpoint by sine distance.
     const float halfTheta = acosf(Clamp(cosHalfTheta, -1.0f, 1.0f));
     const float sinHalfTheta = sinf(halfTheta);
     if (sinHalfTheta < 1.0e-6f) {
@@ -542,12 +567,17 @@ inline Quaterniond Slerp(const Quaterniond &a, const Quaterniond &b, double t) {
     return Normalize(result);
 }
 
-// ---------------------------------------------------------------------------
-// Exponential Map Quaternion Update
-// More accurate integration than first-order Euler: q_new = exp(0.5 * omega * dt) * q_old
-// Uses Taylor series for small angles, Rodrigues formula for larger angles.
-// ---------------------------------------------------------------------------
+/// Integrates gyro angular rate into a quaternion with an exponential map.
+///
+/// This applies the small rotation represented by omega*dt to the previous
+/// attitude. Small angles use a Taylor approximation to avoid numerical trouble.
 inline Quaternion ExponentialMapUpdate(const Quaternion &q, float wx, float wy, float wz, float dt) {
+    /*
+     * Gyro integration is "apply the rotation measured during this timestep."
+     * The exponential map converts angular rate * dt into exactly that small
+     * quaternion rotation. This is better behaved than directly integrating Euler
+     * angles, especially when the rocket is tilted or rolling.
+     */
     // Half-angle vector.
     const float hx = 0.5f * wx * dt;
     const float hy = 0.5f * wy * dt;
@@ -558,15 +588,14 @@ inline Quaternion ExponentialMapUpdate(const Quaternion &q, float wx, float wy, 
 
     float dqW, dqX, dqY, dqZ;
     if (thetaSq < kSmallAngleThresholdSq) {
-        // Small angle: use Taylor series expansion.
-        // exp(theta) ≈ 1 + theta + theta^2/2 (for quaternion: cos(|h|) ≈ 1 - |h|^2/2, sin(|h|)/|h| ≈ 1 - |h|^2/6)
+        // Small angle: approximate sin(theta)/theta and cos(theta) directly.
         dqW = 1.0f - 0.5f * thetaSq;
         const float sincApprox = 1.0f - thetaSq / 6.0f;
         dqX = hx * sincApprox;
         dqY = hy * sincApprox;
         dqZ = hz * sincApprox;
     } else {
-        // Larger angle: use full Rodrigues formula.
+        // Larger angle: compute the exact unit rotation from the half-angle vector.
         const float theta = FastSqrt(thetaSq);
         float sinTheta, cosTheta;
         FastSinCos(theta, sinTheta, cosTheta);
@@ -623,12 +652,10 @@ inline Quaterniond ExponentialMapUpdate(const Quaterniond &q, double wx, double 
     return Normalize(result);
 }
 
-// ---------------------------------------------------------------------------
-// Weighted Quaternion Blend
-// Blends multiple quaternions using weighted SLERP for multi-IMU fusion.
-// ---------------------------------------------------------------------------
+/// Blends two attitude estimates with relative weights.
 inline Quaternion WeightedQuaternionBlend(const Quaternion &q1, float w1,
                                           const Quaternion &q2, float w2) {
+    // Convert weights into a Slerp fraction so the blend stays on the unit sphere.
     const float totalWeight = w1 + w2;
     if (totalWeight <= 0.0f) {
         return q1;
