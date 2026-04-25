@@ -134,6 +134,9 @@ tools/replay/predictor_sim_*.csv
 tools/replay/predictor_sim_*.svg
 tools/replay/*_replay_*.svg
 
+# Generated Doxygen API docs
+docs/api/
+
 # Local replay/generated files
 standalone-c/*.BIN
 standalone-c/*.bin

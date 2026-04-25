@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Code Highlights | ACS Docs</title>
+    <meta name="description" content="Implementation highlights and source walkthrough for the apogee control system firmware.">
+    <meta name="color-scheme" content="light dark">
+    <link rel="stylesheet" href="assets/acs-docs.css">
+    <script src="assets/acs-docs.js" defer></script>
+</head>
+<body>
+<div class="page">
+    <nav class="top-nav" aria-label="Primary">
+        <a class="site-name" href="index.html"><strong>ACS</strong> Docs</a>
+        <ul class="top-links">
+            <li><a href="index.html">Overview</a></li>
+            <li><a href="flight-loop.html">Loop</a></li>
+            <li><a href="predictor.html">Predictor</a></li>
+            <li><a href="math.html">Math</a></li>
+            <li><a href="code.html" aria-current="page">Code</a></li>
+            <li><a href="sensors.html">Sensors</a></li>
+            <li><a href="replay.html">Replay</a></li>
+        </ul>
+    </nav>
+
+    <main>
+        <section class="hero-full reveal">
+            <div class="section-label">Source walkthrough</div>
+            <h1>Code tricks that make the flight path safer.</h1>
+            <p class="desc">
+                This page points at the implementation details worth understanding before changing the system. The theme is consistent: compute a useful estimate, carry confidence with it, and let actuator safety logic see the confidence instead of hiding it inside a number.
+            </p>
+        </section>
+
+        <section class="reveal">
+            <div class="section-head">
+                <h2>Highlights</h2>
+                <div class="section-label">Fast tour</div>
+            </div>
+            <div class="highlight-strip">
+                <div class="highlight-item">
+                    <div class="number">01</div>
+                    <h3>Prediction flags</h3>
+                    <p class="muted">Bad model coverage is not only a weird output value. It becomes a bit flag that the controller can use to retract.</p>
+                </div>
+                <div class="highlight-item">
+                    <div class="number">02</div>
+                    <h3>Two-pass flap search</h3>
+                    <p class="muted">Cheap midpoint integration ranks candidate angles, then the chosen region is checked with bounded RK4.</p>
+                </div>
+                <div class="highlight-item">
+                    <div class="number">03</div>
+                    <h3>Matched IMU rails</h3>
+                    <p class="muted">If attitude comes from ICM or LSM, acceleration prefers the same fresh rail before falling back.</p>
+                </div>
+                <div class="highlight-item">
+                    <div class="number">04</div>
+                    <h3>Normal actuator path</h3>
+                    <p class="muted">Uncertain prediction commands zero degrees through clamp/rate/servo logic instead of jumping the hardware.</p>
+                </div>
+            </div>
+        </section>
+
+        <section class="reveal">
+            <div class="section-head">
+                <h2>Predictor core</h2>
+                <div class="section-label">apogee_model.h</div>
+            </div>
+            <p class="lede">
+                The predictor is structured as a small physics engine. Each derivative evaluation rebuilds air-relative velocity, interpolates CFD force, projects force into state acceleration, advances flap lag, and updates pitch.
+            </p>
+            <div class="code-snippet">
+<pre>PredictApogeeWithTime(seed):
+    while vertical_velocity > 0:
+        next = integrate_one_step(seed, RK4)
+        if next.vertical_velocity <= 0:
+            return refine_zero_crossing(seed, next)
+        seed = next
+
+    if step_limit_hit:
+        return ballistic_bound_with_uncertain_flag</pre>
+            </div>
+            <div class="grid-two">
+                <div class="card">
+                    <h3>Why RK4 here?</h3>
+                    <p>Mach and AoA can move fast near burnout. RK4 reduces step-size error without making every control loop do far more tiny steps.</p>
+                </div>
+                <div class="card">
+                    <h3>Why midpoint elsewhere?</h3>
+                    <p>The flap optimizer has to try many candidate angles. Midpoint is good enough to rank candidates before the expensive bounded validation pass.</p>
+                </div>
+            </div>
+        </section>
+
+        <section class="reveal">
+            <div class="section-head">
+                <h2>Cached CFD interpolation</h2>
+                <div class="section-label">Table lookup</div>
+            </div>
+            <p class="lede">
+                CFD lookup is repeated constantly: every candidate angle, every RK substage, every loop. The code caches nearby index brackets so repeated interpolation does not search the full ACS/AoA/Mach grids from scratch each time.
+            </p>
+            <div class="flow">
+                <div class="step">
+                    <div class="step-num">axes</div>
+                    <div><h3>Find lower and upper grid cells</h3><p>ACS angle, angle of attack, and Mach each produce a lower index, upper index, and blend fraction.</p></div>
+                </div>
+                <div class="step">
+                    <div class="step-num">corners</div>
+                    <div><h3>Read eight table corners</h3><p>The force volume is flattened in memory, so the index function maps 3D coordinates into one array offset.</p></div>
+                </div>
+                <div class="step">
+                    <div class="step-num">blend</div>
+                    <div><h3>Linearly blend ACS, AoA, then Mach</h3><p>The order is not magic for linear interpolation, but keeping it explicit makes the table layout easier to audit.</p></div>
+                </div>
+                <div class="step">
+                    <div class="step-num">flags</div>
+                    <div><h3>Clamp outside coverage and report it</h3><p>Out-of-table values are safer as explicit uncertainty than pretend extrapolation.</p></div>
+                </div>
+            </div>
+        </section>
+
+        <section class="reveal">
+            <div class="section-head">
+                <h2>Estimator to predictor seed</h2>
+                <div class="section-label">flight_computer.cpp</div>
+            </div>
+            <div class="grid-two">
+                <div class="card">
+                    <h3>Zenith clamping</h3>
+                    <p>The predictor gets a bounded zenith angle. If raw attitude produces a value outside the trusted range, the value is clamped and the flag follows it.</p>
+                </div>
+                <div class="card">
+                    <h3>Horizontal speed guard</h3>
+                    <p>Horizontal speed is only seeded when attitude and acceleration are fresh enough. Otherwise, stale tilt is more dangerous than simply omitting lateral energy.</p>
+                </div>
+                <div class="card">
+                    <h3>Baro velocity guard</h3>
+                    <p>When vertical velocity looks suspect, baro-derived velocity can act as a guardrail. That state is visible to control through confidence flags.</p>
+                </div>
+                <div class="card">
+                    <h3>Adaptive drag learning</h3>
+                    <p>The learner compares measured vertical acceleration against modeled axial drag only during clean coast, then nudges the active Mach bin without rewriting unrelated regimes.</p>
+                </div>
+            </div>
+        </section>
+
+        <section class="reveal">
+            <div class="section-head">
+                <h2>Actuation optimizer</h2>
+                <div class="section-label">main.cpp</div>
+            </div>
+            <p class="lede">
+                The control search is built around failure behavior. It tries to find useful drag, but the default answer for stale, uncertain, clamped, or invalid prediction is to request zero degrees through the existing command pipeline.
+            </p>
+            <div class="code-snippet">
+<pre>if predictor is not trusted:
+    target_angle = 0 deg
+else:
+    rank candidate angles with midpoint prediction
+    validate best region with RK4 bounds
+    reject candidates with uncertainty flags
+    command best angle through servo limits</pre>
+            </div>
+            <div class="callout">
+                <p>The important design choice is that "retract" is still just a normal command. The servo layer still applies limits, rate behavior, PWM mapping, and synchronization.</p>
+            </div>
+        </section>
+
+        <section class="reveal">
+            <div class="section-head">
+                <h2>Attitude and rail selection</h2>
+                <div class="section-label">IMU path</div>
+            </div>
+            <ul class="source-list">
+                <li><strong>Quaternion sanitize</strong><span><a href="../src/main.cpp">main.cpp</a> normalizes and validates selected attitude before publishing it as the main quaternion.</span></li>
+                <li><strong>Rail agreement</strong><span>ICM, LSM, BNO, Pulse, and WT901 comparisons update trust with hysteresis so source selection does not chatter.</span></li>
+                <li><strong>Matched accel</strong><span><a href="../src/flight_computer.cpp">flight_computer.cpp</a> keeps selected ICM attitude with ICM accel and selected LSM attitude with LSM accel when those samples are fresh.</span></li>
+                <li><strong>Gyro propagation</strong><span><a href="../src/math_utils.h">math_utils.h</a> uses an exponential-map update so angular rate changes attitude without Euler singularities.</span></li>
+            </ul>
+        </section>
+
+        <section class="reveal">
+            <div class="section-head">
+                <h2>Source map</h2>
+                <div class="section-label">Start here</div>
+            </div>
+            <div class="table">
+                <table>
+                    <thead>
+                    <tr><th>File</th><th>Why it is interesting</th></tr>
+                    </thead>
+                    <tbody>
+                    <tr><td><a href="../src/apogee_model.h">src/apogee_model.h</a></td><td>Physics rollout, RK4/midpoint integration, force projection, CFD interpolation, uncertainty bounds, and adaptive Mach drag.</td></tr>
+                    <tr><td><a href="../src/flight_computer.cpp">src/flight_computer.cpp</a></td><td>State machine, Kalman updates, attitude propagation, predictor seed construction, and clean-coast drag learning.</td></tr>
+                    <tr><td><a href="../src/main.cpp">src/main.cpp</a></td><td>Sensor orchestration, rail health, actuation optimizer, runtime settings, logger fields, and hardware command loop.</td></tr>
+                    <tr><td><a href="../src/cfd_table.cpp">src/cfd_table.cpp</a></td><td>CFD CSV load, table validation, and force-grid storage contract.</td></tr>
+                    <tr><td><a href="../src/math_utils.h">src/math_utils.h</a></td><td>Quaternion math, slerp, zenith extraction, and gyro integration helpers.</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </section>
+    </main>
+
+    <footer>
+        <span>Code highlights</span>
+        <ul class="footer-links">
+            <li><a href="math.html">Math</a></li>
+            <li><a href="predictor.html">Predictor</a></li>
+            <li><a href="../src/main.cpp">Source</a></li>
+        </ul>
+    </footer>
+</div>
+</body>
+</html>

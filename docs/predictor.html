@@ -17,6 +17,8 @@
             <li><a href="index.html">Overview</a></li>
             <li><a href="flight-loop.html">Loop</a></li>
             <li><a href="predictor.html" aria-current="page">Predictor</a></li>
+            <li><a href="math.html">Math</a></li>
+            <li><a href="code.html">Code</a></li>
             <li><a href="sensors.html">Sensors</a></li>
             <li><a href="replay.html">Replay</a></li>
         </ul>
@@ -111,6 +113,28 @@
 
         <section class="reveal">
             <div class="section-head">
+                <h2>Math at a glance</h2>
+                <div class="section-label">Equations</div>
+            </div>
+            <div class="formula-grid">
+                <div class="formula-card">
+                    <h3>Ballistic upper bound</h3>
+                    <span class="equation">h_apogee = h + v_z^2 / (2g)</span>
+                    <p class="muted">Useful as a no-drag reference and conservative step-limit telemetry bound. It is not automatically trusted for flap control.</p>
+                </div>
+                <div class="formula-card">
+                    <h3>Air-relative model</h3>
+                    <span class="equation">Mach = |v_vehicle - v_wind| / a(T)</span>
+                    <p class="muted">The CFD lookup is driven by air-relative speed, flap angle, AoA, and density ratio rather than by altitude alone.</p>
+                </div>
+            </div>
+            <p class="lede" style="margin-top:16px;">
+                The full math walkthrough is in <a href="math.html">Math</a>, including force scaling, RK4 integration, and where each piece lives in source.
+            </p>
+        </section>
+
+        <section class="reveal">
+            <div class="section-head">
                 <h2>Uncertainty behavior</h2>
                 <div class="section-label">Control safety</div>
             </div>
@@ -139,6 +163,8 @@
         <span>Predictor notes</span>
         <ul class="footer-links">
             <li><a href="apogee-predictor.md">Markdown notes</a></li>
+            <li><a href="math.html">Math</a></li>
+            <li><a href="code.html">Code</a></li>
             <li><a href="../src/apogee_model.h">Source</a></li>
             <li><a href="sensors.html">Next: sensors</a></li>
         </ul>

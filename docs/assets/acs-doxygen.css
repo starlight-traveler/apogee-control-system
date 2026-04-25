@@ -1,0 +1,105 @@
+/* Small black-and-white skin so generated API docs match docs/*.html. */
+
+:root {
+    --page-background-color: #f7f7f4;
+    --page-foreground-color: #111111;
+    --primary-color: #111111;
+    --primary-dark-color: #111111;
+    --primary-light-color: #eeeeea;
+    --primary-lighter-color: #f7f7f4;
+    --separator-color: #d0d0cc;
+    --side-nav-background: #ffffff;
+    --code-background: #eeeeea;
+    --fragment-background: #eeeeea;
+    --fragment-foreground: #111111;
+    --tablehead-background: #eeeeea;
+    --blockquote-background: #ffffff;
+    --blockquote-border: #d0d0cc;
+}
+
+body,
+table,
+div,
+p,
+dl {
+    font-family: ui-monospace, "SF Mono", "Cascadia Mono", "Consolas", monospace;
+}
+
+body {
+    background:
+        linear-gradient(90deg, rgba(17, 17, 17, 0.035) 1px, transparent 1px),
+        linear-gradient(180deg, rgba(17, 17, 17, 0.035) 1px, transparent 1px),
+        var(--page-background-color);
+    background-size: 36px 36px;
+}
+
+#titlearea,
+#nav-tree,
+#side-nav,
+.ui-resizable-e {
+    border-color: var(--separator-color);
+}
+
+#projectname,
+h1,
+h2,
+h3,
+h4 {
+    font-weight: 400;
+    letter-spacing: -0.02em;
+}
+
+a,
+a:visited {
+    color: var(--page-foreground-color);
+    text-decoration-thickness: 1px;
+    text-underline-offset: 3px;
+}
+
+a:hover {
+    color: #777777;
+}
+
+.memtitle,
+.memproto,
+.memdoc,
+div.fragment,
+pre.fragment,
+.contents table,
+.directory table {
+    border-color: var(--separator-color);
+}
+
+.memproto,
+.memtitle,
+div.fragment,
+pre.fragment {
+    background: var(--code-background);
+}
+
+.memdoc {
+    background: #ffffff;
+}
+
+@media (prefers-color-scheme: dark) {
+    :root {
+        --page-background-color: #0f0f0e;
+        --page-foreground-color: #eeeeea;
+        --primary-color: #eeeeea;
+        --primary-dark-color: #eeeeea;
+        --primary-light-color: #242422;
+        --primary-lighter-color: #171716;
+        --separator-color: #30302e;
+        --side-nav-background: #171716;
+        --code-background: #242422;
+        --fragment-background: #242422;
+        --fragment-foreground: #eeeeea;
+        --tablehead-background: #242422;
+        --blockquote-background: #171716;
+        --blockquote-border: #30302e;
+    }
+
+    .memdoc {
+        background: #171716;
+    }
+}

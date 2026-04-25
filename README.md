@@ -48,6 +48,12 @@ python3 tools/replay/scripts/compare_predictors.py --list
 python3 tools/replay/scripts/compare_predictors.py --mode current-model
 ```
 
+Generate source API documentation:
+
+```bash
+bash tools/scripts/generate_doxygen.sh
+```
+
 ## Repository Layout
 
 | Path | Purpose |
@@ -76,6 +82,7 @@ Use `tools/` when you need to decode, replay, or explain flight data without fla
 | Tool Area | Start Here | Purpose |
 | --------- | ---------- | ------- |
 | Native build workspace | [`tools/README.md`](tools/README.md) | Build hosted replay, native decode, and optional GUI targets. |
+| Utility scripts | [`tools/scripts/README.md`](tools/scripts/README.md) | Generate Doxygen docs and run repository maintenance helpers. |
 | Hosted replay | [`tools/replay/README.md`](tools/replay/README.md) | Run flight-computer logic against CSV logs. |
 | Stable Python commands | [`tools/replay/scripts/README.md`](tools/replay/scripts/README.md) | Decode logs, run replay, plot flights, compare predictors. |
 | Python helper library | [`tools/replay/replaylib/README.md`](tools/replay/replaylib/README.md) | Shared code for paths, CSV IO, dispatch, and replay execution. |
@@ -123,6 +130,9 @@ Start here when changing flight behavior:
 Supporting docs:
 
 - [`docs/index.html`](docs/index.html): polished multi-page documentation site entry point
+- [`docs/math.html`](docs/math.html): readable predictor and estimator math walkthrough
+- [`docs/code.html`](docs/code.html): code highlights and source walkthrough
+- [`docs/Doxyfile`](docs/Doxyfile): generated API docs configuration
 - [`src/README.md`](src/README.md): pad settings and runtime configuration
 - [`include/README.md`](include/README.md): shared header policy
 - [`lib/README.md`](lib/README.md): vendored library and table policy

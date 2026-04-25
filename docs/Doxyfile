@@ -1,0 +1,136 @@
+# Doxygen configuration for the Apogee Control System firmware and host tools.
+#
+# Generate with:
+#   bash tools/scripts/generate_doxygen.sh
+#
+# Output is written to docs/api/html and intentionally ignored by git.
+
+DOXYFILE_ENCODING      = UTF-8
+PROJECT_NAME           = "Apogee Control System"
+PROJECT_BRIEF          = "Teensy active apogee controller firmware and replay tools"
+OUTPUT_DIRECTORY       = docs/api
+CREATE_SUBDIRS         = NO
+
+ABBREVIATE_BRIEF       =
+FULL_PATH_NAMES        = YES
+STRIP_FROM_PATH        = .
+STRIP_FROM_INC_PATH    = .
+
+INPUT                  = CONTRIBUTING.md \
+                         docs/doxygen-main.md \
+                         docs/README.md \
+                         docs/flow.md \
+                         docs/apogee-predictor.md \
+                         src \
+                         include \
+                         calibration \
+                         tools/README.md \
+                         tools/scripts/README.md \
+                         tools/replay/README.md \
+                         tools/replay/scripts/README.md \
+                         tools/replay/replaylib/README.md \
+                         tools/replay/experiments/README.md \
+                         tools/replay/data/README.md \
+                         tools/replay/plots/README.md \
+                         tools/replay/main.cpp \
+                         tools/replay/arduino_stubs.cpp \
+                         tools/replay/include \
+                         telemetry/README.md \
+                         telemetry/imgui/main.cpp
+RECURSIVE              = YES
+FILE_PATTERNS          = *.c \
+                         *.cc \
+                         *.cpp \
+                         *.cxx \
+                         *.h \
+                         *.hh \
+                         *.hpp \
+                         *.hxx \
+                         *.ino \
+                         *.md
+EXCLUDE                = lib \
+                         .pio \
+                         docs/api \
+                         tools/build \
+                         tools/replay/build \
+                         tools/replay/matplotplusplus \
+                         telemetry/imgui/build
+EXCLUDE_PATTERNS       = */build/* \
+                         */CMakeFiles/* \
+                         */__pycache__/* \
+                         */.pio/* \
+                         */.git/*
+
+EXTRACT_ALL            = YES
+EXTRACT_PRIVATE        = NO
+EXTRACT_PRIV_VIRTUAL   = NO
+EXTRACT_PACKAGE        = NO
+EXTRACT_STATIC         = YES
+EXTRACT_LOCAL_CLASSES  = YES
+HIDE_UNDOC_MEMBERS     = NO
+HIDE_UNDOC_CLASSES     = NO
+HIDE_FRIEND_COMPOUNDS  = NO
+HIDE_IN_BODY_DOCS      = NO
+INTERNAL_DOCS          = NO
+CASE_SENSE_NAMES       = YES
+
+JAVADOC_AUTOBRIEF      = YES
+QT_AUTOBRIEF           = NO
+MULTILINE_CPP_IS_BRIEF = NO
+INHERIT_DOCS           = YES
+MARKDOWN_SUPPORT       = YES
+TOC_INCLUDE_HEADINGS   = 5
+USE_MDFILE_AS_MAINPAGE = docs/doxygen-main.md
+
+SOURCE_BROWSER         = YES
+INLINE_SOURCES         = NO
+STRIP_CODE_COMMENTS    = NO
+REFERENCED_BY_RELATION = YES
+REFERENCES_RELATION    = YES
+REFERENCES_LINK_SOURCE = YES
+VERBATIM_HEADERS       = YES
+
+ALPHABETICAL_INDEX     = YES
+GENERATE_TREEVIEW      = YES
+DISABLE_INDEX          = NO
+HTML_DYNAMIC_MENUS     = YES
+HTML_DYNAMIC_SECTIONS  = YES
+HTML_COLORSTYLE        = LIGHT
+HTML_EXTRA_STYLESHEET  = docs/assets/acs-doxygen.css
+
+GENERATE_HTML          = YES
+HTML_OUTPUT            = html
+GENERATE_LATEX         = NO
+GENERATE_XML           = NO
+GENERATE_MAN           = NO
+GENERATE_RTF           = NO
+
+ENABLE_PREPROCESSING   = YES
+MACRO_EXPANSION        = YES
+EXPAND_ONLY_PREDEF     = YES
+PREDEFINED             = ARDUINO=10819 \
+                         TEENSYDUINO=159 \
+                         __arm__ \
+                         __IMXRT1062__ \
+                         PROGMEM= \
+                         FLASHMEM= \
+                         DMAMEM= \
+                         FASTRUN= \
+                         __attribute__(x)=
+SKIP_FUNCTION_MACROS   = YES
+
+QUIET                  = NO
+WARNINGS               = YES
+WARN_IF_UNDOCUMENTED   = NO
+WARN_IF_DOC_ERROR      = YES
+WARN_IF_INCOMPLETE_DOC = YES
+WARN_NO_PARAMDOC       = NO
+WARN_AS_ERROR          = NO
+WARN_FORMAT            = "$file:$line: $text"
+
+HAVE_DOT               = NO
+CALL_GRAPH             = NO
+CALLER_GRAPH           = NO
+CLASS_GRAPH            = YES
+COLLABORATION_GRAPH    = NO
+DIRECTORY_GRAPH        = YES

@@ -75,6 +75,28 @@
     });
     updatePredictorDemo();
 
+    function updateMathDemo() {
+        var vz = Number((document.getElementById('math-vz') || {}).value || 180);
+        var accel = Number((document.getElementById('math-drag') || {}).value || 12);
+        var g = 9.80665;
+        var ballistic = (vz * vz) / (2 * g);
+        var draggy = (vz * vz) / (2 * Math.max(g + accel, 0.1));
+        var loss = ballistic - draggy;
+        var effectiveG = 1 + accel / g;
+
+        setText('math-vz-value', vz.toFixed(0) + ' m/s');
+        setText('math-drag-value', accel.toFixed(1) + ' m/s^2');
+        setText('math-ballistic', ballistic.toFixed(0) + ' m');
+        setText('math-with-drag', draggy.toFixed(0) + ' m');
+        setText('math-loss', loss.toFixed(0) + ' m');
+        setText('math-effective-g', effectiveG.toFixed(2) + ' g');
+    }
+
+    qsa('[data-math-input]').forEach(function (input) {
+        input.addEventListener('input', updateMathDemo);
+    });
+    updateMathDemo();
+
     qsa('[data-rail-toggle]').forEach(function (button) {
         button.addEventListener('click', function () {
             var rail = button.getAttribute('data-rail-toggle');

@@ -487,6 +487,8 @@
         <ul class="top-links">
             <li><a href="flight-loop.html">Loop</a></li>
             <li><a href="predictor.html">Predictor</a></li>
+            <li><a href="math.html">Math</a></li>
+            <li><a href="code.html">Code</a></li>
             <li><a href="sensors.html">Sensors</a></li>
             <li><a href="replay.html">Replay</a></li>
         </ul>
@@ -548,6 +550,14 @@
                     <h3>Predictor</h3>
                     <p>Interactive apogee intuition tool plus the real CFD/RK4 predictor pipeline and uncertainty behavior.</p>
                 </a>
+                <a class="card card-link" href="math.html">
+                    <h3>Math</h3>
+                    <p>Readable equations for ballistic bounds, air-relative Mach, density scaling, force projection, and RK4 integration.</p>
+                </a>
+                <a class="card card-link" href="code.html">
+                    <h3>Code highlights</h3>
+                    <p>Source walkthrough for the implementation patterns that make the predictor, estimator, and flap path auditable.</p>
+                </a>
                 <a class="card card-link" href="sensors.html">
                     <h3>Sensors</h3>
                     <p>Rail-by-rail explanation of barometer, ICM, LSM, BNO, Pulse, and WT901 frame/freshness roles.</p>
@@ -556,6 +566,36 @@
                     <h3>Replay</h3>
                     <p>Decode, replay, plot, and inspect flight logs using the current estimator and predictor code.</p>
                 </a>
+            </div>
+        </section>
+
+        <section>
+            <div class="section-head">
+                <h2>Mathematics in the code</h2>
+                <div class="section-label">Mental model</div>
+            </div>
+            <p class="lede">
+                The control math starts with the energy picture, then replaces the simple "gravity only" coast with a numerical force model. A no-drag apogee is just current altitude plus remaining kinetic energy divided by gravity. The firmware keeps that as a useful upper bound, but the trusted predictor recomputes drag at each step.
+            </p>
+            <div class="diagram" aria-label="Math summary">
+<pre>no-drag reference:
+    h_apogee = h + v_z^2 / (2g)
+
+firmware predictor:
+    air-relative velocity -> Mach + AoA
+    CFD axial/normal force -> density scaling -> acceleration
+    flap lag + pitch moment -> changing attitude
+    RK4 integration -> refined vertical-velocity zero crossing</pre>
+            </div>
+            <div class="grid-two" style="margin-top:22px;">
+                <div class="card">
+                    <h3>Why numerical integration?</h3>
+                    <p>Drag is not constant. It changes with Mach, flap angle, AoA, density, and attitude, so one closed-form equation would hide the hard parts.</p>
+                </div>
+                <div class="card">
+                    <h3>Why carry flags?</h3>
+                    <p>A prediction can be finite and still not be safe to command from. The code carries clamp, stale, step-limit, and uncertainty flags alongside the number.</p>
+                </div>
             </div>
         </section>
 
@@ -847,10 +887,13 @@ tools/build/bin/acs_replay tools/replay/data/SENS010.csv --ignore-logged-state</
             <li><a href="README.md">Docs index</a></li>
             <li><a href="flight-loop.html">Flight loop</a></li>
             <li><a href="predictor.html">Predictor</a></li>
+            <li><a href="math.html">Math</a></li>
+            <li><a href="code.html">Code</a></li>
             <li><a href="sensors.html">Sensors</a></li>
             <li><a href="replay.html">Replay</a></li>
             <li><a href="apogee-predictor.md">Predictor notes</a></li>
             <li><a href="flow.md">Program flow</a></li>
+            <li><a href="Doxyfile">Doxygen config</a></li>
             <li><a href="../README.md">Repository</a></li>
         </ul>
     </footer>

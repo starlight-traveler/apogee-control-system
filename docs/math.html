@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Math | ACS Docs</title>
+    <meta name="description" content="Mathematical model notes for the apogee control system estimator, predictor, aerodynamics, and actuator path.">
+    <meta name="color-scheme" content="light dark">
+    <link rel="stylesheet" href="assets/acs-docs.css">
+    <script src="assets/acs-docs.js" defer></script>
+</head>
+<body>
+<div class="page">
+    <nav class="top-nav" aria-label="Primary">
+        <a class="site-name" href="index.html"><strong>ACS</strong> Docs</a>
+        <ul class="top-links">
+            <li><a href="index.html">Overview</a></li>
+            <li><a href="flight-loop.html">Loop</a></li>
+            <li><a href="predictor.html">Predictor</a></li>
+            <li><a href="math.html" aria-current="page">Math</a></li>
+            <li><a href="code.html">Code</a></li>
+            <li><a href="sensors.html">Sensors</a></li>
+            <li><a href="replay.html">Replay</a></li>
+        </ul>
+    </nav>
+
+    <main>
+        <section class="hero-full reveal">
+            <div class="section-label">Model math</div>
+            <h1>The predictor is energy plus aero, integrated carefully.</h1>
+            <p class="desc">
+                The firmware does not use one giant closed-form apogee equation. It builds a current coast state, computes air-relative aerodynamic forces, turns those forces into accelerations and pitch dynamics, then numerically rolls the state forward until vertical velocity reaches zero.
+            </p>
+        </section>
+
+        <section class="reveal">
+            <div class="section-head">
+                <h2>Ballistic baseline</h2>
+                <div class="section-label">Sanity check</div>
+            </div>
+            <p class="lede">
+                The simplest no-drag coast estimate is useful as a bound and a debugging reference. If the rocket is at altitude <code>h</code> and climbing vertically at <code>v_z</code>, gravity alone adds <code>v_z^2 / 2g</code> meters before apogee.
+            </p>
+            <div class="formula-grid">
+                <div class="formula-card">
+                    <h3>No-drag height remaining</h3>
+                    <span class="equation">h_apogee = h + v_z^2 / (2g)</span>
+                    <p class="muted">This is intentionally high when drag matters. The firmware uses the same idea as a conservative telemetry bound when integration hits a step limit, but marks the prediction uncertain for control.</p>
+                </div>
+                <div class="formula-card">
+                    <h3>Time remaining</h3>
+                    <span class="equation">t_apogee = v_z / g</span>
+                    <p class="muted">This only holds for pure gravity. With drag, effective deceleration is larger and time-to-apogee is shorter.</p>
+                </div>
+            </div>
+        </section>
+
+        <section class="reveal">
+            <div class="section-head">
+                <h2>Interactive drag intuition</h2>
+                <div class="section-label">Simplified</div>
+            </div>
+            <p class="lede">
+                This panel treats drag as a constant extra upward-opposing acceleration. The real firmware does not do that; it recomputes drag every integration substep from Mach, angle of attack, flap angle, density, and attitude. The point here is to make the energy trade obvious.
+            </p>
+            <div class="interactive-panel">
+                <div class="slider-row">
+                    <label for="math-vz">Vertical velocity</label>
+                    <input id="math-vz" data-math-input type="range" min="40" max="320" value="180">
+                    <span id="math-vz-value">180 m/s</span>
+                </div>
+                <div class="slider-row">
+                    <label for="math-drag">Extra drag decel</label>
+                    <input id="math-drag" data-math-input type="range" min="0" max="35" step="0.5" value="12">
+                    <span id="math-drag-value">12.0 m/s^2</span>
+                </div>
+                <div class="readout">
+                    <div class="readout-cell">
+                        <div class="label">No-drag climb</div>
+                        <div class="value" id="math-ballistic">0 m</div>
+                    </div>
+                    <div class="readout-cell">
+                        <div class="label">With drag</div>
+                        <div class="value" id="math-with-drag">0 m</div>
+                    </div>
+                    <div class="readout-cell">
+                        <div class="label">Height lost</div>
+                        <div class="value" id="math-loss">0 m</div>
+                    </div>
+                </div>
+                <div class="readout">
+                    <div class="readout-cell">
+                        <div class="label">Effective decel</div>
+                        <div class="value" id="math-effective-g">0 g</div>
+                    </div>
+                    <div class="readout-cell">
+                        <div class="label">Firmware reality</div>
+                        <div class="value">variable</div>
+                    </div>
+                    <div class="readout-cell">
+                        <div class="label">Control bias</div>
+                        <div class="value">retract</div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <section class="reveal">
+            <div class="section-head">
+                <h2>Aero force model</h2>
+                <div class="section-label">CFD to acceleration</div>
+            </div>
+            <div class="formula-grid">
+                <div class="formula-card">
+                    <h3>Air-relative speed</h3>
+                    <span class="equation">v_air = v_vehicle - v_wind</span>
+                    <p class="muted">Wind has to be removed before Mach and AoA are computed. A tailwind or headwind changes the force even if ground-relative velocity looks the same.</p>
+                </div>
+                <div class="formula-card">
+                    <h3>Mach number</h3>
+                    <span class="equation">Mach = |v_air| / a(T)</span>
+                    <p class="muted">The speed of sound depends on temperature, so the environment model matters. Mach chooses which CFD slices are blended.</p>
+                </div>
+                <div class="formula-card">
+                    <h3>Density scaling</h3>
+                    <span class="equation">F_scaled = F_CFD * rho(h) / rho_ref</span>
+                    <p class="muted">The table stores forces at a reference density. The predictor scales forces down as altitude rises and air gets thinner.</p>
+                </div>
+                <div class="formula-card">
+                    <h3>Newton's law</h3>
+                    <span class="equation">a = F / m</span>
+                    <p class="muted">Axial and normal force become vertical and horizontal acceleration after projection through the current zenith angle.</p>
+                </div>
+            </div>
+        </section>
+
+        <section class="reveal">
+            <div class="section-head">
+                <h2>State integration</h2>
+                <div class="section-label">RK4</div>
+            </div>
+            <p class="lede">
+                Drag changes quickly during coast because speed, Mach, angle of attack, and flap position are all changing. The predictor uses RK4 on the trusted path because it samples the derivative at the beginning, two midpoints, and the end of each step.
+            </p>
+            <div class="diagram">
+<pre>state = [altitude, vertical velocity, horizontal speed, zenith, angular rate, flap angle]
+
+k1 = f(state)
+k2 = f(state + 0.5 * dt * k1)
+k3 = f(state + 0.5 * dt * k2)
+k4 = f(state + dt * k3)
+
+state_next = state + dt * (k1 + 2*k2 + 2*k3 + k4) / 6</pre>
+            </div>
+            <div class="callout">
+                <p>When the final step crosses from climbing to descending, the code refines inside that bracket. That avoids reporting the first descending sample as apogee, which would bias the result low.</p>
+            </div>
+        </section>
+
+        <section class="reveal">
+            <div class="section-head">
+                <h2>Where it lives</h2>
+                <div class="section-label">Source map</div>
+            </div>
+            <ul class="source-list">
+                <li><strong><a href="../src/apogee_model.h">apogee_model.h</a></strong><span>Defines the state, force interpolation, RK4 rollout, zero-crossing refinement, drag sensitivity bounds, and adaptive Mach drag scale.</span></li>
+                <li><strong><a href="../src/flight_computer.cpp">flight_computer.cpp</a></strong><span>Builds the predictor seed from the estimator, clamps suspect inputs, computes confidence flags, and updates adaptive drag only in clean coast.</span></li>
+                <li><strong><a href="../src/cfd_table.cpp">cfd_table.cpp</a></strong><span>Loads the CFD grid and refuses incomplete/non-finite force cells so interpolation cannot silently ingest missing data.</span></li>
+                <li><strong><a href="../src/math_utils.h">math_utils.h</a></strong><span>Contains quaternion normalization, slerp, zenith extraction, and exponential-map gyro integration used by the attitude path.</span></li>
+            </ul>
+        </section>
+    </main>
+
+    <footer>
+        <span>Math notes</span>
+        <ul class="footer-links">
+            <li><a href="predictor.html">Predictor</a></li>
+            <li><a href="code.html">Code highlights</a></li>
+            <li><a href="../src/apogee_model.h">Source</a></li>
+        </ul>
+    </footer>
+</div>
+</body>
+</html>
