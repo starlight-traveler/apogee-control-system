@@ -1,0 +1,36 @@
+{
+  "name": "sbgECom",
+  "version": "0.0.1",
+  "build": {
+    "srcDir": ".",
+    "srcFilter": [
+      "+<common/crc/*.c>",
+      "+<common/debug/*.c>",
+      "+<common/interfaces/sbgInterface.c>",
+      "+<common/network/*.c>",
+      "+<common/sbgErrorCodes.c>",
+      "+<common/splitBuffer/*.c>",
+      "+<common/streamBuffer/*.c>",
+      "+<common/string/*.c>",
+      "+<common/swap/*.c>",
+      "+<common/version/*.c>",
+      "+<src/*.c>",
+      "+<src/commands/*.c>",
+      "+<src/defs/*.c>",
+      "+<src/logs/*.c>",
+      "+<src/pager/*.c>",
+      "+<src/protocol/*.c>",
+      "+<src/sessionInfo/*.c>",
+      "+<src/transfer/*.c>",
+      "+<src/vibMon/*.c>",
+      "-<build/>",
+      "-<examples/>",
+      "-<tools/>",
+      "-<common/platform/sbgPlatform.c>",
+      "-<common/interfaces/sbgInterfaceFile.c>",
+      "-<common/interfaces/sbgInterfaceSerialUnix.c>",
+      "-<common/interfaces/sbgInterfaceSerialWin.c>",
+      "-<common/interfaces/sbgInterfaceUdp.c>"
+    ]
+  }
+}
