@@ -12,8 +12,9 @@ if ! command -v doxygen >/dev/null 2>&1; then
 fi
 
 cd "${repo_root}"
+rm -rf docs/api
 mkdir -p docs/api
 doxygen "${doxyfile}"
 
 echo
-echo "generated: ${repo_root}/docs/api/html/index.html"
+echo "generated: ${repo_root}/docs/api/index.html"

@@ -1,0 +1,166 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1120 560" role="img" aria-labelledby="title desc">
+  <title id="title">Apogee prediction flow graph</title>
+  <desc id="desc">A black and white diagram showing burnout, sensor fusion, apogee prediction, target comparison, flap command, and apogee detection over time.</desc>
+
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0L10 5L0 10Z" fill="#111"/>
+    </marker>
+    <marker id="arrowGray" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0L10 5L0 10Z" fill="#777"/>
+    </marker>
+    <style>
+      .bg { fill: #f7f7f4; }
+      .panel { fill: #fff; stroke: #cfcfca; stroke-width: 1; }
+      .grid { stroke: #d8d8d3; stroke-width: 1; }
+      .axis { stroke: #111; stroke-width: 1.5; }
+      .target { stroke: #111; stroke-width: 2; stroke-dasharray: 8 7; }
+      .prediction { fill: none; stroke: #111; stroke-width: 4; stroke-linecap: round; stroke-linejoin: round; }
+      .altitude { fill: none; stroke: #777; stroke-width: 3; stroke-linecap: round; stroke-linejoin: round; }
+      .velocity { fill: none; stroke: #555; stroke-width: 2.5; stroke-linecap: round; stroke-linejoin: round; stroke-dasharray: 4 8; }
+      .flap { fill: #111; }
+      .thin { stroke: #111; stroke-width: 1.4; fill: none; }
+      .thin-gray { stroke: #777; stroke-width: 1.3; fill: none; }
+      .phase { fill: #efefeb; stroke: #d0d0cc; stroke-width: 1; }
+      .trusted { fill: #e7e7e2; stroke: #111; stroke-width: 1; }
+      .txt { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: #111; }
+      .muted { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: #777; }
+      .tiny { font-size: 12px; }
+      .small { font-size: 14px; }
+      .label { font-size: 16px; }
+      .title { font-size: 20px; font-weight: 600; }
+      .num { font-size: 13px; font-weight: 700; }
+    </style>
+  </defs>
+
+  <rect class="bg" width="1120" height="560"/>
+
+  <g class="txt">
+    <text class="title" x="56" y="48">how the apogee predictor is supposed to be read</text>
+    <text class="muted small" x="56" y="72">the controller trusts the prediction only when sensors, velocity, aero coverage, and phase gates agree</text>
+  </g>
+
+  <g transform="translate(56 104)">
+    <rect class="panel" x="0" y="0" width="1008" height="316" rx="0"/>
+
+    <g>
+      <rect class="phase" x="58" y="28" width="152" height="36"/>
+      <rect class="phase" x="210" y="28" width="154" height="36"/>
+      <rect class="trusted" x="364" y="28" width="390" height="36"/>
+      <rect class="phase" x="754" y="28" width="188" height="36"/>
+      <text class="muted tiny" x="82" y="51">burnout settle</text>
+      <text class="muted tiny" x="247" y="51">seed blend</text>
+      <text class="txt tiny" x="485" y="51">trusted control window</text>
+      <text class="muted tiny" x="818" y="51">apogee detect</text>
+    </g>
+
+    <g class="grid">
+      <path d="M58 94H942"/>
+      <path d="M58 144H942"/>
+      <path d="M58 194H942"/>
+      <path d="M58 244H942"/>
+      <path d="M58 294H942"/>
+      <path d="M160 84V300"/>
+      <path d="M270 84V300"/>
+      <path d="M380 84V300"/>
+      <path d="M490 84V300"/>
+      <path d="M600 84V300"/>
+      <path d="M710 84V300"/>
+      <path d="M820 84V300"/>
+      <path d="M930 84V300"/>
+    </g>
+
+    <path class="axis" d="M58 84V300H942"/>
+    <text class="muted tiny" x="18" y="112">high</text>
+    <text class="muted tiny" x="12" y="300">pad</text>
+    <text class="muted tiny" x="910" y="322">time</text>
+
+    <path class="target" d="M58 118H942"/>
+    <text class="txt small" x="780" y="111">target apogee</text>
+
+    <path class="altitude" d="M58 289 C128 286 190 274 256 252 C340 222 422 184 510 153 C610 119 715 101 824 107 C874 110 914 121 942 135"/>
+    <path class="prediction" d="M58 201 C122 166 189 133 254 111 C322 88 386 84 448 97 C526 114 590 126 658 124 C732 122 802 116 872 116 C902 116 926 118 942 120"/>
+    <path class="velocity" d="M58 96 C136 112 224 142 326 178 C436 217 545 264 656 287 C758 309 854 297 942 254"/>
+
+    <g>
+      <rect x="383" y="273" width="34" height="27" class="flap"/>
+      <rect x="428" y="260" width="34" height="40" class="flap"/>
+      <rect x="473" y="248" width="34" height="52" class="flap"/>
+      <rect x="518" y="256" width="34" height="44" class="flap"/>
+      <rect x="563" y="269" width="34" height="31" class="flap"/>
+      <rect x="608" y="282" width="34" height="18" class="flap"/>
+      <text class="txt tiny" x="382" y="318">flap command only after trust gates pass</text>
+    </g>
+
+    <g class="txt">
+      <text class="small" x="672" y="146">predicted final apogee</text>
+      <text class="muted small" x="640" y="183">baro/state altitude</text>
+      <text class="muted small" x="684" y="272">vertical velocity trend</text>
+    </g>
+
+    <g class="thin">
+      <path d="M655 132L704 124" marker-end="url(#arrow)"/>
+      <path d="M636 176L700 150" marker-end="url(#arrowGray)"/>
+    </g>
+    <g class="thin-gray">
+      <path d="M676 260L736 282" marker-end="url(#arrowGray)"/>
+    </g>
+
+    <g>
+      <circle cx="254" cy="111" r="6" fill="#fff" stroke="#111" stroke-width="2"/>
+      <circle cx="448" cy="97" r="6" fill="#fff" stroke="#111" stroke-width="2"/>
+      <circle cx="658" cy="124" r="6" fill="#fff" stroke="#111" stroke-width="2"/>
+      <circle cx="872" cy="116" r="6" fill="#fff" stroke="#111" stroke-width="2"/>
+      <line x1="872" y1="84" x2="872" y2="300" stroke="#111" stroke-width="1.5" stroke-dasharray="5 7"/>
+      <text class="txt tiny" x="884" y="90">velocity crosses 0</text>
+    </g>
+  </g>
+
+  <g transform="translate(56 446)">
+    <rect class="panel" x="0" y="0" width="1008" height="72" rx="0"/>
+
+    <g transform="translate(22 20)">
+      <circle cx="11" cy="11" r="11" fill="#111"/>
+      <text class="num" x="7" y="16" fill="#fff">1</text>
+      <text class="txt small" x="34" y="8">seed state</text>
+      <text class="muted tiny" x="34" y="28">baro agl + velocity + attitude + fresh accel</text>
+    </g>
+
+    <path class="thin" d="M250 36H300" marker-end="url(#arrow)"/>
+
+    <g transform="translate(316 20)">
+      <circle cx="11" cy="11" r="11" fill="#111"/>
+      <text class="num" x="7" y="16" fill="#fff">2</text>
+      <text class="txt small" x="34" y="8">roll physics forward</text>
+      <text class="muted tiny" x="34" y="28">gravity + drag table + flap lag until vz = 0</text>
+    </g>
+
+    <path class="thin" d="M562 36H612" marker-end="url(#arrow)"/>
+
+    <g transform="translate(628 20)">
+      <circle cx="11" cy="11" r="11" fill="#111"/>
+      <text class="num" x="7" y="16" fill="#fff">3</text>
+      <text class="txt small" x="34" y="8">compare target</text>
+      <text class="muted tiny" x="34" y="28">too high means more drag, uncertain means retract</text>
+    </g>
+
+    <path class="thin" d="M862 36H912" marker-end="url(#arrow)"/>
+
+    <g transform="translate(928 20)">
+      <circle cx="11" cy="11" r="11" fill="#111"/>
+      <text class="num" x="7" y="16" fill="#fff">4</text>
+      <text class="txt small" x="34" y="8">command flaps</text>
+      <text class="muted tiny" x="34" y="28">through normal limits and sync logic</text>
+    </g>
+  </g>
+
+  <g transform="translate(804 36)">
+    <rect class="panel" x="0" y="0" width="260" height="84" rx="0"/>
+    <path class="prediction" d="M18 22H74"/>
+    <text class="txt tiny" x="88" y="26">apogee prediction</text>
+    <path class="altitude" d="M18 44H74"/>
+    <text class="muted tiny" x="88" y="48">measured/state altitude</text>
+    <path class="velocity" d="M18 66H74"/>
+    <text class="muted tiny" x="88" y="70">vertical velocity</text>
+  </g>
+</svg>

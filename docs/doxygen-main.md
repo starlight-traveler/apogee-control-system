@@ -2,6 +2,8 @@
 
 This generated reference covers the flight firmware, shared headers, calibration helpers, replay entry points, and telemetry UI source that are useful when navigating the code.
 
+[Back to the hand-written docs](../index.html)
+
 Start with these source areas:
 
 - `src/flight_computer.cpp` for estimator, phase, and predictor seed behavior.
@@ -10,4 +12,4 @@ Start with these source areas:
 - `src/settings.h` for tunable constants and compile-time configuration.
 - `include/telemetry_packet.h` for host/firmware telemetry packets.
 
-The hand-written documentation site lives in `docs/index.html`. The generated HTML entry point is `docs/api/html/index.html`.
+The generated HTML entry point is `docs/api/index.html`.

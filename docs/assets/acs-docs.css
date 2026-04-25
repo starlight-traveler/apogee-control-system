@@ -441,6 +441,24 @@ tr:last-child td {
     overflow-x: auto;
 }
 
+.figure {
+    border: 1px solid var(--faint);
+    background: var(--panel);
+    padding: 14px;
+}
+
+.figure img {
+    display: block;
+    width: 100%;
+    height: auto;
+}
+
+.figure-caption {
+    color: var(--mid);
+    font-size: 11px;
+    margin-top: 10px;
+}
+
 .diagram pre {
     font-family: inherit;
     font-size: 12px;

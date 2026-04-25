@@ -429,6 +429,24 @@
             overflow-x: auto;
         }
 
+        .figure {
+            border: 1px solid var(--faint);
+            background: var(--panel);
+            padding: 14px;
+        }
+
+        .figure img {
+            display: block;
+            width: 100%;
+            height: auto;
+        }
+
+        .figure-caption {
+            color: var(--mid);
+            font-size: 11px;
+            margin-top: 10px;
+        }
+
         .diagram pre {
             font-family: inherit;
             font-size: 12px;
@@ -524,13 +542,13 @@
 <body>
 <div class="page">
     <nav class="top-nav" aria-label="Primary">
-        <a class="site-name" href="../README.md"><strong>ACS</strong> Docs</a>
+        <a class="site-name" href="index.html"><strong>ACS</strong> Docs</a>
         <ul class="top-links">
             <li><a href="flight-loop.html">Loop</a></li>
             <li><a href="predictor.html">Predictor</a></li>
             <li><a href="math.html">Math</a></li>
             <li><a href="code.html">Code</a></li>
-            <li><a href="api/html/index.html">API</a></li>
+            <li><a href="api/index.html">API</a></li>
             <li><a href="sensors.html">Sensors</a></li>
             <li><a href="replay.html">Replay</a></li>
         </ul>
@@ -600,7 +618,7 @@
                     <h3>Code highlights</h3>
                     <p>Source walkthrough for the implementation patterns that make the predictor, estimator, and flap path auditable.</p>
                 </a>
-                <a class="card card-link" href="api/html/index.html">
+                <a class="card card-link" href="api/index.html">
                     <h3>Generated API</h3>
                     <p>Doxygen-generated source reference for firmware, replay entry points, shared headers, and calibration helpers.</p>
                 </a>
@@ -623,6 +641,10 @@
             <p class="lede">
                 The control math starts with the energy picture, then replaces the simple "gravity only" coast with a numerical force model. A no-drag apogee is just current altitude plus remaining kinetic energy divided by gravity. The firmware keeps that as a useful upper bound, but the trusted predictor recomputes drag at each step.
             </p>
+            <div class="figure">
+                <img src="assets/apogee-flow-graph.svg" alt="Monochrome apogee prediction graph showing target, prediction, measured altitude, and velocity trend.">
+                <div class="figure-caption">The control loop is mostly about making the dashed prediction line converge without trusting stale or out-of-coverage data.</div>
+            </div>
             <div class="code-block" aria-label="Math summary">
                 <div class="code-title"><span>Math path</span><span>coast model</span></div>
                 <div class="code-body">
@@ -938,13 +960,13 @@ tools/build/bin/acs_replay tools/replay/data/SENS010.csv --ignore-logged-state</
             <li><a href="predictor.html">Predictor</a></li>
             <li><a href="math.html">Math</a></li>
             <li><a href="code.html">Code</a></li>
-            <li><a href="api/html/index.html">API</a></li>
+            <li><a href="api/index.html">API</a></li>
             <li><a href="sensors.html">Sensors</a></li>
             <li><a href="replay.html">Replay</a></li>
             <li><a href="apogee-predictor.md">Predictor notes</a></li>
             <li><a href="flow.md">Program flow</a></li>
             <li><a href="Doxyfile">Doxygen config</a></li>
-            <li><a href="../README.md">Repository</a></li>
+            <li><a href="api/index.html">Generated source</a></li>
         </ul>
     </footer>
 </div>

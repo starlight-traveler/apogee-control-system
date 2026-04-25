@@ -23,7 +23,7 @@
             <li><a href="predictor.html">Predictor</a></li>
             <li><a href="math.html">Math</a></li>
             <li><a href="code.html" aria-current="page">Code</a></li>
-            <li><a href="api/html/index.html">API</a></li>
+            <li><a href="api/index.html">API</a></li>
             <li><a href="sensors.html">Sensors</a></li>
             <li><a href="replay.html">Replay</a></li>
         </ul>
@@ -76,17 +76,21 @@
                 The predictor is structured as a small physics engine. Each derivative evaluation rebuilds air-relative velocity, interpolates CFD force, projects force into state acceleration, advances flap lag, and updates pitch.
             </p>
             <div class="code-block">
-                <div class="code-title"><span>Predictor core</span><span>pseudocode</span></div>
+                <div class="code-title"><span>src/apogee_model.h</span><span>zero-crossing rollout</span></div>
                 <div class="code-body">
-<pre><code>PredictApogeeWithTime(seed):
-    while vertical_velocity > 0:
-        next = integrate_one_step(seed, RK4)
-        if next.vertical_velocity <= 0:
-            return refine_zero_crossing(seed, next)
-        seed = next
-
-    if step_limit_hit:
-        return ballistic_bound_with_uncertain_flag</code></pre>
+<pre><code>while (state.verticalVelocity &gt; 0.0 &amp;&amp; steps &lt; maxIntegrationSteps_) {
+    const ApogeeState previousState = state;
+    state = IntegrateStep(state, timeStep_, hints, method);
+    elapsedTime += timeStep_;
+    ++steps;
+    if (previousState.verticalVelocity &gt; 0.0 &amp;&amp; state.verticalVelocity &lt;= 0.0) {
+        return RefineZeroCrossingByBisection(previousState,
+                                            state,
+                                            elapsedTime - timeStep_,
+                                            timeStep_,
+                                            method);
+    }
+}</code></pre>
                 </div>
             </div>
             <div class="grid-two">
@@ -127,6 +131,24 @@
                     <div><h3>Clamp outside coverage and report it</h3><p>Out-of-table values are safer as explicit uncertainty than pretend extrapolation.</p></div>
                 </div>
             </div>
+            <div class="code-block">
+                <div class="code-title"><span>src/apogee_model.h</span><span>cached CFD cell</span></div>
+                <div class="code-body">
+<pre><code>const bool sameCell = hints-&gt;cachedCellValid &amp;&amp;
+                      hints-&gt;cachedAcsLower == acs.lower &amp;&amp;
+                      hints-&gt;cachedAtkLower == atk.lower &amp;&amp;
+                      hints-&gt;cachedMachLower == mch.lower;
+if (!sameCell) {
+    PopulateCachedCorners(table,
+                          acs.lower,
+                          atk.lower,
+                          mch.lower,
+                          hints-&gt;cachedAxialCorners,
+                          hints-&gt;cachedNormalCorners);
+    hints-&gt;cachedCellValid = true;
+}</code></pre>
+                </div>
+            </div>
         </section>
 
         <section class="reveal">
@@ -152,6 +174,22 @@
                     <p>The learner compares measured vertical acceleration against modeled axial drag only during clean coast, then nudges the active Mach bin without rewriting unrelated regimes.</p>
                 </div>
             </div>
+            <div class="code-block">
+                <div class="code-title"><span>src/flight_computer.cpp</span><span>matched accel source</span></div>
+                <div class="code-body">
+<pre><code>if (selectedQuaternionSource == MainQuaternionSource::Icm &amp;&amp; hasFreshIcmAccel) {
+    accelBody[0] = data.accelICM[0];
+    accelBody[1] = data.accelICM[1];
+    accelBody[2] = data.accelICM[2];
+    loadIcmGyro();
+} else if (selectedQuaternionSource == MainQuaternionSource::Lsm &amp;&amp; hasFreshLsmAccel) {
+    accelBody[0] = data.accelLSM[0];
+    accelBody[1] = data.accelLSM[1];
+    accelBody[2] = data.accelLSM[2];
+    loadLsmGyro();
+}</code></pre>
+                </div>
+            </div>
         </section>
 
         <section class="reveal">
@@ -163,15 +201,16 @@
                 The control search is built around failure behavior. It tries to find useful drag, but the default answer for stale, uncertain, clamped, or invalid prediction is to request zero degrees through the existing command pipeline.
             </p>
             <div class="code-block">
-                <div class="code-title"><span>Actuation command</span><span>failure behavior</span></div>
+                <div class="code-title"><span>src/main.cpp</span><span>low-confidence gate</span></div>
                 <div class="code-body">
-<pre><code>if predictor is not trusted:
-    target_angle = 0 deg
-else:
-    rank candidate angles with midpoint prediction
-    validate best region with RK4 bounds
-    reject candidates with uncertainty flags
-    command best angle through servo limits</code></pre>
+<pre><code>const bool seedLowConfidence =
+    PredictorFlagsHasModelInvalidity(predictorFlags) ||
+    (predictorFlags &amp; (kPredictorSeedFlagPredictionUncertain |
+                       kPredictorSeedFlagCoastEntryBlendActive |
+                       kPredictorSeedFlagZenithClamped |
+                       kPredictorSeedFlagAngularRateClamped |
+                       kPredictorSeedFlagBaroVzGuardActive |
+                       kPredictorSeedFlagVerticalAccelDeweighted)) != 0u;</code></pre>
                 </div>
             </div>
             <div class="callout">
@@ -185,10 +224,10 @@ else:
                 <div class="section-label">IMU path</div>
             </div>
             <ul class="source-list">
-                <li><strong>Quaternion sanitize</strong><span><a href="../src/main.cpp">main.cpp</a> normalizes and validates selected attitude before publishing it as the main quaternion.</span></li>
+                <li><strong>Quaternion sanitize</strong><span><a href="api/src_2main_8cpp_source.html">main.cpp</a> normalizes and validates selected attitude before publishing it as the main quaternion.</span></li>
                 <li><strong>Rail agreement</strong><span>ICM, LSM, BNO, Pulse, and WT901 comparisons update trust with hysteresis so source selection does not chatter.</span></li>
-                <li><strong>Matched accel</strong><span><a href="../src/flight_computer.cpp">flight_computer.cpp</a> keeps selected ICM attitude with ICM accel and selected LSM attitude with LSM accel when those samples are fresh.</span></li>
-                <li><strong>Gyro propagation</strong><span><a href="../src/math_utils.h">math_utils.h</a> uses an exponential-map update so angular rate changes attitude without Euler singularities.</span></li>
+                <li><strong>Matched accel</strong><span><a href="api/flight__computer_8cpp_source.html">flight_computer.cpp</a> keeps selected ICM attitude with ICM accel and selected LSM attitude with LSM accel when those samples are fresh.</span></li>
+                <li><strong>Gyro propagation</strong><span><a href="api/math__utils_8h_source.html">math_utils.h</a> uses an exponential-map update so angular rate changes attitude without Euler singularities.</span></li>
             </ul>
         </section>
 
@@ -203,11 +242,11 @@ else:
                     <tr><th>File</th><th>Why it is interesting</th></tr>
                     </thead>
                     <tbody>
-                    <tr><td><a href="../src/apogee_model.h">src/apogee_model.h</a></td><td>Physics rollout, RK4/midpoint integration, force projection, CFD interpolation, uncertainty bounds, and adaptive Mach drag.</td></tr>
-                    <tr><td><a href="../src/flight_computer.cpp">src/flight_computer.cpp</a></td><td>State machine, Kalman updates, attitude propagation, predictor seed construction, and clean-coast drag learning.</td></tr>
-                    <tr><td><a href="../src/main.cpp">src/main.cpp</a></td><td>Sensor orchestration, rail health, actuation optimizer, runtime settings, logger fields, and hardware command loop.</td></tr>
-                    <tr><td><a href="../src/cfd_table.cpp">src/cfd_table.cpp</a></td><td>CFD CSV load, table validation, and force-grid storage contract.</td></tr>
-                    <tr><td><a href="../src/math_utils.h">src/math_utils.h</a></td><td>Quaternion math, slerp, zenith extraction, and gyro integration helpers.</td></tr>
+                    <tr><td><a href="api/apogee__model_8h_source.html">src/apogee_model.h</a></td><td>Physics rollout, RK4/midpoint integration, force projection, CFD interpolation, uncertainty bounds, and adaptive Mach drag.</td></tr>
+                    <tr><td><a href="api/flight__computer_8cpp_source.html">src/flight_computer.cpp</a></td><td>State machine, Kalman updates, attitude propagation, predictor seed construction, and clean-coast drag learning.</td></tr>
+                    <tr><td><a href="api/src_2main_8cpp_source.html">src/main.cpp</a></td><td>Sensor orchestration, rail health, actuation optimizer, runtime settings, logger fields, and hardware command loop.</td></tr>
+                    <tr><td><a href="api/cfd__table_8cpp_source.html">src/cfd_table.cpp</a></td><td>CFD CSV load, table validation, and force-grid storage contract.</td></tr>
+                    <tr><td><a href="api/math__utils_8h_source.html">src/math_utils.h</a></td><td>Quaternion math, slerp, zenith extraction, and gyro integration helpers.</td></tr>
                     </tbody>
                 </table>
             </div>
@@ -219,8 +258,8 @@ else:
         <ul class="footer-links">
             <li><a href="math.html">Math</a></li>
             <li><a href="predictor.html">Predictor</a></li>
-            <li><a href="api/html/index.html">API</a></li>
-            <li><a href="../src/main.cpp">Source</a></li>
+            <li><a href="api/index.html">API</a></li>
+            <li><a href="api/src_2main_8cpp_source.html">Source</a></li>
         </ul>
     </footer>
 </div>

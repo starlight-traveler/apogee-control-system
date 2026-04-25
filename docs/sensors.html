@@ -23,7 +23,7 @@
             <li><a href="predictor.html">Predictor</a></li>
             <li><a href="math.html">Math</a></li>
             <li><a href="code.html">Code</a></li>
-            <li><a href="api/html/index.html">API</a></li>
+            <li><a href="api/index.html">API</a></li>
             <li><a href="sensors.html" aria-current="page">Sensors</a></li>
             <li><a href="replay.html">Replay</a></li>
         </ul>
@@ -102,6 +102,63 @@
 
         <section class="reveal">
             <div class="section-head">
+                <h2>Sensor math</h2>
+                <div class="section-label">Corrections</div>
+            </div>
+            <p class="lede">
+                Every sensor rail is corrected before the estimator uses it. The important corrections are pressure-to-altitude conversion, mount-frame rotation, quaternion normalization, gravity removal, and stale/spike rejection.
+            </p>
+            <div class="formula-grid">
+                <div class="formula-card">
+                    <h3>Baro altitude</h3>
+                    <span class="equation">\(h = 44330\left(1 - (p/p_0)^{0.190294957}\right)\)</span>
+                    <p class="muted">BMP585 pressure is converted to altitude with the configured sea-level pressure reference. The code then converts meters to feet for logging and back to meters where the estimator expects SI.</p>
+                </div>
+                <div class="formula-card">
+                    <h3>Mount rotation</h3>
+                    <span class="equation">\(\vec{a}_{body} = R_{mount}\vec{a}_{sensor}\)</span>
+                    <p class="muted">ICM, LSM, BNO, WT901, and Pulse values are all rotated into the rocket body frame before comparisons. A sign error here becomes bad zenith and bad AoA.</p>
+                </div>
+                <div class="formula-card">
+                    <h3>Quaternion basis rotation</h3>
+                    <span class="equation">\(R_{body} = R_{mount}R_{sensor}R_{mount}^{T}\)</span>
+                    <p class="muted">Vector samples can be multiplied once by the mount matrix. Quaternion samples are converted through a rotation matrix so the attitude basis changes correctly.</p>
+                </div>
+                <div class="formula-card">
+                    <h3>Gravity and linear accel</h3>
+                    <span class="equation">\(\vec{a}_{linear} = \vec{a}_{measured} - R(q)\vec{g}\)</span>
+                    <p class="muted">Static acceleration includes gravity. The attitude path tells the estimator where gravity points so linear motion is not confused with tilt.</p>
+                </div>
+            </div>
+        </section>
+
+        <section class="reveal">
+            <div class="section-head">
+                <h2>Correction gates</h2>
+                <div class="section-label">Trust rules</div>
+            </div>
+            <div class="flow">
+                <div class="step">
+                    <div class="step-num">baro</div>
+                    <div><h3>Fresh finite altitude</h3><p>Pad reference and AGL-dependent gates require a current finite barometer sample. Cached altitude can be logged, but it cannot create liftoff or actuation evidence.</p></div>
+                </div>
+                <div class="step">
+                    <div class="step-num">spike</div>
+                    <div><h3>Pressure jump rejection</h3><p>The BMP585 path rejects altitude jumps that imply more than the configured maximum altitude rate, with a minimum jump allowance so normal noise is not over-filtered.</p></div>
+                </div>
+                <div class="step">
+                    <div class="step-num">rail</div>
+                    <div><h3>Matched attitude and accel</h3><p>Selected ICM attitude uses fresh ICM accel when available; selected LSM attitude uses fresh LSM accel. Blended/default attitude uses the normal fresh-rail preference.</p></div>
+                </div>
+                <div class="step">
+                    <div class="step-num">blend</div>
+                    <div><h3>Reference correction is ramped</h3><p>BNO/Pulse reference attitude can trim the fast rails only after freshness, tilt agreement, sample count, phase, and ramp checks pass.</p></div>
+                </div>
+            </div>
+        </section>
+
+        <section class="reveal">
+            <div class="section-head">
                 <h2>Freshness rules</h2>
                 <div class="section-label">Why it matters</div>
             </div>
@@ -117,8 +174,8 @@
     <footer>
         <span>Sensor notes</span>
         <ul class="footer-links">
-            <li><a href="../src/imu_orientation.h">Frame source</a></li>
-            <li><a href="../src/settings.h">Settings</a></li>
+            <li><a href="api/imu__orientation_8h_source.html">Frame source</a></li>
+            <li><a href="api/settings_8h_source.html">Settings</a></li>
             <li><a href="replay.html">Next: replay</a></li>
         </ul>
     </footer>

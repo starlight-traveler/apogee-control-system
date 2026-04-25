@@ -23,7 +23,7 @@
             <li><a href="predictor.html">Predictor</a></li>
             <li><a href="math.html">Math</a></li>
             <li><a href="code.html">Code</a></li>
-            <li><a href="api/html/index.html">API</a></li>
+            <li><a href="api/index.html">API</a></li>
             <li><a href="sensors.html">Sensors</a></li>
             <li><a href="replay.html" aria-current="page">Replay</a></li>
         </ul>
@@ -93,6 +93,63 @@ python3 tools/replay/scripts/plot_flight.py --flight fullscale_4 --view validati
 
         <section class="reveal">
             <div class="section-head">
+                <h2>Replay math</h2>
+                <div class="section-label">Reconstruction</div>
+            </div>
+            <p class="lede">
+                Replay is useful because it separates three different questions: what the sensors measured, what the estimator believed, and what the predictor would command from the current code.
+            </p>
+            <div class="formula-grid">
+                <div class="formula-card">
+                    <h3>Pad-relative altitude</h3>
+                    <span class="equation">\(h_{AGL}(t) = h_{baro}(t) - h_{pad}\)</span>
+                    <p class="muted">Use AGL for flight decisions and apogee error. Comparing ASL prediction against AGL target creates an error close to pad altitude.</p>
+                </div>
+                <div class="formula-card">
+                    <h3>Baro velocity check</h3>
+                    <span class="equation">\(v_{baro}(t) \approx \frac{h(t)-h(t-\Delta t)}{\Delta t}\)</span>
+                    <p class="muted">This is noisy, but it catches cases where the state velocity drifts toward a bad value. The firmware only updates this from fresh baro samples.</p>
+                </div>
+                <div class="formula-card">
+                    <h3>Prediction error</h3>
+                    <span class="equation">\(e_{apogee}(t) = h_{predicted}(t) - h_{actual}\)</span>
+                    <p class="muted">Early coast error usually points at burnout timing, velocity, frame/AoA, or drag model coverage. Late error often points at state altitude/velocity convergence.</p>
+                </div>
+                <div class="formula-card">
+                    <h3>Energy sanity check</h3>
+                    <span class="equation">\(h_{ballistic} = h + \frac{v_z^2}{2g}\)</span>
+                    <p class="muted">A predictor below the ballistic bound is normal with drag. A predictor behaving like raw state altitude means velocity, drag, or validity gates are suspect.</p>
+                </div>
+            </div>
+        </section>
+
+        <section class="reveal">
+            <div class="section-head">
+                <h2>Corrections to test</h2>
+                <div class="section-label">Replay flags</div>
+            </div>
+            <div class="grid-two">
+                <div class="card">
+                    <h3>Frame correction</h3>
+                    <p>Plot pad gravity vectors for ICM, LSM, BNO, Pulse, and WT901. The dominant axis and signs should agree. A frame mismatch can look exactly like an aero-model miss.</p>
+                </div>
+                <div class="card">
+                    <h3>Altitude source correction</h3>
+                    <p>Compare baro AGL, state AGL, and predictor seed altitude. If prediction is off by pad altitude, inspect ASL/AGL conversion before changing drag constants.</p>
+                </div>
+                <div class="card">
+                    <h3>Velocity correction</h3>
+                    <p>Plot pre-burnout, burnout, and coast velocity. Bad vertical velocity creates squared error in the no-drag term, so a small velocity miss can become a large apogee miss.</p>
+                </div>
+                <div class="card">
+                    <h3>Aero coverage correction</h3>
+                    <p>Check CFD clamp flags for ACS angle, AoA, and Mach. Above table coverage should be treated as uncertain, not silently trusted as a precise flap command.</p>
+                </div>
+            </div>
+        </section>
+
+        <section class="reveal">
+            <div class="section-head">
                 <h2>Curated artifacts</h2>
                 <div class="section-label">Repository policy</div>
             </div>
@@ -135,8 +192,8 @@ python3 tools/replay/scripts/plot_flight.py --flight fullscale_4 --view validati
     <footer>
         <span>Replay notes</span>
         <ul class="footer-links">
-            <li><a href="../tools/replay/README.md">Replay README</a></li>
-            <li><a href="../tools/replay/scripts/README.md">Scripts</a></li>
+            <li><a href="README.md">Docs README</a></li>
+            <li><a href="api/pages.html">Generated pages</a></li>
             <li><a href="index.html">Back to overview</a></li>
         </ul>
     </footer>

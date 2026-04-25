@@ -3,7 +3,7 @@
 # Generate with:
 #   bash tools/scripts/generate_doxygen.sh
 #
-# Output is written to docs/api/html and intentionally ignored by git.
+# Output is written to docs/api and intentionally ignored by git.
 
 DOXYFILE_ENCODING      = UTF-8
 PROJECT_NAME           = "Apogee Control System"
@@ -88,15 +88,15 @@ REFERENCES_LINK_SOURCE = YES
 VERBATIM_HEADERS       = YES
 
 ALPHABETICAL_INDEX     = YES
-GENERATE_TREEVIEW      = YES
+GENERATE_TREEVIEW      = NO
 DISABLE_INDEX          = NO
-HTML_DYNAMIC_MENUS     = YES
+HTML_DYNAMIC_MENUS     = NO
 HTML_DYNAMIC_SECTIONS  = YES
 HTML_COLORSTYLE        = LIGHT
 HTML_EXTRA_STYLESHEET  = docs/assets/acs-doxygen.css
 
 GENERATE_HTML          = YES
-HTML_OUTPUT            = html
+HTML_OUTPUT            = .
 GENERATE_LATEX         = NO
 GENERATE_XML           = NO
 GENERATE_MAN           = NO
