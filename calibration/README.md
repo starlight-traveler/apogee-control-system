@@ -7,6 +7,9 @@ Targets:
 - `icm20948_advanced.cpp`
 - `lsm9ds1_advanced.cpp`
 - `pulse20_advanced.cpp`
+- `orientation_check.cpp`
+- `motor_actuation_sequence.cpp`
+- `ahrs_testing/main.cpp`
 
 Build and upload:
 
@@ -14,6 +17,9 @@ Build and upload:
 platformio run -e icm_calibration -t upload
 platformio run -e lsm9ds1_calibration -t upload
 platformio run -e pulse20_calibration -t upload
+platformio run -e orientation_check -t upload
+platformio run -e ahrs_testing -t upload
+platformio run -e motor_actuation_sequence -t upload
 platformio device monitor -b 115200
 ```
 

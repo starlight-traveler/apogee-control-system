@@ -8,10 +8,25 @@ prediction algorithm without loading firmware onto the rocket avionics.
 ## Layout
 
 - `scripts/`: Python replay analysis, plotting, and tuning utilities
-- `data/`: CSV, index, and text replay artifacts
-- `plots/`: generated SVG comparison plots
+- `replaylib/`: reusable Python helpers shared by the stable replay commands
+- `experiments/`: archived flight-specific and model-specific investigations
+- `data/`: local CSV, event, spreadsheet, and replay artifacts; ignored by default
+- `plots/`: curated SVG comparison plots suitable for review
 - `include/`, `main.cpp`, `arduino_stubs.cpp`: hosted replay source
 - `build/`: CMake output
+
+## Command Layers
+
+Use the layers this way:
+
+| Layer | Path | Use |
+| ----- | ---- | --- |
+| Supported commands | `scripts/` | Normal decode, replay, plotting, and predictor comparisons. |
+| Shared helpers | `replaylib/` | New reusable Python code used by supported commands. |
+| Archived scripts | `experiments/` | Old flight-specific investigations retained for reproducibility. |
+| Native replay source | `main.cpp`, `include/`, `arduino_stubs.cpp` | Hosted C++ executable that reuses firmware logic. |
+
+New tooling should usually add helper code in `replaylib/` and expose it through a small script in `scripts/`.
 
 ## Building
 
@@ -78,9 +93,12 @@ apogee estimate.
 
 ## Python utilities
 
-Run the Python replay helpers from the repo root so `PYTHONPATH=.` picks up
-the shared simulator modules, for example:
+Run the stable Python replay commands from the repo root, for example:
 
 ```bash
-env PYTHONPATH=. python3 tools/replay/scripts/compute_apogee_prediction_variants.py
+python3 tools/replay/scripts/decode_log.py tools/replay/scripts/SENS065.BIN -o tools/replay/data/SENS065.csv
+python3 tools/replay/scripts/plot_flight.py --flight fullscale_4 --view validation
+python3 tools/replay/scripts/compare_predictors.py --mode current-model
 ```
+
+Archived investigation scripts live under `tools/replay/experiments/`. They are kept for reproducibility, but the supported command surface is `tools/replay/scripts/`.

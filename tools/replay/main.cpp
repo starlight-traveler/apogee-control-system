@@ -337,6 +337,17 @@ enum class SampleValueId {
     GyroX,
     GyroY,
     GyroZ,
+    StateAccelZ,
+    StateInertialAccelZ,
+    StateBaroVelocityMps,
+    StateBaroVelocityResidualMps,
+    StateBaroVelocityUpdateUsed,
+    StateBaroVelocityGuardActive,
+    StateZAccelUpdateUsed,
+    PredictorSeedHorizontalSpeedMps,
+    PredictorSeedZenithDeg,
+    PredictorSeedAngularRateDps,
+    PredictorSeedFlags,
 };
 
 struct SampleValueInfo {
@@ -473,6 +484,72 @@ const std::vector<SampleValueInfo> &AllSampleValues() {
         {SampleValueId::GyroX, "gyro_x", {"gyro_x", "gx"}, "Gyroscope X axis (rad/s).", true, true},
         {SampleValueId::GyroY, "gyro_y", {"gyro_y", "gy"}, "Gyroscope Y axis (rad/s).", true, true},
         {SampleValueId::GyroZ, "gyro_z", {"gyro_z", "gz"}, "Gyroscope Z axis (rad/s).", true, true},
+        {SampleValueId::StateAccelZ,
+         "state_accel_z_mps2",
+         {"state_accel_z", "accel_z_state"},
+         "Filtered vertical acceleration in m/s^2.",
+         true,
+         true},
+        {SampleValueId::StateInertialAccelZ,
+         "state_inertial_accel_z_mps2",
+         {"state_inertial_accel_z", "inertial_accel_z"},
+         "Latest inertial vertical acceleration measurement in m/s^2.",
+         true,
+         true},
+        {SampleValueId::StateBaroVelocityMps,
+         "state_baro_velocity_mps",
+         {"baro_velocity_mps", "baro_vz_mps"},
+         "Rolling baro vertical velocity estimate in m/s.",
+         true,
+         true},
+        {SampleValueId::StateBaroVelocityResidualMps,
+         "state_baro_velocity_residual_mps",
+         {"baro_velocity_residual_mps", "baro_vz_residual_mps"},
+         "Kalman velocity minus rolling baro velocity in m/s.",
+         true,
+         true},
+        {SampleValueId::StateBaroVelocityUpdateUsed,
+         "state_baro_velocity_update_used",
+         {"baro_velocity_update_used", "baro_vz_update_used"},
+         "Whether the baro velocity update was accepted.",
+         true,
+         true},
+        {SampleValueId::StateBaroVelocityGuardActive,
+         "state_baro_velocity_guard_active",
+         {"baro_velocity_guard_active", "baro_vz_guard_active"},
+         "Whether baro velocity guard mode is active.",
+         true,
+         true},
+        {SampleValueId::StateZAccelUpdateUsed,
+         "state_z_accel_update_used",
+         {"z_accel_update_used"},
+         "Whether the vertical accel update was accepted.",
+         true,
+         true},
+        {SampleValueId::PredictorSeedHorizontalSpeedMps,
+         "predictor_seed_horizontal_speed_mps",
+         {"seed_horizontal_speed_mps"},
+         "Horizontal speed seed used by the runtime apogee predictor in m/s.",
+         true,
+         true},
+        {SampleValueId::PredictorSeedZenithDeg,
+         "predictor_seed_zenith_deg",
+         {"seed_zenith_deg"},
+         "Clamped zenith seed used by the runtime apogee predictor in degrees.",
+         true,
+         true},
+        {SampleValueId::PredictorSeedAngularRateDps,
+         "predictor_seed_angular_rate_dps",
+         {"seed_angular_rate_dps"},
+         "Clamped angular-rate seed used by the runtime apogee predictor in degrees/s.",
+         true,
+         true},
+        {SampleValueId::PredictorSeedFlags,
+         "predictor_seed_flags",
+         {"seed_flags", "predictor_flags"},
+         "Predictor seed confidence flags as an integer-valued float.",
+         true,
+         true},
     };
     return kValues;
 }
@@ -792,9 +869,9 @@ math_utils::Vec3 RotateReplayBodyToInertial(const math_utils::Vec3 &bodyAccel,
     const float earthZ = r02 * bodyAccel.x + r12 * bodyAccel.y + r22 * bodyAccel.z;
 
     math_utils::Vec3 result;
-    result.x = -earthZ;
+    result.x = earthX;
     result.y = earthY;
-    result.z = earthX - constants::kGravity;
+    result.z = earthZ - constants::kGravity;
     return result;
 }
 
@@ -1615,8 +1692,6 @@ struct SampleSnapshot {
 SampleValueContext::DerivedMetrics ComputeDerivedMetrics(const FilteredState &state,
                                                          const EnvironmentModel &environment,
                                                          float apogeeTargetMeters,
-                                                         float altitudeReferenceMeters,
-                                                         bool hasAltitudeReference,
                                                          float previousTimeSeconds,
                                                          float previousZenithRadians,
                                                          bool hasPreviousZenith) {
@@ -1657,11 +1732,9 @@ SampleValueContext::DerivedMetrics ComputeDerivedMetrics(const FilteredState &st
 
     metrics.apogeeErrorMeters = state.apogeeEstimate - apogeeTargetMeters;
 
-    if (hasAltitudeReference) {
-        metrics.altitudeAglMeters = state.position[2] - altitudeReferenceMeters;
-        if (metrics.altitudeAglMeters < 0.0f) {
-            metrics.altitudeAglMeters = 0.0f;
-        }
+    metrics.altitudeAglMeters = state.position[2];
+    if (metrics.altitudeAglMeters < 0.0f) {
+        metrics.altitudeAglMeters = 0.0f;
     }
 
     return metrics;
@@ -1715,6 +1788,28 @@ std::optional<float> ResolveSampleValue(SampleValueId id, const SampleValueConte
             return ctx.sensor.gyro[1];
         case SampleValueId::GyroZ:
             return ctx.sensor.gyro[2];
+        case SampleValueId::StateAccelZ:
+            return ctx.state.acceleration[2];
+        case SampleValueId::StateInertialAccelZ:
+            return ctx.state.inertialAcceleration[2];
+        case SampleValueId::StateBaroVelocityMps:
+            return ctx.state.baroVerticalVelocityMps;
+        case SampleValueId::StateBaroVelocityResidualMps:
+            return ctx.state.baroVerticalVelocityResidualMps;
+        case SampleValueId::StateBaroVelocityUpdateUsed:
+            return ctx.state.baroVerticalVelocityUpdateUsed;
+        case SampleValueId::StateBaroVelocityGuardActive:
+            return ctx.state.baroVerticalVelocityGuardActive;
+        case SampleValueId::StateZAccelUpdateUsed:
+            return ctx.state.zAccelUpdateUsed;
+        case SampleValueId::PredictorSeedHorizontalSpeedMps:
+            return ctx.state.predictorSeedHorizontalSpeedMps;
+        case SampleValueId::PredictorSeedZenithDeg:
+            return ctx.state.predictorSeedClampedZenithRad * 57.2957795f;
+        case SampleValueId::PredictorSeedAngularRateDps:
+            return ctx.state.predictorSeedClampedAngularRateRadPerSec * 57.2957795f;
+        case SampleValueId::PredictorSeedFlags:
+            return ctx.state.predictorSeedConfidenceFlags;
     }
     return std::nullopt;
 }
@@ -2425,8 +2520,6 @@ int main(int argc, char **argv) {
     std::size_t skippedRows = 0;
     std::size_t outlierAltimeterRows = 0;
     std::size_t emittedStates = 0;
-    bool hasAltitudeReference = false;
-    float altitudeReferenceMeters = 0.0f;
     bool hasPreviousZenith = false;
     float previousZenithRadians = 0.0f;
     float previousTimeSeconds = 0.0f;
@@ -2532,15 +2625,9 @@ int main(int argc, char **argv) {
             ++emittedStates;
             lastEmittedApogeeMeters = state.apogeeEstimate;
             lastEmittedStatus = emittedStatus;
-            if (!hasAltitudeReference) {
-                altitudeReferenceMeters = state.position[2];
-                hasAltitudeReference = true;
-            }
             const SampleValueContext::DerivedMetrics derived = ComputeDerivedMetrics(state,
                                                                                      environment,
                                                                                      options.apogeeTargetMeters,
-                                                                                     altitudeReferenceMeters,
-                                                                                     hasAltitudeReference,
                                                                                      previousTimeSeconds,
                                                                                      previousZenithRadians,
                                                                                      hasPreviousZenith);

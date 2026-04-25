@@ -4,8 +4,12 @@ This folder is the flight firmware. The main thing to keep straight on launch da
 is which values are meant to be updated at the pad and which ones are baked into
 the build.
 
-`ACSCFG.TXT` on the SD card holds the runtime settings. Those can also be pushed
-over telemetry, but only while the flight computer is still in `Ground`.
+The flashed defaults in `settings.h` are authoritative at boot. `ACSCFG.TXT` on
+the SD card is overwritten as a mirror of those flashed values when storage is
+available, so an old SD file cannot silently override a new firmware flash.
+Runtime settings can still be pushed over telemetry while the flight computer is
+in `Ground`; those take effect for the running boot and are saved, but the next
+boot returns to the flashed defaults.
 
 ## What To Check At The Pad
 

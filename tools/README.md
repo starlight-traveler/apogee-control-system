@@ -1,30 +1,64 @@
-# ACS NDRT Rocketry Tools
+# ACS Tools
 
-## gui_dashboard.py (Recommended)
+Native and Python tooling for decoding flight logs, replaying recorded flights, and validating predictor behavior.
 
-Local web GUI that consolidates decode + CSV/events browsing + smart plotting.
+## Layout
 
-```bash
-python tools/gui_dashboard.py
-```
+| Path | Purpose |
+| ---- | ------- |
+| `CMakeLists.txt` | Top-level native tooling build. |
+| `decode/` | Binary log decoders, including the native fast decoder. |
+| `replay/` | Hosted replay executable, Python replay commands, reusable helpers, experiments, data, and plots. |
+| `build/` | Local CMake output. Ignored by Git. |
 
-Safari HTTPS-Only users:
-
-```bash
-python tools/gui_dashboard.py --https
-```
-
-For fast BIN decoding, build the native decoder once:
+Use the top-level CMake workspace from the repository root:
 
 ```bash
-cmake -S tools -B tools/build
+cmake -S tools -B tools/build -DACS_TOOLS_ENABLE_NATIVE_CPP_GUI=OFF
 cmake --build tools/build -j
 ```
 
-This creates `tools/build/bin/acs_ndrt_rocketry_fast_decode` (and legacy `acs_fast_decode`). The GUI and `decode_sensor_log.py`
-will automatically use it when present.
+The common native outputs are placed under `tools/build/bin/`.
 
-For very large logs with long idle time, use smart trimming:
+## Native Targets
+
+| Target | Purpose |
+| ------ | ------- |
+| `acs_ndrt_rocketry_fast_decode` | Fast binary log decoder. |
+| `acs_fast_decode` | Legacy alias for the fast decoder when provided by the build. |
+| `acs_replay` | Hosted replay executable that reuses flight logic against CSV input. |
+| `acs_ndrt_rocketry_decoder` | Native CSV/BIN analysis UI when GUI dependencies are enabled. |
+| `teensy_imgui_telemetry` | Native telemetry UI from `telemetry/imgui` when GUI dependencies are enabled. |
+
+Build replay without GUI dependencies:
+
+```bash
+cmake -S tools -B tools/build -DACS_TOOLS_ENABLE_NATIVE_CPP_GUI=OFF
+cmake --build tools/build --target acs_replay -j
+```
+
+Build the native decode utility:
+
+```bash
+cmake -S tools -B tools/build -DACS_TOOLS_BUILD_DECODER=ON
+cmake --build tools/build --target acs_ndrt_rocketry_fast_decode -j
+```
+
+## Decode Logs
+
+Python decoder:
+
+```bash
+python3 tools/replay/scripts/decode_log.py path/to/SENS010.BIN -o output.csv
+```
+
+Native decoder after building tools:
+
+```bash
+tools/build/bin/acs_ndrt_rocketry_fast_decode path/to/SENS010.BIN -o output.csv
+```
+
+For long logs with idle time, the native decoder supports smart trimming:
 
 ```bash
 tools/build/bin/acs_ndrt_rocketry_fast_decode input.BIN -o output.csv --smart-parser \
@@ -32,105 +66,23 @@ tools/build/bin/acs_ndrt_rocketry_fast_decode input.BIN -o output.csv --smart-pa
   --smart-min-alt-ft 25 --smart-min-vel-ftps 20 --smart-min-cmd-deg 0.5
 ```
 
-Features:
-- scans for `.BIN`, `.csv`, and `_events.json` under a root directory
-- one-click BIN decode via `decode_sensor_log.py`
-- preset graph views (flight overview, actuation/optimizer, baro quality, dynamics)
-- event overlay markers on plots
-- point decimation + in-memory caching for quick reloads
-
-Optional CMake helper target:
-
-```bash
-cmake --build tools/build --target run_gui
-```
-
-## Native C++ GUI
-
-For a native C++ GUI (Dear ImGui/OpenGL), use `telemetry/imgui` via the same
-tools CMake workspace:
-
-```bash
-cmake -S tools -B tools/build
-cmake --build tools/build -j
-cmake --build tools/build --target run_native_gui
-```
-
-Windows notes:
-- `acs_ndrt_rocketry_decoder` builds on Windows from the same CMake flow.
-- `teensy_imgui_telemetry` is currently POSIX-socket based and is auto-disabled on Windows.
-
-For offline CSV/BIN analysis (range graphing, signal picker, event markers):
-
-```bash
-cmake --build tools/build --target run_native_decoder_gui
-tools/build/bin/acs_ndrt_rocketry_decoder path/to/SENS010.BIN
-```
-
 ## Hosted Replay
 
-The hosted replay executable now lives under `tools/replay` and is built from
-the same native tools workspace:
-
 ```bash
-cmake -S tools -B tools/build -DACS_TOOLS_ENABLE_NATIVE_CPP_GUI=OFF
-cmake --build tools/build --target acs_replay -j
-tools/build/bin/acs_replay tools/replay/output.csv
+tools/build/bin/acs_replay output.csv
 ```
 
-## tui_dashboard.py
+Replay implementation and usage details live in [`tools/replay/README.md`](replay/README.md).
 
-Unified TUI dashboard for choosing CSV, JSON, or binary log inputs.
+## Python Replay Scripts
 
-```bash
-python tools/tui_dashboard.py
-```
-
-On first launch the dashboard asks for a data root directory and stores it
-in `tools/.tui_settings.json`. You can change it later from the Settings
-menu.
-
-The dashboard also includes a Rocketry Analysis panel that summarizes
-flight metrics (apogee, max velocity, burn/coast/descent timing) and can
-estimate thrust-to-weight and drag if you provide mass and reference area
-in Settings.
-
-## decode_sensor_log.py
-
-Decode binary telemetry logs written by the flight computer into CSV + JSON.
+Run Python replay helpers from the repo root:
 
 ```bash
-python tools/decode_sensor_log.py data/subscale_3/SENS010.BIN \
-  -o data/subscale_3/sens010.csv
+python3 tools/replay/scripts/plot_flight.py --flight fullscale_4 --view validation
+python3 tools/replay/scripts/compare_predictors.py --mode current-model
 ```
 
-## tui_telemetry_viewer.py
+Stable command documentation lives in [`replay/scripts/README.md`](replay/scripts/README.md). Archived investigation scripts live in [`replay/experiments/`](replay/experiments/).
 
-Scrollable TUI for telemetry CSV files (arrow keys, PgUp/PgDn, q to quit).
-
-```bash
-python tools/tui_telemetry_viewer.py data/subscale_3/sens010.csv
-```
-
-Pick specific columns:
-
-```bash
-python tools/tui_telemetry_viewer.py data/subscale_3/sens010.csv \
-  --columns state_time,state_apogee_estimate,flight_status
-```
-
-## tui_tail_csv.py
-
-Live tail view of the latest CSV rows.
-
-```bash
-python tools/tui_tail_csv.py data/subscale_3/sens010.csv --rows 15 --interval 0.5
-```
-
-## tui_event_viewer.py
-
-Scrollable TUI for event JSON files produced by `decode_sensor_log.py`.
-
-```bash
-python tools/tui_event_viewer.py data/events/sample_events.json
-```
+Generated CSVs, raw logs, build trees, and ad-hoc plots should stay local unless they are intentionally curated documentation artifacts.

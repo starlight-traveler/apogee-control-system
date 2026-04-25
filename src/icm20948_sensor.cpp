@@ -26,6 +26,12 @@ constexpr uint8_t kDmpMaxDrainFrames = 8;
 constexpr uint8_t kMaxConsecutiveReadFailures = 3;
 constexpr uint8_t kMaxConsecutiveDmpFailures = 2;
 
+enum class DmpReadResult : uint8_t {
+    NoData = 0,
+    QuaternionRead,
+    Failure,
+};
+
 ICM_20948_SPI g_icm;
 volatile bool g_dataReadyInterrupt = false;
 bool g_initialized = false;
@@ -551,11 +557,9 @@ void UpdateBootstrapYprDiagnostics(const float accelNorm[3], const float magNorm
     math_utils::QuaternionToEuler(quat, yaw, pitch, roll);
     g_lastBootstrapYprDeg[0] = yaw * kRadToDeg;
     g_lastBootstrapYprDeg[1] = pitch * kRadToDeg;
-    // The ICM body-frame mapping includes a Y reflection relative to the
-    // BNO/LSM rails. That reflected frame is fine for vector math, but when we
-    // expose Euler angles for diagnostics the roll sign must be flipped back so
-    // the reported tilt matches the other rails.
-    g_lastBootstrapYprDeg[2] = -roll * kRadToDeg;
+    // Keep the bootstrap Euler diagnostics in the same body-frame convention as
+    // the steady-state quaternion output.
+    g_lastBootstrapYprDeg[2] = roll * kRadToDeg;
     g_lastBootstrapYprValid = true;
 }
 
@@ -1300,9 +1304,9 @@ bool ExtractDmpQuaternion(const icm_20948_DMP_data_t &data, float quaternion[4])
     return QuaternionFromUpVector(upBody, quaternion);
 }
 
-bool TryReadDmpQuaternion(float quaternion[4]) {
+DmpReadResult TryReadDmpQuaternion(float quaternion[4]) {
     if (!g_dmpQuaternionActive) {
-        return false;
+        return DmpReadResult::Failure;
     }
 
     bool foundQuaternion = false;
@@ -1314,7 +1318,7 @@ bool TryReadDmpQuaternion(float quaternion[4]) {
             break;
         }
         if (status != ICM_20948_Stat_Ok && status != ICM_20948_Stat_FIFOMoreDataAvail) {
-            return false;
+            return DmpReadResult::Failure;
         }
         if (ExtractDmpQuaternion(data, quaternion)) {
             foundQuaternion = true;
@@ -1323,7 +1327,7 @@ bool TryReadDmpQuaternion(float quaternion[4]) {
             break;
         }
     }
-    return foundQuaternion;
+    return foundQuaternion ? DmpReadResult::QuaternionRead : DmpReadResult::NoData;
 }
 
 /// Publishes the last valid ICM sample so the estimator can hold state between
@@ -2031,7 +2035,25 @@ bool Icm20948SensorAcquire(SensorData &out) {
 
     float dmpQuaternion[4] = {1.0f, 0.0f, 0.0f, 0.0f};
     if (g_dmpQuaternionActive) {
-        if (!TryReadDmpQuaternion(dmpQuaternion)) {
+        bool shouldRead = false;
+        if (g_interruptConfigured) {
+            shouldRead = interruptTriggered;
+            if (!shouldRead && g_icm.dataReady()) {
+                shouldRead = true;
+            }
+        } else {
+            shouldRead = g_icm.dataReady();
+        }
+
+        if (!shouldRead) {
+            return PopulateFromCache(out, nowUs);
+        }
+
+        const DmpReadResult dmpReadResult = TryReadDmpQuaternion(dmpQuaternion);
+        if (dmpReadResult == DmpReadResult::NoData) {
+            return PopulateFromCache(out, nowUs);
+        }
+        if (dmpReadResult == DmpReadResult::Failure) {
             return HandleAcquireFailure(out, nowUs, "DMP FIFO read failure", true);
         }
         g_lastSampleUs = nowUs;

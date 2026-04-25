@@ -36,7 +36,7 @@ constexpr uint32_t kHardFlushIntervalMicros = kFlushIntervalMicros * 4u;
 constexpr const char *kLogPrefix = "SENS";
 constexpr const char *kLogExtension = "BIN";
 constexpr uint16_t kLogFileFormatVersion = 1;
-constexpr uint16_t kLogSchemaVersion = 10;
+constexpr uint16_t kLogSchemaVersion = 12;
 constexpr uint8_t kLogMagic[8] = {'A', 'C', 'S', 'N', 'D', 'R', 'T', '1'};
 
 #if defined(ACS_FIRMWARE_GIT_HASH)
@@ -48,8 +48,8 @@ constexpr const char *kFirmwareGitHash = "unknown";
 // These static asserts are the first line of defense for the binary schema.
 // If any of them changes, the decoder table in tools/decode/native must be
 // updated in lockstep before new logs are trusted.
-static_assert(sizeof(LoggedTelemetrySample) == 248, "LoggedTelemetrySample size mismatch.");
-static_assert(sizeof(TelemetryLogRecord) == 252, "TelemetryLogRecord size mismatch.");
+static_assert(sizeof(LoggedTelemetrySample) == 276, "LoggedTelemetrySample size mismatch.");
+static_assert(sizeof(TelemetryLogRecord) == 280, "TelemetryLogRecord size mismatch.");
 static_assert(sizeof(EventLogRecord) == 28, "EventLogRecord size mismatch.");
 static_assert(sizeof(LogFilePreamble) == 64, "LogFilePreamble size mismatch.");
 
@@ -120,6 +120,17 @@ LoggedTelemetrySample BuildLoggedTelemetrySample(const SensorData &sensor,
         sample.verticalVelocityFps = state->velocity[2] * constants::kMetersToFeet;
         sample.zenithDeg = state->zenith * kRadToDeg;
         sample.apogeeEstimateFeet = state->apogeeEstimate * constants::kMetersToFeet;
+        sample.baroVerticalVelocityFps = state->baroVerticalVelocityMps * constants::kMetersToFeet;
+        sample.baroVerticalVelocitySigmaFps = state->baroVerticalVelocitySigmaMps * constants::kMetersToFeet;
+        sample.baroVerticalVelocityResidualFps =
+            state->baroVerticalVelocityResidualMps * constants::kMetersToFeet;
+        sample.zAccelSigmaScale = state->zAccelSigmaScale;
+        sample.baroVerticalVelocityUpdateUsed = (state->baroVerticalVelocityUpdateUsed > 0.5f) ? 1u : 0u;
+        sample.baroVerticalVelocityGuardActive = (state->baroVerticalVelocityGuardActive > 0.5f) ? 1u : 0u;
+        sample.zAccelUpdateUsed = (state->zAccelUpdateUsed > 0.5f) ? 1u : 0u;
+        sample.bnoQuaternionAgeMs = state->bnoQuaternionAgeMs;
+        sample.bnoReferenceTiltErrorDeg = state->bnoReferenceTiltErrorDeg;
+        sample.bnoReferenceCorrectionApplied = state->bnoReferenceCorrectionApplied;
     }
 
     return sample;

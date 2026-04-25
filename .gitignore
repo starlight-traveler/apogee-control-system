@@ -56,6 +56,7 @@ dkms.conf
 
 # PlatformIO build output
 .pio/
+.pio-core/
 
 # Python cache/venv
 __pycache__/
@@ -66,16 +67,22 @@ venv/
 # IDE/editor
 .vscode/
 .idea/
+/imgui.ini
 .DS_Store
+**/.DS_Store
 
 # Local data/logs
 data/
+!tools/replay/data/
+!tools/replay/data/README.md
+!tools/replay/data/.gitkeep
 *.log
 standalone-c/sensor_data/
 *.idx
 
 # CMake/Ninja build trees
 build/
+**/build/
 cmake-build-*/
 **/CMakeFiles/
 **/CMakeCache.txt
@@ -112,7 +119,10 @@ tools/build/
 tools/cpp/build/
 tools/*.BIN
 tools/*.bin
+tools/**/*.BIN
+tools/**/*.bin
 tools/*.csv
+tools/**/*.xlsx
 tools/*_events.json
 tools/*.png
 tools/*.svg

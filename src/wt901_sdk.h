@@ -100,20 +100,6 @@ void WitDeInit(void);
 
 
 
-/**
-  ******************************************************************************
-  * @file    wit_c_sdk.h
-  * @author  Wit
-  * @version V1.0
-  * @date    05-May-2022
-  * @brief   This file provides all Configure sensor function.
-  ******************************************************************************
-  * @attention
-  *
-  *        http://wit-motion.cn/
-  *
-  ******************************************************************************
-  */
 int32_t WitStartAccCali(void);
 int32_t WitStopAccCali(void);
 int32_t WitStartMagCali(void);

@@ -1,5 +1,7 @@
 #pragma once
 
+#include <array>
+
 #include <Arduino.h>
 
 #include "apogee_model.h"
@@ -25,6 +27,8 @@ struct SensorData {
     float accelBNO[3] = {0.0f, 0.0f, 0.0f};
     float gyroBNO[3] = {0.0f, 0.0f, 0.0f};
     float quaternionBNO[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+    float bnoQuaternionAgeMs = NAN;
+    float bnoQuaternionTimestampS = 0.0f;
     float accelICM[3] = {0.0f, 0.0f, 0.0f};
     float quaternion[4] = {1.0f, 0.0f, 0.0f, 0.0f};
     float gyro[3] = {0.0f, 0.0f, 0.0f};
@@ -57,9 +61,12 @@ struct SensorData {
     float predictorSeedClampedAngularRateRadPerSec = 0.0f;
     float predictorSeedConfidenceFlags = 0.0f;
     uint8_t mainQuaternionSource = static_cast<uint8_t>(MainQuaternionSource::None);
+    uint32_t bnoQuaternionSampleMicros = 0;
     bool icmSampleFresh = false;
     bool lsmSampleFresh = false;
+    bool pulseSampleFresh = false;
     bool baroSampleFresh = false;
+    bool bnoQuaternionFresh = false;
     bool hasBnoQuaternion = false;
     bool hasQuaternion = false;
     bool hasIcmQuaternion = false;
@@ -89,6 +96,16 @@ struct FilteredState {
     float predictorSeedConfidenceFlags = 0.0f;
     float padReferenceDriftMps = 0.0f;
     float padReferenceSettled = 0.0f;
+    float baroVerticalVelocityMps = NAN;
+    float baroVerticalVelocitySigmaMps = NAN;
+    float baroVerticalVelocityResidualMps = NAN;
+    float zAccelSigmaScale = 1.0f;
+    float baroVerticalVelocityUpdateUsed = 0.0f;
+    float baroVerticalVelocityGuardActive = 0.0f;
+    float zAccelUpdateUsed = 0.0f;
+    float bnoReferenceCorrectionApplied = 0.0f;
+    float bnoReferenceTiltErrorDeg = NAN;
+    float bnoQuaternionAgeMs = NAN;
 };
 
 /// High-level flight phases used for event detection and control gating.
@@ -170,6 +187,11 @@ class FlightComputer {
                                  double flapCommandDeg,
                                  double flapEffectiveDeg,
                                  bool actuationIsSettling);
+    void ResetBaroVelocityGuardState();
+    void RecordBaroAltitudeSample(double timeSeconds, double relativeAltitudeMeters);
+    bool ComputeBaroVelocityEstimate(double altitudeSigmaScale,
+                                     double *velocityMpsOut,
+                                     double *sigmaMpsOut) const;
     KalmanFilterAccel kalmanX_;
     KalmanFilterAccel kalmanY_;
     KalmanFilterAccelAlt kalmanZ_;
@@ -184,6 +206,7 @@ class FlightComputer {
     bool altitudeReferenceInitialized_ = false;
     double altitudeReferenceMeters_ = 0.0;
     double lastGroundRelativeAltitudeMeters_ = 0.0;
+    double lastGroundRelativeAltitudeTimestamp_ = 0.0;
     double groundRelativeVelocityMps_ = 0.0;
     double zenithRadians_ = 0.0;
     double lastZenith_ = 0.0;
@@ -199,6 +222,7 @@ class FlightComputer {
     double burnoutTimestamp_ = 0.0;
     double apogeeTimestamp_ = 0.0;
     uint8_t liftoffCandidateCount_ = 0;
+    uint8_t baroLiftoffCandidateCount_ = 0;
     uint8_t burnoutCandidateCount_ = 0;
 
     double processNoiseXY_ = 0.5;
@@ -220,6 +244,14 @@ class FlightComputer {
     double groundReferenceDriftRateMps_ = 0.0;
     double groundReferenceStableSince_ = 0.0;
     bool groundReferenceSettled_ = false;
+    uint8_t bnoFreshPostBurnoutQuaternionCount_ = 0;
+    uint32_t lastBnoReferenceCorrectionSampleMicros_ = 0;
+    static constexpr std::size_t kBaroVelocityHistoryCapacity = 256;
+    std::array<double, kBaroVelocityHistoryCapacity> baroVelocityHistoryTimeSeconds_{};
+    std::array<double, kBaroVelocityHistoryCapacity> baroVelocityHistoryAltitudeMeters_{};
+    std::size_t baroVelocityHistoryCount_ = 0;
+    std::size_t baroVelocityHistoryNextIndex_ = 0;
+    uint8_t baroVzGuardPersistenceCount_ = 0;
 
 };
 

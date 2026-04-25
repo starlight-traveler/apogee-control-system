@@ -5,6 +5,7 @@
 #include <stdlib.h>
 
 #include <algorithm>
+#include <cmath>
 #include <vector>
 
 #include "data_logger.h"
@@ -151,6 +152,20 @@ bool CfdTableLoadFromSd(const char *path, CfdTableStorage *storage) {
         return false;
     }
 
+    int invalidCells = fill.missing;
+    for (int index = 0; index < total; ++index) {
+        if (!std::isfinite(tableStorage.axial[index]) ||
+            !std::isfinite(tableStorage.normal[index])) {
+            ++invalidCells;
+        }
+    }
+    if (invalidCells > 0) {
+        LOG_PRINT("CFD table missing/invalid entries: ");
+        LOG_PRINTLN(invalidCells);
+        storage->loaded = false;
+        return false;
+    }
+
     storage->table.acsAnglesDeg = tableStorage.acs.data();
     storage->table.atkAnglesDeg = tableStorage.atk.data();
     storage->table.machNumbers = tableStorage.mach.data();
@@ -168,10 +183,6 @@ bool CfdTableLoadFromSd(const char *path, CfdTableStorage *storage) {
     LOG_PRINT(" x ");
     LOG_PRINT(machCount);
     LOG_PRINTLN(".");
-    if (fill.missing > 0) {
-        LOG_PRINT("CFD table missing entries: ");
-        LOG_PRINTLN(fill.missing);
-    }
 
     return true;
 }

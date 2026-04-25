@@ -15,11 +15,12 @@ namespace {
 
 constexpr uint32_t kSampleIntervalUs = settings::sensors::bno055::kSampleIntervalUs;
 constexpr uint8_t kBnoI2cAddress = settings::sensors::bno055::kI2cAddress;
+constexpr uint32_t kBnoI2cClockHz = settings::sensors::bno055::kI2cClockHz;
 constexpr int8_t kBnoResetPin = settings::sensors::bno055::kResetPin;
 constexpr uint32_t kDataTimeoutUs = settings::sensors::bno055::kDataTimeoutUs;
 constexpr uint8_t kQuaternionInvalidDropThreshold = 2;
 
-Adafruit_BNO055 g_bno(55, kBnoI2cAddress, &Wire1);
+Adafruit_BNO055 g_bno(55, kBnoI2cAddress, &Wire);
 bool g_initialized = false;
 uint32_t g_lastSampleUs = 0;
 uint32_t g_lastHealthyEventUs = 0;
@@ -48,7 +49,8 @@ bool StartSensorTransport() {
         LOG_PRINTLN("BNO055 only supports I2C in this firmware build");
         return false;
     }
-    Wire1.begin();
+    Wire.begin();
+    Wire.setClock(kBnoI2cClockHz);
     if (!g_bno.begin()) {
         return false;
     }
@@ -56,7 +58,7 @@ bool StartSensorTransport() {
         pinMode(kBnoResetPin, OUTPUT);
         digitalWrite(kBnoResetPin, HIGH);
     }
-    g_bno.setExtCrystalUse(false);
+    g_bno.setExtCrystalUse(true);
     delay(10);
     return true;
 }

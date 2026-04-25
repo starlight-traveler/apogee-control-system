@@ -31,9 +31,16 @@ so the embedded logic stays aligned.
 
 ## Offline tools
 
-- `tools/decode_sensor_log.py` decodes the binary log produced by
-  `src/data_logger.*` into CSV + JSON events.
-- Subscale datasets live under `data/subscale_*` for repeatable tests.
+- `tools/replay/scripts/decode_log.py` decodes the binary log
+  produced by `src/data_logger.*` into CSV + JSON events.
+- `tools/replay/scripts/plot_flight.py` and
+  `tools/replay/scripts/compare_predictors.py` are the stable replay-analysis
+  entry points. Flight-specific experiments are archived under
+  `tools/replay/experiments/`.
+- `tools/decode/native/fast_decode_sensor_log.cpp` is the native fast
+  decoder built through the top-level tools CMake workspace.
+- Local datasets and generated replay artifacts should stay out of git unless
+  they are intentionally curated documentation fixtures.
 
 ## Hosted replay tool
 

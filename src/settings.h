@@ -54,9 +54,9 @@ constexpr uint32_t kDataLoggerPreallocateBytes = DATA_LOGGER_PREALLOCATE_BYTES;
 // ---------------------------------------------------------------------------
 namespace hardware {
 constexpr uint8_t kStatusLedPin = -1;
-constexpr uint8_t kBuzzerPin = 8;
-constexpr uint8_t kTopServoPin = 9;
-constexpr uint8_t kBottomServoPin = 10;
+constexpr uint8_t kBuzzerPin = 9;
+constexpr uint8_t kTopServoPin = 17;
+constexpr uint8_t kBottomServoPin = 16;
 constexpr int kServoExtendAngle = 60;
 constexpr int kServoRetractAngle = 0;
 }
@@ -69,8 +69,8 @@ namespace network {
 constexpr bool kEnableTelemetry = true;
 // `true` = Teensy hosts AP; `false` = Teensy joins existing WiFi as station.
 constexpr bool kUseAccessPointMode = true;
-constexpr const char *kSsid = "Hi_Madelyn";
-constexpr const char *kPassword = "11112222";
+constexpr const char *kSsid = "NDRT Apogee Control System";
+constexpr const char *kPassword = "Hi_Madelyn";
 // WiFiNINA `setPins()` arguments for the AirLift coprocessor.
 constexpr int8_t kAirliftSsPin = 34;
 constexpr int8_t kAirliftAckPin = 31;
@@ -100,7 +100,7 @@ namespace actuation {
 constexpr float kServoMaxActuationDeg = 45.0f;
 constexpr int kServoAttachMinPulseUs = 400;
 constexpr int kServoAttachMaxPulseUs = 2700;
-constexpr int kTopServoClosedPwmUs = 1125;
+constexpr int kTopServoClosedPwmUs = 1126;
 constexpr int kTopServoOpenPwmUs = 1737;
 constexpr int kBottomServoClosedPwmUs = 2169;
 constexpr int kBottomServoOpenPwmUs = 1578;
@@ -144,7 +144,7 @@ constexpr float kCoastHardDisableVelocityMps = 25.0f;
 constexpr float kPostBurnoutHoldoffSeconds = 1.0f;
 // Clamp the very first permitted automatic flap command to a conservative
 // angle, then ramp available authority up from there over a short window.
-constexpr float kFirstMotionRampStartMaxAngleDeg = 8.0f;
+constexpr float kFirstMotionRampStartMaxAngleDeg = 5.0f;
 constexpr float kFirstMotionRampDurationSeconds = 1.0f;
 // Require baro AGL and estimator altitude to agree this closely before the
 // first automatic flap motion is allowed.
@@ -152,6 +152,11 @@ constexpr float kFirstFlapBaroStateAgreementMeters = 25.0f;
 // Disable automatic coast control if estimator altitude diverges too far from
 // baro AGL after the initial release gate.
 constexpr float kCoastBaroStateAgreementMeters = 50.0f;
+// Seed the actuation predictor altitude from fresh baro AGL during coast when
+// baro/state agreement is within the coast safety gate. The estimator state is
+// left unchanged; this only prevents a deweighted/lagging state altitude from
+// biasing apogee prediction low.
+constexpr bool kUseBaroAglForCoastPredictorAltitude = true;
 // Disable automatic coast control if the estimator reports implausible upward
 // acceleration after burnout.
 constexpr float kCoastMaxUpwardAccelerationMps2 = 20.0f;
@@ -226,13 +231,13 @@ constexpr size_t kCsvLineBufferSize = 2048;
 // ---------------------------------------------------------------------------
 namespace environment {
 // Ground temperature used as altitude=0 reference in Fahrenheit.
-constexpr float kGroundTemperatureF = 53.0f;
+constexpr float kGroundTemperatureF = 74;
 // Measured surface wind speed in miles per hour.
-constexpr float kWindSpeedMph = 8.0f;
+constexpr float kWindSpeedMph = 7.0f;
 // Meteorological wind direction in degrees.
-constexpr float kWindDirectionDeg = 111.0f;
+constexpr float kWindDirectionDeg = 190.0f;
 // Launch rail azimuth direction in degrees.
-constexpr float kLaunchDirectionDeg = 111.0f;
+constexpr float kLaunchDirectionDeg = 190.0f;
 // Terrain roughness length (meters) for log wind profile.
 constexpr float kRoughnessLengthMeters = 0.075f;
 // Height where gradient wind is modeled (meters).
@@ -249,11 +254,11 @@ namespace vehicle {
 // Aerodynamic moment arm CP-CG during coast/burnout [m].
 // CP from tip: 1.7537 m, CG from tip: 1.31 m.
 
-constexpr double kCenterOfPressureOffsetMeters = 0.22;
+constexpr double kCenterOfPressureOffsetMeters = 0.4437;
 // Longitudinal moment of inertia during coast [kg*m^2].
-constexpr double kMomentOfInertiaKgM2 = 0.529;
+constexpr double kMomentOfInertiaKgM2 = 8.28;
 // Rocket dry mass / burnout mass [kg].
-constexpr double kDryMassKg = 3.33;
+constexpr double kDryMassKg = 18.24;
 }
 
 // ---------------------------------------------------------------------------
@@ -304,6 +309,20 @@ constexpr double kCoastAccelSigmaScale = 1.0;
 constexpr double kCoastAltSigmaScale = 1.0;
 constexpr double kCoastProcessNoiseXYScale = 1.0;
 constexpr double kCoastProcessNoiseZScale = 1.0;
+// Coast-only baro-vz sanity correction. Use a weak velocity pseudo-
+// measurement from a short rolling baro slope window, and only escalate
+// into guard mode after sustained disagreement with the Kalman velocity.
+constexpr double kBaroVzGuardStartDelaySeconds = 0.20;
+constexpr double kBaroVzWindowSeconds = 0.35;
+constexpr double kBaroVzMinWindowSpanSeconds = 0.18;
+constexpr uint8_t kBaroVzMinWindowSamples = 4;
+constexpr uint8_t kBaroVzGuardPersistenceSamples = 4;
+constexpr double kBaroVzSigmaFloorMps = 4.0;
+constexpr double kBaroVzSigmaCeilMps = 18.0;
+constexpr double kBaroVzResidualGuardFloorMps = 8.0;
+constexpr double kBaroVzResidualGuardSigmaMultiplier = 3.0;
+constexpr double kBaroVzInnovationGateSigma = 4.0;
+constexpr double kBaroVzGuardAccelSigmaScale = 3.0;
 // Descent is lower dynamic pressure but still less benign than the pad.
 constexpr double kDescentAccelSigmaScale = 1.2;
 constexpr double kDescentAltSigmaScale = 1.0;
@@ -324,7 +343,7 @@ constexpr double kGroundAltitudeReferenceTauSeconds = 30.0;
 constexpr double kPadReferenceDriftTauSeconds = 8.0;
 constexpr double kPadReadyMaxDriftMps = 0.0035;
 constexpr double kPadReadyHoldSeconds = 15.0;
-constexpr double kApogeeTargetMeters = 822.96;
+constexpr double kApogeeTargetMeters = 1569;
 // Predictor-only horizontal speed seed tuning. These values intentionally keep
 // XY speed conservative because the estimator does not have a horizontal
 // position/velocity measurement update.
@@ -372,18 +391,20 @@ constexpr Transport kTransport = Transport::I2c;
 namespace bno055 {
 // BNO055 I2C address.
 constexpr uint8_t kI2cAddress = 0x28;
+// Fast-mode I2C clock for the BNO055 rail.
+constexpr uint32_t kI2cClockHz = 400000UL;
 // Optional BNO055 reset pin. Set to -1 if reset is not wired.
 constexpr int8_t kResetPin = -1;
 // Poll interval for consuming queued sensor events.
 constexpr uint32_t kSampleIntervalUs = 10000;
 // If no complete sample arrives for this long, force a full reinit.
-constexpr uint32_t kDataTimeoutUs = 250000;
+constexpr uint32_t kDataTimeoutUs = 750000;
 inline constexpr const float (&kMountRotation)[3][3] = imu_orientation::kBnoMountRotation;
 }
 
 namespace wt901 {
 // Enable the WT901 comparison rail on Serial5.
-constexpr bool kEnabled = true;
+constexpr bool kEnabled = false;
 // Teensy HardwareSerial instance index: 1 -> Serial1, 2 -> Serial2, etc.
 constexpr uint8_t kSerialPortIndex = 5;
 // Optional explicit RX/TX remap pins for Teensy serial ports. Leave -1 to use
@@ -440,20 +461,29 @@ constexpr uint32_t kDataTimeoutUs = 250000;
 }
 
 namespace ellipse20 {
-// Enable the SBG Pulse 20 sidecar rail. Disabled by default until a serial
-// port and pins are assigned on the target build.
-constexpr bool kEnabled = false;
+// Enable the SBG Pulse 20 sidecar rail.
+constexpr bool kEnabled = true;
 // Teensy HardwareSerial instance index: 1 -> Serial1, 2 -> Serial2, etc.
-constexpr uint8_t kSerialPortIndex = 2;
+constexpr uint8_t kSerialPortIndex = 7;
 // Optional explicit RX/TX remap pins for Teensy serial ports. Leave -1 to use
 // the port defaults.
 constexpr int8_t kRxPin = -1;
 constexpr int8_t kTxPin = -1;
-// Pulse 20 example configuration uses 921600 baud.
-constexpr uint32_t kBaudRate = 921600;
-// Drain up to this many SBG frames per acquire call to keep the rail current
-// without letting the serial sidecar monopolize the hot loop.
-constexpr uint8_t kHandleBudgetPerAcquire = 8;
+// Preferred operating baud for the Ellipse rail. Keep this at 115200 to match
+// the established fielded setup.
+constexpr uint32_t kBaudRate = 115200;
+// One-time fallback used to recover units that were temporarily promoted to
+// 921600 back onto the standard 115200 runtime baud.
+constexpr uint32_t kFallbackBaudRate = 921600;
+// Pulse 20 COM_A is wired through an RS-422 transceiver.
+constexpr uint8_t kPortMode = 2;
+// Extra UART RX storage for the Pulse serial link. This buffers bytes, not
+// decoded samples, so the newest valid Pulse frame can still win while short
+// CPU stalls don't immediately overflow the tiny default UART buffer.
+constexpr uint16_t kRxExtraBufferBytes = 2048;
+// CPU-time budget to spend draining Pulse logs on each service pass. The main
+// loop services Pulse twice, so this should stay small to preserve latency.
+constexpr uint16_t kServiceBudgetUs = 300;
 // Consider cached Pulse data stale after this long without a fresh frame.
 constexpr uint32_t kSampleMaxAgeUs = 100000;
 // One-shot output configuration sent during startup. Pulse 20 is treated as a
@@ -514,7 +544,7 @@ constexpr float kMagAinv[3][3] = {
 
 namespace bmp585 {
 // Pressure reference used by barometric altitude conversion.
-constexpr float kSeaLevelPressureHpa = 1030.9f;
+constexpr float kSeaLevelPressureHpa = 1012.87f;
 // Reject altitude jumps that imply faster vertical motion than this rate.
 constexpr float kMaxAltitudeRateFeetPerSecond = 2500.0f;
 // Minimum single-sample jump (feet) required before classifying as a spike.
@@ -527,7 +557,7 @@ namespace ms5611 {
 // SPI chip-select pin for the MS5611 breakout.
 constexpr uint8_t kChipSelectPin = 36;
 // Pressure reference used by barometric altitude conversion.
-constexpr float kSeaLevelPressureHpa = 1030.9f;
+constexpr float kSeaLevelPressureHpa = 1012.87f;
 // Minimum spacing between blocking reads.
 constexpr uint32_t kMinReadSpacingUs = 1000;
 // Absolute altitude magnitude limit for invalid sample rejection.
@@ -574,10 +604,8 @@ constexpr uint8_t kFifoMaxBurstSamplesPerAcquire = 4;
 // Optional library-side hard-iron offset load for sanity checks.
 // Keep false for the normal path; the firmware calibration model remains primary.
 constexpr bool kUseLibraryMagOffsets = false;
-// Sensor-to-body mapping:
-// body +X = sensor +Z
-// body +Y = sensor -Y
-// body +Z = sensor +X
+// Raw axis transform before the mount rotation. The current LSM setup keeps
+// the rail-aligned calibrated sensor frame unchanged here.
 inline constexpr const uint8_t (&kAxisMap)[3] = imu_orientation::kLsm9ds1AxisMap;
 inline constexpr const int8_t (&kAxisSign)[3] = imu_orientation::kLsm9ds1AxisSign;
 constexpr float kMagDeclinationDeg = -14.84f;
@@ -611,7 +639,7 @@ constexpr float kAccelCorrectionMaxRateRadPerSec = 6.0f;
 constexpr float kMagCorrectionMaxRateRadPerSec = 2.5f;
 constexpr float kTotalCorrectionMaxRateRadPerSec = 7.0f;
 
-constexpr float kGyroOffset[3] = {69.15f, 174.46f, -145.84f};
+constexpr float kGyroOffset[3] = {426.79f, 431.71f, -124.32f};
 // Gyro scale/misalignment correction matrix in the rail-aligned sensor frame.
 // The current bench workflow fits bias and temperature drift; leave this as
 // identity until a rate-table style capture is available.
@@ -620,16 +648,16 @@ constexpr float kGyroAinv[3][3] = {
   {0.0f, 1.0f, 0.0f},
   {0.0f, 0.0f, 1.0f},
 };
-constexpr float kAccelBias[3] = {-121.00f, -104.50f, -142.00f};
+constexpr float kAccelBias[3] = {-195.00f, -310.00f, 77.50f};
 constexpr float kAccelAinv[3][3] = {
-  {1.00626f, -0.00332f, 0.00705f},
-  {-0.00332f, 1.00802f, -0.02086f},
-  {0.00705f, -0.02086f, 1.00402f},
+  {1.00520f, 0.07398f, 0.01041f},
+  {0.07398f, 1.01547f, -0.00674f},
+  {0.01041f, -0.00674f, 0.99307f},
 };
-// Sensor-to-body mapping:
-// body +X = sensor +Z
-// body +Y = sensor -Y
-// body +Z = sensor +X
+// Fixed rotation from calibrated sensor axes into the rocket body frame:
+// body +X = sensor +X
+// body +Y = sensor +Y
+// body +Z = sensor +Z
 inline constexpr const float (&kMountRotation)[3][3] = imu_orientation::kLsm9ds1MountRotation;
 
 constexpr float kMagBias[3] = {-3751.00f, 5702.00f, -6056.00f};
@@ -760,9 +788,9 @@ constexpr float kAccelAinv[3][3] = {
   {0.01883f, 0.04047f, 0.99574f},
 };
 // Fixed rotation from calibrated sensor axes into the rocket body frame:
-// body +X = sensor +Z
+// body +X = sensor -X
 // body +Y = sensor -Y
-// body +Z = sensor -X
+// body +Z = sensor +Z
 inline constexpr const float (&kMountRotation)[3][3] = imu_orientation::kIcm20948MountRotation;
 // Keep the ICM magnetometer in the same calibrated sensor frame as the
 // accel/gyro before applying the common mount rotation. The SparkFun reference
@@ -827,12 +855,15 @@ constexpr float kBnoCoastBlendFactor = 0.1f;
 // more meaningful influence over the final tilt quaternion instead of treating
 // it as a near-zero trim source.
 constexpr float kBnoReferenceCorrectionBlendFactor = 0.20f;
-// Aggressive BNO correction during coast - weight BNO much more heavily to
-// quickly correct any gyro drift accumulated during burn.
-constexpr float kBnoCoastCorrectionBlendFactor = 0.66f;
+// Coast correction should stay a guarded trim, not an authority handoff.
+constexpr float kBnoCoastCorrectionBlendFactor = 0.25f;
 // Ramp into the stronger coast correction instead of stepping it in one
 // sample at burnout, which can create a visible zenith/apogee jump.
 constexpr float kBnoCoastCorrectionRampSeconds = 0.5f;
+// Only use fresh post-burnout BNO quaternions as a coast reference.
+constexpr float kBnoCoastCorrectionMaxSampleAgeMs = 40.0f;
+constexpr uint8_t kBnoCoastCorrectionMinFreshSamples = 3;
+constexpr float kBnoCoastCorrectionMaxTiltAgreementDeg = 8.0f;
 
 // Burnout correction burst: aggressive accel correction window after burnout
 // to quickly correct gyro drift accumulated during burn phase.
@@ -893,6 +924,16 @@ constexpr float kMachDragAdaptTauTransitionEnd = 1.5f;   // Fully conservative b
 // Prediction uncertainty bounds: perturbation factors for confidence interval.
 constexpr float kUncertaintyDragPerturbFraction = 0.12f;  // +/- 12% drag variation
 constexpr float kUncertaintyWindPerturbMps = 3.0f;        // +/- 3 m/s wind variation
+
+// If the predictor runs above the CFD AoA table, the clamped edge can be too
+// drag-heavy during early coast. Fade toward a low-drag bound for telemetry,
+// while still marking the prediction uncertain so actuation will not trust it.
+constexpr bool kEnableHighAoAFallback = true;
+constexpr float kHighAoAFallbackEntryBlend = 0.55f;
+constexpr float kHighAoAFallbackPeakBlend = 0.68f;
+constexpr float kHighAoAFallbackPeakTimeSeconds = 2.0f;
+constexpr float kHighAoAFallbackExitBlend = 0.08f;
+constexpr float kHighAoAFallbackExitTimeSeconds = 4.9f;
 
 // CFD table reference density. The force table stores absolute forces, so the
 // runtime atmosphere scales those forces relative to the density used when the

@@ -326,6 +326,22 @@ class KalmanFilterAccelAlt {
             kMaxAltitudeResidual);
     }
 
+    bool UpdateVelocityOnly(double velocityMeasurement,
+                            double velocitySigma,
+                            double velocityGateSigma = 3.5) {
+        if (!std::isfinite(velocitySigma) || velocitySigma <= 0.0) {
+            return false;
+        }
+        constexpr double kMaxVelocityResidual = 250.0;
+        const double measurementModel[kStateDim] = {0.0, 1.0, 0.0, 0.0};
+        return ApplyScalarMeasurement(
+            measurementModel,
+            velocityMeasurement,
+            velocitySigma * velocitySigma,
+            velocityGateSigma,
+            kMaxVelocityResidual);
+    }
+
     bool UpdateAccelAndAltitude(double accelMeasurement,
                                 double altitudeMeasurement,
                                 double altitudeSigmaScale = 1.0,

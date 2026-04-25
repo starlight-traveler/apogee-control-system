@@ -1,9 +1,7 @@
 #include "runtime_settings.h"
 
 #include <math.h>
-#include <stdlib.h>
 #include <stdio.h>
-#include <string.h>
 
 #include "data_logger.h"
 #include "settings.h"
@@ -11,91 +9,6 @@
 namespace {
 
 constexpr const char *kRuntimeSettingsPath = "ACSCFG.TXT";
-
-struct ParseContext {
-    RuntimeSettings settings = RuntimeSettingsDefaults();
-    bool sawAnySetting = false;
-    bool parseError = false;
-};
-
-bool ParseDoubleValue(const char *text, double &outValue) {
-    if (text == nullptr || *text == '\0') {
-        return false;
-    }
-    char *end = nullptr;
-    const double value = strtod(text, &end);
-    if (end == text || !isfinite(value)) {
-        return false;
-    }
-    outValue = value;
-    return true;
-}
-
-bool ParseLine(const char *line, void *context) {
-    if (line == nullptr || context == nullptr) {
-        return false;
-    }
-
-    ParseContext *parse = static_cast<ParseContext *>(context);
-    while (*line == ' ' || *line == '\t') {
-        ++line;
-    }
-    if (*line == '\0' || *line == '#') {
-        return true;
-    }
-
-    const char *separator = strchr(line, '=');
-    if (separator == nullptr) {
-        parse->parseError = true;
-        return false;
-    }
-
-    char key[64];
-    const size_t keyLength = static_cast<size_t>(separator - line);
-    if (keyLength == 0 || keyLength >= sizeof(key)) {
-        parse->parseError = true;
-        return false;
-    }
-    memcpy(key, line, keyLength);
-    key[keyLength] = '\0';
-
-    const char *valueText = separator + 1;
-    double value = 0.0;
-    if (!ParseDoubleValue(valueText, value)) {
-        parse->parseError = true;
-        return false;
-    }
-
-    parse->sawAnySetting = true;
-    if (strcmp(key, "environment.ground_temperature_f") == 0) {
-        parse->settings.environment.groundTemperatureF = static_cast<float>(value);
-    } else if (strcmp(key, "environment.sea_level_pressure_hpa") == 0) {
-        parse->settings.environment.seaLevelPressureHpa = static_cast<float>(value);
-    } else if (strcmp(key, "environment.wind_speed_mph") == 0) {
-        parse->settings.environment.windSpeedMph = static_cast<float>(value);
-    } else if (strcmp(key, "environment.wind_direction_deg") == 0) {
-        parse->settings.environment.windDirectionDeg = static_cast<float>(value);
-    } else if (strcmp(key, "environment.launch_direction_deg") == 0) {
-        parse->settings.environment.launchDirectionDeg = static_cast<float>(value);
-    } else if (strcmp(key, "environment.roughness_length_m") == 0) {
-        parse->settings.environment.roughnessLengthMeters = static_cast<float>(value);
-    } else if (strcmp(key, "environment.gradient_height_m") == 0) {
-        parse->settings.environment.gradientHeightMeters = static_cast<float>(value);
-    } else if (strcmp(key, "environment.measurement_height_m") == 0) {
-        parse->settings.environment.measurementHeightMeters = static_cast<float>(value);
-    } else if (strcmp(key, "vehicle.center_of_pressure_offset_m") == 0) {
-        parse->settings.vehicle.centerOfPressureOffsetMeters = value;
-    } else if (strcmp(key, "vehicle.moment_of_inertia_kg_m2") == 0) {
-        parse->settings.vehicle.momentOfInertia = value;
-    } else if (strcmp(key, "vehicle.dry_mass_kg") == 0) {
-        parse->settings.vehicle.dryMass = value;
-    } else {
-        parse->parseError = true;
-        return false;
-    }
-
-    return true;
-}
 
 bool PositiveFinite(double value) {
     return isfinite(value) && value > 0.0;
@@ -175,41 +88,27 @@ bool RuntimeSettingsValidate(const RuntimeSettings &settings) {
            PositiveFinite(vehicle.dryMass);
 }
 
-bool RuntimeSettingsLoadOrCreate(RuntimeSettings &settings, RuntimeSettingsStorageStatus &status) {
+bool RuntimeSettingsUseFlashedDefaults(RuntimeSettings &settings, RuntimeSettingsStorageStatus &status) {
     status = RuntimeSettingsStorageStatus{};
     settings = RuntimeSettingsDefaults();
+    status.usingDefaults = true;
 
     if (!DataLoggerIsInitialized()) {
-        status.usingDefaults = true;
         return false;
     }
 
     status.storageAvailable = true;
     const bool filePresent = RuntimeSettingsFilePresent();
     status.filePresent = filePresent;
-    if (!filePresent) {
-        status.usingDefaults = true;
-        char buffer[640];
-        if (!BuildFileContents(settings, buffer, sizeof(buffer))) {
-            return false;
-        }
-        status.createdDefaultFile = DataLoggerWriteTextFile(kRuntimeSettingsPath, buffer);
-        status.filePresent = status.createdDefaultFile;
-        status.lastSaveSucceeded = status.createdDefaultFile;
+    char buffer[640];
+    if (!BuildFileContents(settings, buffer, sizeof(buffer))) {
         return false;
     }
 
-    ParseContext parse{};
-    const bool readOk = DataLoggerReadTextFile(kRuntimeSettingsPath, &ParseLine, &parse);
-    if (readOk && !parse.parseError && parse.sawAnySetting && RuntimeSettingsValidate(parse.settings)) {
-        settings = parse.settings;
-        status.usingDefaults = false;
-        status.lastLoadSucceeded = true;
-        return true;
-    }
-
-    status.usingDefaults = true;
-    return false;
+    status.lastSaveSucceeded = DataLoggerWriteTextFile(kRuntimeSettingsPath, buffer);
+    status.createdDefaultFile = !filePresent && status.lastSaveSucceeded;
+    status.filePresent = filePresent || status.lastSaveSucceeded;
+    return status.lastSaveSucceeded;
 }
 
 bool RuntimeSettingsSave(const RuntimeSettings &settings, RuntimeSettingsStorageStatus &status) {

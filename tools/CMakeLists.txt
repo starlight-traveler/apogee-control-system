@@ -43,9 +43,11 @@ if(TARGET acs_replay)
   )
 endif()
 
-add_custom_target(
-  run_gui
-  COMMAND ${CMAKE_COMMAND} -E env PYTHONUNBUFFERED=1 python3 ${CMAKE_CURRENT_SOURCE_DIR}/gui_dashboard.py --https --host localhost --port 8765
-  WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-  COMMENT "Run ACS NDRT Rocketry GUI dashboard on https://localhost:8765"
-)
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/gui_dashboard.py)
+  add_custom_target(
+    run_gui
+    COMMAND ${CMAKE_COMMAND} -E env PYTHONUNBUFFERED=1 python3 ${CMAKE_CURRENT_SOURCE_DIR}/gui_dashboard.py --https --host localhost --port 8765
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    COMMENT "Run ACS NDRT Rocketry GUI dashboard on https://localhost:8765"
+  )
+endif()

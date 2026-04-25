@@ -6,6 +6,7 @@ extern "C" {
 #include <sbgCommon.h>
 #include <sbgECom.h>
 #include <sbgEComLib.h>
+#include <commands/sbgEComCmdSettings.h>
 }
 
 #include "calibration_matrix.h"
@@ -20,7 +21,10 @@ namespace {
 constexpr uint8_t kSerialPortIndex = settings::sensors::ellipse20::kSerialPortIndex;
 constexpr int8_t kRxPin = settings::sensors::ellipse20::kRxPin;
 constexpr int8_t kTxPin = settings::sensors::ellipse20::kTxPin;
-constexpr uint32_t kPulseBaudRate = settings::sensors::ellipse20::kBaudRate;
+constexpr uint32_t kPulseBaudRate = 921600;
+constexpr uint32_t kPulseFallbackBaudRate = settings::sensors::ellipse20::kFallbackBaudRate;
+constexpr SbgEComPortMode kPulsePortMode =
+    static_cast<SbgEComPortMode>(settings::sensors::ellipse20::kPortMode);
 constexpr SbgEComOutputMode kImuOutputMode =
     static_cast<SbgEComOutputMode>(settings::sensors::ellipse20::kImuOutputMode);
 constexpr SbgEComOutputMode kMagOutputMode =
@@ -33,6 +37,11 @@ constexpr size_t kMaxGyroTemperaturePoints = 8;
 constexpr uint16_t kMaxMagSamples = 2048;
 constexpr float kGToMps2 = 9.80665f;
 constexpr float kRadToDeg = 57.295779513082320876f;
+constexpr uint32_t kCmdTimeoutMs = 300;
+constexpr uint32_t kNoSampleDiagIntervalMs = 1000;
+constexpr uint32_t kInitRetryIntervalMs = 1000;
+constexpr uint8_t kCmdTrials = 3;
+constexpr uint32_t kPostMigrationRebootDelayMs = 1000;
 
 struct SerialInterfaceContext {
     HardwareSerial *serial = nullptr;
@@ -43,13 +52,28 @@ SerialInterfaceContext g_serialContext;
 SbgInterface g_interface;
 SbgEComHandle g_comHandle;
 bool g_deviceInitialized = false;
+bool g_comHandleInitialized = false;
 
 bool g_streamEnabled = true;
 uint32_t g_lastStreamMs = 0;
+uint32_t g_lastNoSampleDiagMs = 0;
+uint32_t g_lastInitAttemptMs = 0;
+uint32_t g_initAttemptCount = 0;
+bool g_helpPrinted = false;
 bool g_haveImu = false;
 bool g_haveMag = false;
 uint32_t g_lastImuHostMicros = 0;
 uint32_t g_lastMagHostMicros = 0;
+uint32_t g_serialBytesWritten = 0;
+uint32_t g_serialBytesRead = 0;
+uint32_t g_serialWriteCalls = 0;
+uint32_t g_serialReadCalls = 0;
+uint32_t g_lastSerialReadMicros = 0;
+uint32_t g_lastSerialWriteMicros = 0;
+SbgErrorCode g_lastProtocolError = SBG_NO_ERROR;
+uint32_t g_lastProtocolErrorMs = 0;
+SbgEComDeviceInfo g_deviceInfo = {};
+bool g_haveDeviceInfo = false;
 
 float g_lastAccel[3] = {0.0f, 0.0f, 0.0f};
 float g_lastGyro[3] = {0.0f, 0.0f, 0.0f};
@@ -225,6 +249,9 @@ SbgErrorCode SerialWrite(SbgInterface *pInterface, const void *pBuffer, size_t b
         return SBG_NO_ERROR;
     }
     const size_t written = g_serialContext.serial->write(static_cast<const uint8_t *>(pBuffer), bytesToWrite);
+    ++g_serialWriteCalls;
+    g_serialBytesWritten += static_cast<uint32_t>(written);
+    g_lastSerialWriteMicros = micros();
     return written == bytesToWrite ? SBG_NO_ERROR : SBG_WRITE_ERROR;
 }
 
@@ -245,6 +272,11 @@ SbgErrorCode SerialRead(SbgInterface *pInterface, void *pBuffer, size_t *pReadBy
         }
         dst[*pReadBytes] = static_cast<uint8_t>(value);
         ++(*pReadBytes);
+    }
+    ++g_serialReadCalls;
+    g_serialBytesRead += static_cast<uint32_t>(*pReadBytes);
+    if (*pReadBytes > 0u) {
+        g_lastSerialReadMicros = micros();
     }
     return SBG_NO_ERROR;
 }
@@ -282,14 +314,14 @@ uint32_t SerialGetDelay(const SbgInterface *pInterface, size_t numBytes) {
     return static_cast<uint32_t>((numBytes * 10000000ull) / g_serialContext.baudRate);
 }
 
-bool SetupInterface() {
+bool SetupInterface(uint32_t baudRate) {
     g_serialContext.serial = ResolveSerialPort(kSerialPortIndex);
     if (g_serialContext.serial == nullptr) {
         Serial.println("Pulse20: invalid serial port index");
         return false;
     }
 
-    ConfigureSerial(kPulseBaudRate);
+    ConfigureSerial(baudRate);
     FlushInput();
 
     sbgInterfaceZeroInit(&g_interface);
@@ -303,6 +335,81 @@ bool SetupInterface() {
     g_interface.pGetSpeedFunc = &SerialGetSpeed;
     g_interface.pDelayFunc = &SerialGetDelay;
     sbgInterfaceNameSet(&g_interface, "Pulse20Cal");
+    return true;
+}
+
+void RecordProtocolError(SbgErrorCode errorCode) {
+    if (errorCode == SBG_NO_ERROR || errorCode == SBG_NOT_READY) {
+        return;
+    }
+    g_lastProtocolError = errorCode;
+    g_lastProtocolErrorMs = millis();
+}
+
+void PrintErrorLine(const char *label, SbgErrorCode errorCode) {
+    Serial.print(label);
+    Serial.print(": ");
+    Serial.print(sbgErrorCodeToString(errorCode));
+    Serial.print(" (");
+    Serial.print(static_cast<int>(errorCode));
+    Serial.println(")");
+}
+
+void PrintLinkStats() {
+    Serial.print("link txB=");
+    Serial.print(g_serialBytesWritten);
+    Serial.print(" rxB=");
+    Serial.print(g_serialBytesRead);
+    Serial.print(" txCalls=");
+    Serial.print(g_serialWriteCalls);
+    Serial.print(" readCalls=");
+    Serial.print(g_serialReadCalls);
+    Serial.print(" lastRxMs=");
+    if (g_lastSerialReadMicros != 0u) {
+        Serial.print(static_cast<float>(micros() - g_lastSerialReadMicros) * 1.0e-3f, 1);
+    } else {
+        Serial.print("na");
+    }
+    Serial.print(" lastTxMs=");
+    if (g_lastSerialWriteMicros != 0u) {
+        Serial.print(static_cast<float>(micros() - g_lastSerialWriteMicros) * 1.0e-3f, 1);
+    } else {
+        Serial.print("na");
+    }
+    if (g_lastProtocolError != SBG_NO_ERROR) {
+        Serial.print(" lastErr=");
+        Serial.print(sbgErrorCodeToString(g_lastProtocolError));
+        Serial.print("@");
+        Serial.print(millis() - g_lastProtocolErrorMs);
+        Serial.print("ms");
+    }
+    Serial.println();
+}
+
+bool ProbeDeviceInfo() {
+    sbgEComPurgeIncoming(&g_comHandle);
+    SbgErrorCode errorCode = sbgEComCmdGetInfo(&g_comHandle, &g_deviceInfo);
+    if (errorCode != SBG_NO_ERROR) {
+        RecordProtocolError(errorCode);
+        PrintErrorLine("Pulse20: CMD_INFO failed", errorCode);
+        PrintLinkStats();
+        return false;
+    }
+
+    g_haveDeviceInfo = true;
+    char productCode[SBG_ECOM_INFO_PRODUCT_CODE_LENGTH + 1] = {};
+    memcpy(productCode, g_deviceInfo.productCode, SBG_ECOM_INFO_PRODUCT_CODE_LENGTH);
+    productCode[SBG_ECOM_INFO_PRODUCT_CODE_LENGTH] = '\0';
+
+    Serial.print("Pulse20: device info OK product=");
+    Serial.print(productCode);
+    Serial.print(" serial=");
+    Serial.print(g_deviceInfo.serialNumber);
+    Serial.print(" fw=");
+    Serial.print(g_deviceInfo.firmwareRev);
+    Serial.print(" hw=");
+    Serial.println(g_deviceInfo.hardwareRev);
+    PrintLinkStats();
     return true;
 }
 
@@ -348,11 +455,12 @@ SbgErrorCode OnLogReceived(SbgEComHandle *pHandle,
 
 bool ConfigureOutputs() {
     const struct {
+        const char *name;
         SbgEComMsgId msgId;
         SbgEComOutputMode mode;
     } configs[] = {
-        {SBG_ECOM_LOG_IMU_DATA, kImuOutputMode},
-        {SBG_ECOM_LOG_MAG, kMagOutputMode},
+        {"imu_data", SBG_ECOM_LOG_IMU_DATA, kImuOutputMode},
+        {"mag", SBG_ECOM_LOG_MAG, kMagOutputMode},
     };
 
     bool ok = true;
@@ -364,26 +472,144 @@ bool ConfigureOutputs() {
                                     config.msgId,
                                     config.mode);
         if (errorCode != SBG_NO_ERROR) {
+            RecordProtocolError(errorCode);
+            Serial.print("Pulse20: output config failed for ");
+            Serial.print(config.name);
+            Serial.print(" -> ");
+            Serial.print(sbgErrorCodeToString(errorCode));
+            Serial.print(" (");
+            Serial.print(static_cast<int>(errorCode));
+            Serial.println(")");
             ok = false;
+        } else {
+            Serial.print("Pulse20: output config OK for ");
+            Serial.println(config.name);
         }
+    }
+    if (!ok) {
+        PrintLinkStats();
     }
     return ok;
 }
 
-bool ConfigureDevice() {
-    if (!SetupInterface()) {
+void ResetDeviceSession() {
+    if (g_comHandleInitialized) {
+        sbgEComClose(&g_comHandle);
+        g_comHandleInitialized = false;
+    }
+    g_deviceInitialized = false;
+    g_haveDeviceInfo = false;
+    g_haveImu = false;
+    g_haveMag = false;
+    g_lastImuHostMicros = 0;
+    g_lastMagHostMicros = 0;
+}
+
+bool OpenDeviceSession(uint32_t baudRate) {
+    ResetDeviceSession();
+    if (!SetupInterface(baudRate)) {
         return false;
     }
     if (sbgEComInit(&g_comHandle, &g_interface) != SBG_NO_ERROR) {
         Serial.println("Pulse20: sbgECom init failed");
         return false;
     }
-    sbgEComSetCmdTrialsAndTimeOut(&g_comHandle, 2u, 150u);
+    g_comHandleInitialized = true;
+    sbgEComSetCmdTrialsAndTimeOut(&g_comHandle, kCmdTrials, kCmdTimeoutMs);
     sbgEComSetReceiveLogCallback(&g_comHandle, &OnLogReceived, nullptr);
+    return true;
+}
+
+bool MigrateComABaud(uint32_t fromBaud, uint32_t toBaud) {
+    if (!OpenDeviceSession(fromBaud)) {
+        return false;
+    }
+    if (!ProbeDeviceInfo()) {
+        Serial.println("Pulse20: no valid response at fallback baud");
+        return false;
+    }
+
+    SbgEComInterfaceConf uartConf = {};
+    uartConf.baudRate = toBaud;
+    uartConf.mode = kPulsePortMode;
+    const SbgErrorCode errorCode =
+        sbgEComCmdInterfaceSetUartConf(&g_comHandle, SBG_ECOM_IF_COM_A, &uartConf);
+    if (errorCode == SBG_NO_ERROR) {
+        Serial.print("Pulse20: COM_A migrated to ");
+        Serial.println(toBaud);
+    } else {
+        RecordProtocolError(errorCode);
+        PrintErrorLine("Pulse20: COM_A migration ACK missed", errorCode);
+    }
+    delay(50);
+
+    bool activeOnPreferredBaud = false;
+    if (OpenDeviceSession(toBaud) && ProbeDeviceInfo()) {
+        Serial.println("Pulse20: preferred baud is already active");
+        activeOnPreferredBaud = true;
+    } else if (OpenDeviceSession(fromBaud) && ProbeDeviceInfo()) {
+        Serial.println("Pulse20: baud change staged; saving via fallback baud");
+    } else {
+        Serial.println("Pulse20: unable to reach device after baud change command");
+        return false;
+    }
+
+    const SbgErrorCode saveError = sbgEComCmdSettingsAction(&g_comHandle, SBG_ECOM_SAVE_SETTINGS);
+    if (saveError != SBG_NO_ERROR) {
+        RecordProtocolError(saveError);
+        PrintErrorLine("Pulse20: save+reboot failed", saveError);
+        return false;
+    }
+    Serial.println("Pulse20: settings saved, device rebooting");
+    ResetDeviceSession();
+    delay(kPostMigrationRebootDelayMs);
+
+    if (!OpenDeviceSession(toBaud)) {
+        Serial.println("Pulse20: preferred baud session open failed after reboot");
+    } else if (ProbeDeviceInfo()) {
+        Serial.println("Pulse20: preferred baud probe OK after reboot");
+        return true;
+    } else {
+        Serial.println("Pulse20: preferred baud probe failed after reboot");
+        if (activeOnPreferredBaud) {
+            Serial.println("Pulse20: device answered at preferred baud before save, but not after reboot");
+        }
+    }
+    return false;
+}
+
+bool ConfigureDevice() {
+    bool ready = OpenDeviceSession(kPulseBaudRate) && ProbeDeviceInfo();
+    if (!ready && kPulseFallbackBaudRate != kPulseBaudRate) {
+        Serial.print("Pulse20: falling back to ");
+        Serial.println(kPulseFallbackBaudRate);
+        ready = MigrateComABaud(kPulseFallbackBaudRate, kPulseBaudRate);
+    }
+    if (!ready) {
+        Serial.println("Pulse20: no valid response from device");
+        return false;
+    }
     if (!ConfigureOutputs()) {
-        Serial.println("Pulse20: output configuration warning");
+        Serial.println("Pulse20: output configuration failed");
+        return false;
     }
     g_deviceInitialized = true;
+    return true;
+}
+
+bool AttemptDeviceInit() {
+    ++g_initAttemptCount;
+    g_lastInitAttemptMs = millis();
+    Serial.print("Pulse20: init attempt ");
+    Serial.println(g_initAttemptCount);
+
+    if (!ConfigureDevice()) {
+        Serial.println("Pulse20: init retry pending");
+        return false;
+    }
+
+    Serial.print("Pulse20: init succeeded after attempts=");
+    Serial.println(g_initAttemptCount);
     return true;
 }
 
@@ -397,6 +623,7 @@ void PollDevice() {
             break;
         }
         if (errorCode != SBG_NO_ERROR) {
+            RecordProtocolError(errorCode);
             break;
         }
     }
@@ -1089,15 +1316,13 @@ void setup() {
     Serial.print(" baud: ");
     Serial.println(kPulseBaudRate);
 
-    if (!ConfigureDevice()) {
-        Serial.println("Pulse20 init failed. Check serial port, baud rate, and wiring.");
-        while (true) {
-            delay(1000);
-        }
-    }
-
     ResetCalibrationState();
-    PrintHelp();
+    if (AttemptDeviceInit()) {
+        PrintHelp();
+        g_helpPrinted = true;
+    } else {
+        Serial.println("Pulse20 init failed. Will keep retrying. Check serial port, baud rate, wiring, and RS-422 converter.");
+    }
 }
 
 void loop() {
@@ -1105,11 +1330,26 @@ void loop() {
         HandleCommand(static_cast<char>(Serial.read()));
     }
 
+    const uint32_t nowMs = millis();
+    if (!g_deviceInitialized) {
+        if ((nowMs - g_lastInitAttemptMs) >= kInitRetryIntervalMs) {
+            if (AttemptDeviceInit() && !g_helpPrinted) {
+                PrintHelp();
+                g_helpPrinted = true;
+            }
+        }
+        delay(10);
+        return;
+    }
+
     PollDevice();
     UpdateGyroCalibration();
     UpdateMagCapture();
-
-    const uint32_t nowMs = millis();
+    if (!g_haveImu && (nowMs - g_lastNoSampleDiagMs) >= kNoSampleDiagIntervalMs) {
+        g_lastNoSampleDiagMs = nowMs;
+        Serial.print("Pulse20: no IMU sample yet. ");
+        PrintLinkStats();
+    }
     if (!g_streamEnabled || (nowMs - g_lastStreamMs) < kStreamIntervalMs) {
         delay(1);
         return;

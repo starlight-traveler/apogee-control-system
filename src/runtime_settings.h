@@ -12,7 +12,7 @@ struct RuntimeSettings {
 };
 
 /// Storage status published alongside runtime settings so the GUI can report
-/// whether the SD-backed copy is authoritative.
+/// whether the SD-backed copy matches the active runtime values.
 struct RuntimeSettingsStorageStatus {
     bool storageAvailable = false;
     bool filePresent = false;
@@ -26,7 +26,7 @@ struct RuntimeSettingsStorageStatus {
 RuntimeSettings RuntimeSettingsDefaults();
 /// Validates one candidate settings payload before it is applied.
 bool RuntimeSettingsValidate(const RuntimeSettings &settings);
-/// Loads runtime settings from SD or writes defaults when the file is absent.
-bool RuntimeSettingsLoadOrCreate(RuntimeSettings &settings, RuntimeSettingsStorageStatus &status);
+/// Uses compile-time defaults and mirrors them to SD when storage is available.
+bool RuntimeSettingsUseFlashedDefaults(RuntimeSettings &settings, RuntimeSettingsStorageStatus &status);
 /// Persists the provided settings to the SD-backed runtime settings file.
 bool RuntimeSettingsSave(const RuntimeSettings &settings, RuntimeSettingsStorageStatus &status);

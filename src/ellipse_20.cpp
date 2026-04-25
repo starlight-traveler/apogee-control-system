@@ -9,6 +9,7 @@ extern "C" {
 #include <sbgCommon.h>
 #include <sbgECom.h>
 #include <sbgEComLib.h>
+#include <commands/sbgEComCmdSettings.h>
 }
 
 #include "math_utils.h"
@@ -17,12 +18,23 @@ extern "C" {
 
 namespace {
 
+#if defined(ACS_FORCE_ENABLE_ELLIPSE20) && ACS_FORCE_ENABLE_ELLIPSE20
+constexpr bool kPulseEnabled = true;
+#else
 constexpr bool kPulseEnabled = settings::sensors::ellipse20::kEnabled;
+#endif
 constexpr uint8_t kSerialPortIndex = settings::sensors::ellipse20::kSerialPortIndex;
 constexpr int8_t kRxPin = settings::sensors::ellipse20::kRxPin;
 constexpr int8_t kTxPin = settings::sensors::ellipse20::kTxPin;
 constexpr uint32_t kBaudRate = settings::sensors::ellipse20::kBaudRate;
-constexpr uint8_t kHandleBudgetPerAcquire = settings::sensors::ellipse20::kHandleBudgetPerAcquire;
+constexpr uint32_t kFallbackBaudRate = settings::sensors::ellipse20::kFallbackBaudRate;
+constexpr SbgEComPortMode kPortMode =
+    static_cast<SbgEComPortMode>(settings::sensors::ellipse20::kPortMode);
+constexpr uint8_t kCmdTrials = 3;
+constexpr uint32_t kCmdTimeoutMs = 300;
+constexpr uint32_t kPostMigrationRebootDelayMs = 1000;
+constexpr uint16_t kRxExtraBufferBytes = settings::sensors::ellipse20::kRxExtraBufferBytes;
+constexpr uint16_t kServiceBudgetUs = settings::sensors::ellipse20::kServiceBudgetUs;
 constexpr uint32_t kSampleMaxAgeUs = settings::sensors::ellipse20::kSampleMaxAgeUs;
 constexpr SbgEComOutputMode kImuOutputMode =
     static_cast<SbgEComOutputMode>(settings::sensors::ellipse20::kImuOutputMode);
@@ -41,8 +53,10 @@ struct SerialInterfaceContext {
 SerialInterfaceContext g_serialContext;
 SbgInterface g_interface;
 SbgEComHandle g_comHandle;
+uint8_t g_serialRxExtraBuffer[kRxExtraBufferBytes] = {};
 
 bool g_initialized = false;
+bool g_comHandleInitialized = false;
 bool g_haveImu = false;
 bool g_haveMag = false;
 bool g_haveQuaternion = false;
@@ -128,6 +142,10 @@ HardwareSerial *ResolveSerialPort(uint8_t portIndex) {
         default:
             return nullptr;
     }
+}
+
+HardwareSerialIMXRT *ResolveImxrtSerialPort(HardwareSerial *serial) {
+    return static_cast<HardwareSerialIMXRT *>(serial);
 }
 
 void Apply3x3(const float matrix[3][3], const float in[3], float out[3]) {
@@ -826,6 +844,8 @@ void ConfigureSerial(uint32_t baudRate) {
         }
     }
     g_serialContext.serial->begin(baudRate);
+    ResolveImxrtSerialPort(g_serialContext.serial)
+        ->addMemoryForRead(g_serialRxExtraBuffer, sizeof(g_serialRxExtraBuffer));
     g_serialContext.baudRate = baudRate;
 }
 
@@ -920,14 +940,27 @@ uint32_t SerialGetDelay(const SbgInterface *pInterface, size_t numBytes) {
     return static_cast<uint32_t>((numBytes * 10000000ull) / g_serialContext.baudRate);
 }
 
-bool SetupInterface() {
+SbgErrorCode OnLogReceived(SbgEComHandle *pHandle,
+                           SbgEComClass msgClass,
+                           SbgEComMsgId msg,
+                           const SbgEComLogUnion *pLogData,
+                           void *pUserArg);
+
+void ResetEComSession() {
+    if (g_comHandleInitialized) {
+        sbgEComClose(&g_comHandle);
+        g_comHandleInitialized = false;
+    }
+}
+
+bool SetupInterface(uint32_t baudRate) {
     g_serialContext.serial = ResolveSerialPort(kSerialPortIndex);
     if (g_serialContext.serial == nullptr) {
         LOG_PRINTLN("Pulse20: invalid serial port index");
         return false;
     }
 
-    ConfigureSerial(kBaudRate);
+    ConfigureSerial(baudRate);
     FlushInput();
 
     sbgInterfaceZeroInit(&g_interface);
@@ -942,6 +975,115 @@ bool SetupInterface() {
     g_interface.pDelayFunc = &SerialGetDelay;
     sbgInterfaceNameSet(&g_interface, "Pulse20");
     return true;
+}
+
+bool OpenComSession(uint32_t baudRate) {
+    ResetEComSession();
+    if (!SetupInterface(baudRate)) {
+        return false;
+    }
+    if (sbgEComInit(&g_comHandle, &g_interface) != SBG_NO_ERROR) {
+        LOG_PRINTLN("Pulse20: sbgECom init failed");
+        return false;
+    }
+    g_comHandleInitialized = true;
+    sbgEComSetCmdTrialsAndTimeOut(&g_comHandle, kCmdTrials, kCmdTimeoutMs);
+    sbgEComSetReceiveLogCallback(&g_comHandle, &OnLogReceived, nullptr);
+    return true;
+}
+
+bool ProbeDeviceInfo() {
+    if (!g_comHandleInitialized) {
+        return false;
+    }
+    sbgEComPurgeIncoming(&g_comHandle);
+    SbgEComDeviceInfo deviceInfo = {};
+    return sbgEComCmdGetInfo(&g_comHandle, &deviceInfo) == SBG_NO_ERROR;
+}
+
+void LogProtocolError(const char *prefix, SbgErrorCode errorCode) {
+    LOG_PRINT(prefix);
+    LOG_PRINT(": ");
+    LOG_PRINT(sbgErrorCodeToString(errorCode));
+    LOG_PRINT(" (");
+    LOG_PRINT(static_cast<int>(errorCode));
+    LOG_PRINTLN(")");
+}
+
+bool SaveSettingsAndReboot() {
+    const SbgErrorCode errorCode = sbgEComCmdSettingsAction(&g_comHandle, SBG_ECOM_SAVE_SETTINGS);
+    if (errorCode != SBG_NO_ERROR) {
+        LogProtocolError("Pulse20: save+reboot failed", errorCode);
+        return false;
+    }
+    LOG_PRINTLN("Pulse20: settings saved, device rebooting");
+    ResetEComSession();
+    delay(kPostMigrationRebootDelayMs);
+    return true;
+}
+
+bool MigrateComABaud(uint32_t fromBaud, uint32_t toBaud) {
+    if (!OpenComSession(fromBaud)) {
+        return false;
+    }
+    if (!ProbeDeviceInfo()) {
+        LOG_PRINTLN("Pulse20: no response at fallback baud");
+        return false;
+    }
+
+    SbgEComInterfaceConf uartConf = {};
+    uartConf.baudRate = toBaud;
+    uartConf.mode = kPortMode;
+    const SbgErrorCode errorCode =
+        sbgEComCmdInterfaceSetUartConf(&g_comHandle, SBG_ECOM_IF_COM_A, &uartConf);
+    if (errorCode == SBG_NO_ERROR) {
+        LOG_PRINT("Pulse20: COM_A migrated to ");
+        LOG_PRINTLN(static_cast<unsigned long>(toBaud));
+    } else {
+        LogProtocolError("Pulse20: COM_A migration ACK missed", errorCode);
+    }
+    delay(50);
+
+    bool activeOnPreferredBaud = false;
+    if (OpenComSession(toBaud) && ProbeDeviceInfo()) {
+        LOG_PRINTLN("Pulse20: preferred baud is already active");
+        activeOnPreferredBaud = true;
+    } else if (OpenComSession(fromBaud) && ProbeDeviceInfo()) {
+        LOG_PRINTLN("Pulse20: baud change staged; saving via fallback baud");
+    } else {
+        LOG_PRINTLN("Pulse20: unable to reach device after baud change command");
+        return false;
+    }
+
+    if (!SaveSettingsAndReboot()) {
+        return false;
+    }
+
+    if (!OpenComSession(toBaud)) {
+        LOG_PRINTLN("Pulse20: preferred baud session open failed after reboot");
+    } else if (ProbeDeviceInfo()) {
+        LOG_PRINTLN("Pulse20: preferred baud probe OK after reboot");
+        return true;
+    } else {
+        LOG_PRINTLN("Pulse20: preferred baud probe failed after reboot");
+        if (activeOnPreferredBaud) {
+            LOG_PRINTLN("Pulse20: device answered at preferred baud before save, but not after reboot");
+        }
+    }
+    return false;
+}
+
+bool StartAtPreferredBaud() {
+    if (OpenComSession(kBaudRate) && ProbeDeviceInfo()) {
+        return true;
+    }
+    if (kFallbackBaudRate == kBaudRate) {
+        return false;
+    }
+
+    LOG_PRINT("Pulse20: falling back to ");
+    LOG_PRINTLN(static_cast<unsigned long>(kFallbackBaudRate));
+    return MigrateComABaud(kFallbackBaudRate, kBaudRate);
 }
 
 SbgErrorCode OnLogReceived(SbgEComHandle *pHandle,
@@ -1008,6 +1150,26 @@ bool ConfigureOutputs() {
     return ok;
 }
 
+uint8_t DrainIncomingLogs(uint32_t budgetUs) {
+    if (!g_comHandleInitialized) {
+        return 0u;
+    }
+
+    uint8_t handledFrames = 0u;
+    const uint32_t startUs = micros();
+    do {
+        const SbgErrorCode errorCode = sbgEComHandleOneLog(&g_comHandle);
+        if (errorCode == SBG_NOT_READY) {
+            break;
+        }
+        if (errorCode == SBG_NO_ERROR) {
+            ++handledFrames;
+        }
+    } while (static_cast<uint32_t>(micros() - startUs) < budgetUs);
+
+    return handledFrames;
+}
+
 }  // namespace
 
 bool Ellipse20SensorBegin() {
@@ -1019,21 +1181,27 @@ bool Ellipse20SensorBegin() {
     }
 
     ResetCachedState();
-    if (!SetupInterface()) {
+    if (!StartAtPreferredBaud()) {
+        ResetEComSession();
         return false;
     }
-    if (sbgEComInit(&g_comHandle, &g_interface) != SBG_NO_ERROR) {
-        LOG_PRINTLN("Pulse20: sbgECom init failed");
-        return false;
-    }
-    sbgEComSetCmdTrialsAndTimeOut(&g_comHandle, 2u, 150u);
-    sbgEComSetReceiveLogCallback(&g_comHandle, &OnLogReceived, nullptr);
     if (!ConfigureOutputs()) {
-        LOG_PRINTLN("Pulse20: output configuration warning");
+        LOG_PRINTLN("Pulse20: output configuration failed");
+        ResetCachedState();
+        ResetEComSession();
+        return false;
     }
     g_initialized = true;
     LOG_PRINTLN("Pulse20: raw IMU rail startup complete");
     return true;
+}
+
+void Ellipse20SensorService() {
+    if (!kPulseEnabled || !g_initialized) {
+        return;
+    }
+
+    DrainIncomingLogs(kServiceBudgetUs);
 }
 
 void Ellipse20SensorSetFlightStatus(FlightStatus status) {
@@ -1051,17 +1219,7 @@ bool Ellipse20SensorAcquire(SensorData &out) {
         return false;
     }
 
-    bool handledFrame = false;
-    for (uint8_t i = 0; i < kHandleBudgetPerAcquire; ++i) {
-        const SbgErrorCode errorCode = sbgEComHandleOneLog(&g_comHandle);
-        if (errorCode == SBG_NOT_READY) {
-            break;
-        }
-        if (errorCode != SBG_NO_ERROR) {
-            break;
-        }
-        handledFrame = true;
-    }
+    DrainIncomingLogs(kServiceBudgetUs);
 
     const uint32_t nowUs = micros();
     const bool imuRecent =
@@ -1170,7 +1328,7 @@ bool Ellipse20SensorAcquire(SensorData &out) {
 
     g_lastSampleMicros = nowUs;
     g_lastProcessedImuSensorTimestampUs = g_lastImuSensorTimestampUs;
-    g_lastAcquireFresh = handledFrame;
+    g_lastAcquireFresh = true;
     g_lastAcquireUsedCache = false;
     g_hasCachedSample = true;
 
@@ -1193,5 +1351,12 @@ Ellipse20Diagnostics Ellipse20SensorGetDiagnostics() {
     diagnostics.lastAcquireFresh = kPulseEnabled && g_lastAcquireFresh;
     diagnostics.lastAcquireUsedCache = kPulseEnabled && g_lastAcquireUsedCache;
     diagnostics.lastSampleMicros = kPulseEnabled ? g_lastSampleMicros : 0u;
+    if (kPulseEnabled) {
+        for (int i = 0; i < 3; ++i) {
+            diagnostics.accelBodyMps2[i] = g_lastAccel[i];
+            diagnostics.gyroBodyRadPerSec[i] = g_lastGyro[i];
+            diagnostics.yprDeg[i] = g_lastYprDeg[i];
+        }
+    }
     return diagnostics;
 }

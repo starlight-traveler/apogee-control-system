@@ -30,6 +30,9 @@ enum PredictorSeedConfidenceFlag : uint32_t {
     kPredictorSeedFlagCfdMachClamped = 1u << 9,
     kPredictorSeedFlagPredictionStepLimit = 1u << 10,
     kPredictorSeedFlagPredictionUncertain = 1u << 11,
+    kPredictorSeedFlagBaroVzGuardActive = 1u << 12,
+    kPredictorSeedFlagBaroVzCorrectionUsed = 1u << 13,
+    kPredictorSeedFlagVerticalAccelDeweighted = 1u << 14,
 };
 
 inline bool PredictorFlagsHasCfdClamp(uint32_t flags) {

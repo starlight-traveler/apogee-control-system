@@ -359,7 +359,13 @@ class ApogeePredictor {
             }
         }
         if (state.verticalVelocity > 0.0 && steps >= maxIntegrationSteps_) {
-            lastPredictionFlags_ |= kPredictorSeedFlagPredictionStepLimit;
+            lastPredictionFlags_ |= kPredictorSeedFlagPredictionStepLimit |
+                                    kPredictorSeedFlagPredictionUncertain;
+            result.altitude = state.altitudeMeters +
+                              (state.verticalVelocity * state.verticalVelocity) /
+                                  (2.0 * constants::kGravity);
+            result.timeToApogee = elapsedTime + state.verticalVelocity / constants::kGravity;
+            return result;
         }
         result.altitude = state.altitudeMeters;
         result.timeToApogee = elapsedTime;

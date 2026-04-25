@@ -45,6 +45,10 @@ struct LoggedTelemetrySample {
     float verticalVelocityFps = 0.0f;
     float zenithDeg = 0.0f;
     float apogeeEstimateFeet = 0.0f;
+    float baroVerticalVelocityFps = 0.0f;
+    float baroVerticalVelocitySigmaFps = 0.0f;
+    float baroVerticalVelocityResidualFps = 0.0f;
+    float zAccelSigmaScale = 1.0f;
     float accelBno[3] = {0.0f, 0.0f, 0.0f};
     float gyroBno[3] = {0.0f, 0.0f, 0.0f};
     float quaternionBno[4] = {1.0f, 0.0f, 0.0f, 0.0f};
@@ -53,6 +57,9 @@ struct LoggedTelemetrySample {
     float wt901YprDeg[3] = {0.0f, 0.0f, 0.0f};
     float gyroWt901[3] = {0.0f, 0.0f, 0.0f};
     float quaternionWt901[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+    float bnoQuaternionAgeMs = 0.0f;
+    float bnoReferenceTiltErrorDeg = 0.0f;
+    float bnoReferenceCorrectionApplied = 0.0f;
     uint8_t mainQuaternionSource = 0;
     uint8_t hasQuaternion = 0;
     uint8_t hasIcmQuaternion = 0;
@@ -66,7 +73,9 @@ struct LoggedTelemetrySample {
     uint8_t hasWt901Ypr = 0;
     uint8_t hasWt901Gyro = 0;
     uint8_t hasWt901Quaternion = 0;
-    uint8_t reserved[3] = {0u, 0u, 0u};
+    uint8_t baroVerticalVelocityUpdateUsed = 0;
+    uint8_t baroVerticalVelocityGuardActive = 0;
+    uint8_t zAccelUpdateUsed = 0;
 };
 
 /// Telemetry payload written for each main-loop sample.
