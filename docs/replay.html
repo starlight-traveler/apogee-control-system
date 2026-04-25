@@ -7,6 +7,10 @@
     <meta name="description" content="Replay and analysis workflow for ACS flight logs.">
     <meta name="color-scheme" content="light dark">
     <link rel="stylesheet" href="assets/acs-docs.css">
+    <script>
+        window.MathJax = { tex: { inlineMath: [["\\(", "\\)"], ["$", "$"]] }, svg: { fontCache: "global" } };
+    </script>
+    <script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-svg.js" defer></script>
     <script src="assets/acs-docs.js" defer></script>
 </head>
 <body>
@@ -19,6 +23,7 @@
             <li><a href="predictor.html">Predictor</a></li>
             <li><a href="math.html">Math</a></li>
             <li><a href="code.html">Code</a></li>
+            <li><a href="api/html/index.html">API</a></li>
             <li><a href="sensors.html">Sensors</a></li>
             <li><a href="replay.html" aria-current="page">Replay</a></li>
         </ul>
@@ -27,7 +32,7 @@
     <main>
         <section class="hero-full reveal">
             <div class="section-label">Post-flight analysis</div>
-            <h1>Replay turns guesses into evidence.</h1>
+            <h1>Replay workflow.</h1>
             <p class="desc">
                 The data logger writes a binary record of what the firmware knew at each loop. Replay decodes that record, reruns estimator and predictor logic, and lets you compare logged decisions against the current code.
             </p>

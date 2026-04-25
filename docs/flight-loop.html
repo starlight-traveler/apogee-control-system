@@ -7,6 +7,10 @@
     <meta name="description" content="Detailed flight-loop walkthrough for the apogee control system.">
     <meta name="color-scheme" content="light dark">
     <link rel="stylesheet" href="assets/acs-docs.css">
+    <script>
+        window.MathJax = { tex: { inlineMath: [["\\(", "\\)"], ["$", "$"]] }, svg: { fontCache: "global" } };
+    </script>
+    <script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-svg.js" defer></script>
     <script src="assets/acs-docs.js" defer></script>
 </head>
 <body>
@@ -19,6 +23,7 @@
             <li><a href="predictor.html">Predictor</a></li>
             <li><a href="math.html">Math</a></li>
             <li><a href="code.html">Code</a></li>
+            <li><a href="api/html/index.html">API</a></li>
             <li><a href="sensors.html">Sensors</a></li>
             <li><a href="replay.html">Replay</a></li>
         </ul>
@@ -27,7 +32,7 @@
     <main>
         <section class="hero-full reveal">
             <div class="section-label">Runtime pipeline</div>
-            <h1>The loop is a set of gates.</h1>
+            <h1>Flight loop gates.</h1>
             <p class="desc">
                 The firmware loop is written to keep control authority behind evidence. Measurements must be fresh, frames must be known, phases must be confirmed, and the predictor must stay inside trusted coverage before the flaps are allowed to add drag.
             </p>

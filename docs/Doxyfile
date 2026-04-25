@@ -48,13 +48,7 @@ FILE_PATTERNS          = *.c \
                          *.hxx \
                          *.ino \
                          *.md
-EXCLUDE                = lib \
-                         .pio \
-                         docs/api \
-                         tools/build \
-                         tools/replay/build \
-                         tools/replay/matplotplusplus \
-                         telemetry/imgui/build
+EXCLUDE                =
 EXCLUDE_PATTERNS       = */build/* \
                          */CMakeFiles/* \
                          */__pycache__/* \
@@ -81,6 +75,9 @@ INHERIT_DOCS           = YES
 MARKDOWN_SUPPORT       = YES
 TOC_INCLUDE_HEADINGS   = 5
 USE_MDFILE_AS_MAINPAGE = docs/doxygen-main.md
+USE_MATHJAX            = YES
+MATHJAX_FORMAT         = HTML-CSS
+MATHJAX_RELPATH        = https://cdn.jsdelivr.net/npm/mathjax@2
 
 SOURCE_BROWSER         = YES
 INLINE_SOURCES         = NO

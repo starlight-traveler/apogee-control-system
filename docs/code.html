@@ -7,6 +7,10 @@
     <meta name="description" content="Implementation highlights and source walkthrough for the apogee control system firmware.">
     <meta name="color-scheme" content="light dark">
     <link rel="stylesheet" href="assets/acs-docs.css">
+    <script>
+        window.MathJax = { tex: { inlineMath: [["\\(", "\\)"], ["$", "$"]] }, svg: { fontCache: "global" } };
+    </script>
+    <script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-svg.js" defer></script>
     <script src="assets/acs-docs.js" defer></script>
 </head>
 <body>
@@ -19,6 +23,7 @@
             <li><a href="predictor.html">Predictor</a></li>
             <li><a href="math.html">Math</a></li>
             <li><a href="code.html" aria-current="page">Code</a></li>
+            <li><a href="api/html/index.html">API</a></li>
             <li><a href="sensors.html">Sensors</a></li>
             <li><a href="replay.html">Replay</a></li>
         </ul>
@@ -27,7 +32,7 @@
     <main>
         <section class="hero-full reveal">
             <div class="section-label">Source walkthrough</div>
-            <h1>Code tricks that make the flight path safer.</h1>
+            <h1>Code highlights.</h1>
             <p class="desc">
                 This page points at the implementation details worth understanding before changing the system. The theme is consistent: compute a useful estimate, carry confidence with it, and let actuator safety logic see the confidence instead of hiding it inside a number.
             </p>
@@ -70,8 +75,10 @@
             <p class="lede">
                 The predictor is structured as a small physics engine. Each derivative evaluation rebuilds air-relative velocity, interpolates CFD force, projects force into state acceleration, advances flap lag, and updates pitch.
             </p>
-            <div class="code-snippet">
-<pre>PredictApogeeWithTime(seed):
+            <div class="code-block">
+                <div class="code-title"><span>Predictor core</span><span>pseudocode</span></div>
+                <div class="code-body">
+<pre><code>PredictApogeeWithTime(seed):
     while vertical_velocity > 0:
         next = integrate_one_step(seed, RK4)
         if next.vertical_velocity <= 0:
@@ -79,7 +86,8 @@
         seed = next
 
     if step_limit_hit:
-        return ballistic_bound_with_uncertain_flag</pre>
+        return ballistic_bound_with_uncertain_flag</code></pre>
+                </div>
             </div>
             <div class="grid-two">
                 <div class="card">
@@ -154,14 +162,17 @@
             <p class="lede">
                 The control search is built around failure behavior. It tries to find useful drag, but the default answer for stale, uncertain, clamped, or invalid prediction is to request zero degrees through the existing command pipeline.
             </p>
-            <div class="code-snippet">
-<pre>if predictor is not trusted:
+            <div class="code-block">
+                <div class="code-title"><span>Actuation command</span><span>failure behavior</span></div>
+                <div class="code-body">
+<pre><code>if predictor is not trusted:
     target_angle = 0 deg
 else:
     rank candidate angles with midpoint prediction
     validate best region with RK4 bounds
     reject candidates with uncertainty flags
-    command best angle through servo limits</pre>
+    command best angle through servo limits</code></pre>
+                </div>
             </div>
             <div class="callout">
                 <p>The important design choice is that "retract" is still just a normal command. The servo layer still applies limits, rate behavior, PWM mapping, and synchronization.</p>
@@ -208,6 +219,7 @@ else:
         <ul class="footer-links">
             <li><a href="math.html">Math</a></li>
             <li><a href="predictor.html">Predictor</a></li>
+            <li><a href="api/html/index.html">API</a></li>
             <li><a href="../src/main.cpp">Source</a></li>
         </ul>
     </footer>

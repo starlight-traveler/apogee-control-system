@@ -54,6 +54,8 @@ Generate source API documentation:
 bash tools/scripts/generate_doxygen.sh
 ```
 
+The generated API site lands at `docs/api/html/index.html`. The GitHub Pages workflow generates that directory before publishing `docs/`, so the public static docs include both the hand-written pages and the Doxygen source reference. Set the repository Pages source to GitHub Actions.
+
 ## Repository Layout
 
 | Path | Purpose |
@@ -132,6 +134,7 @@ Supporting docs:
 - [`docs/index.html`](docs/index.html): polished multi-page documentation site entry point
 - [`docs/math.html`](docs/math.html): readable predictor and estimator math walkthrough
 - [`docs/code.html`](docs/code.html): code highlights and source walkthrough
+- [`docs/api/html/index.html`](docs/api/html/index.html): generated API docs after running Doxygen locally or in GitHub Pages
 - [`docs/Doxyfile`](docs/Doxyfile): generated API docs configuration
 - [`src/README.md`](src/README.md): pad settings and runtime configuration
 - [`include/README.md`](include/README.md): shared header policy

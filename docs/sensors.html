@@ -7,6 +7,10 @@
     <meta name="description" content="Sensor rail and frame documentation for the apogee control system.">
     <meta name="color-scheme" content="light dark">
     <link rel="stylesheet" href="assets/acs-docs.css">
+    <script>
+        window.MathJax = { tex: { inlineMath: [["\\(", "\\)"], ["$", "$"]] }, svg: { fontCache: "global" } };
+    </script>
+    <script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-svg.js" defer></script>
     <script src="assets/acs-docs.js" defer></script>
 </head>
 <body>
@@ -19,6 +23,7 @@
             <li><a href="predictor.html">Predictor</a></li>
             <li><a href="math.html">Math</a></li>
             <li><a href="code.html">Code</a></li>
+            <li><a href="api/html/index.html">API</a></li>
             <li><a href="sensors.html" aria-current="page">Sensors</a></li>
             <li><a href="replay.html">Replay</a></li>
         </ul>
@@ -27,7 +32,7 @@
     <main>
         <section class="hero-full reveal">
             <div class="section-label">Sensor rails</div>
-            <h1>Fresh, framed, and matched.</h1>
+            <h1>Sensor frames and freshness.</h1>
             <p class="desc">
                 The sensor code has one recurring theme: a number is not useful until the firmware knows when it was measured, which frame it is in, and whether it belongs with the selected attitude source.
             </p>

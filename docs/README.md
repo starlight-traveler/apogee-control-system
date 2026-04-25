@@ -27,3 +27,7 @@ bash tools/scripts/generate_doxygen.sh
 ```
 
 The generated entry point is `docs/api/html/index.html`. The `docs/api/` directory is ignored by git; commit the comments and Doxygen config, not the generated HTML.
+
+GitHub Pages is wired through `.github/workflows/pages.yml`. Set the repository Pages source to **GitHub Actions**. On pushes to `main` or `master`, the workflow installs Doxygen, generates `docs/api/html/`, and publishes the whole `docs/` directory as the static site.
+
+Math-heavy pages use MathJax, so write equations in normal LaTeX delimiters such as `\(h_{\mathrm{apogee}}\)` or display blocks if a longer equation is needed.

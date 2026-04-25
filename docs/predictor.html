@@ -7,6 +7,10 @@
     <meta name="description" content="Interactive apogee predictor documentation for the apogee control system.">
     <meta name="color-scheme" content="light dark">
     <link rel="stylesheet" href="assets/acs-docs.css">
+    <script>
+        window.MathJax = { tex: { inlineMath: [["\\(", "\\)"], ["$", "$"]] }, svg: { fontCache: "global" } };
+    </script>
+    <script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-svg.js" defer></script>
     <script src="assets/acs-docs.js" defer></script>
 </head>
 <body>
@@ -19,6 +23,7 @@
             <li><a href="predictor.html" aria-current="page">Predictor</a></li>
             <li><a href="math.html">Math</a></li>
             <li><a href="code.html">Code</a></li>
+            <li><a href="api/html/index.html">API</a></li>
             <li><a href="sensors.html">Sensors</a></li>
             <li><a href="replay.html">Replay</a></li>
         </ul>
@@ -27,7 +32,7 @@
     <main>
         <section class="hero-full reveal">
             <div class="section-label">Apogee model</div>
-            <h1>One coast rollout, many guardrails.</h1>
+            <h1>Coast apogee predictor.</h1>
             <p class="desc">
                 The predictor takes a compact coast seed and rolls it forward until vertical velocity reaches zero. The implementation is practical rather than magical: bounded inputs, CFD interpolation, density scaling, actuator lag, RK integration, and flags whenever the answer leaves trusted ground.
             </p>
@@ -119,12 +124,12 @@
             <div class="formula-grid">
                 <div class="formula-card">
                     <h3>Ballistic upper bound</h3>
-                    <span class="equation">h_apogee = h + v_z^2 / (2g)</span>
+                    <span class="equation">\(h_{\mathrm{apogee}} = h + \frac{v_z^2}{2g}\)</span>
                     <p class="muted">Useful as a no-drag reference and conservative step-limit telemetry bound. It is not automatically trusted for flap control.</p>
                 </div>
                 <div class="formula-card">
                     <h3>Air-relative model</h3>
-                    <span class="equation">Mach = |v_vehicle - v_wind| / a(T)</span>
+                    <span class="equation">\(M = \frac{|\vec{v}_{\mathrm{vehicle}} - \vec{v}_{\mathrm{wind}}|}{a(T)}\)</span>
                     <p class="muted">The CFD lookup is driven by air-relative speed, flap angle, AoA, and density ratio rather than by altitude alone.</p>
                 </div>
             </div>
@@ -165,6 +170,7 @@
             <li><a href="apogee-predictor.md">Markdown notes</a></li>
             <li><a href="math.html">Math</a></li>
             <li><a href="code.html">Code</a></li>
+            <li><a href="api/html/index.html">API</a></li>
             <li><a href="../src/apogee_model.h">Source</a></li>
             <li><a href="sensors.html">Next: sensors</a></li>
         </ul>
