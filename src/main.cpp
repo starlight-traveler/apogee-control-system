@@ -7,25 +7,29 @@
 #include <string.h>
 #include <SPI.h>
 
-#include "bno_sensor.h"
-#include "bmp585_sensor.h"
+/*Include Sensors*/
+#include "Sensors/BNO085/bno_sensor.h"
+#include "Sensors/BMP 585/bmp585_sensor.h"
+#include "Sensors/ICM 20948/icm20948_sensor.h"
+#include "Sensors/LMS9DS1/lsm9ds1_sensor.h"
+#include "Sensors/MS5611/ms5611_sensor.h"
+#include "Sensors/WT 901/wt901_sensor.h"
+
+
 #include "cfd_table.h"
-#include "constants.h"
-#include "data_logger.h"
-#include "ellipse_20.h"
+#include "ACS Utilities/constants.h"
+#include "Logging/data_logger.h"
+#include "Sensors/Ellipse 20/ellipse_20.h"
 #include "flight_computer.h"
-#include "icm20948_sensor.h"
-#include "lsm9ds1_sensor.h"
-#include "math_utils.h"
-#include "ms5611_sensor.h"
-#include "network_telemetry.h"
-#include "predictor_seed.h"
-#include "runtime_settings.h"
-#include "serial_logging.h"
+
+#include "ACS Utilities/math_utils.h"
+#include "ACS Utilities/network_telemetry.h"
+#include "ACS Utilities/predictor_seed.h"
+#include "ACS Utilities/runtime_settings.h"
+#include "Logging/serial_logging.h"
 #include "settings.h"
-#include "status_leds.h"
+#include "ACS Utilities/status_leds.h"
 #include "synced_flap_actuation.h"
-#include "wt901_sensor.h"
 
 namespace {
 

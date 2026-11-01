@@ -25,7 +25,7 @@
 #if defined(ACS_ENABLE_IMGUI_DECODER)
 #include "../../../src/apogee_model.h"
 #include "../../../src/flight_computer.h"
-#include "../../../src/predictor_seed.h"
+#include "../../../src/ACS Utilities/predictor_seed.h"
 #endif
 
 #if defined(ACS_ENABLE_IMGUI_DECODER)
